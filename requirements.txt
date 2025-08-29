@@ -1,0 +1,8 @@
+pymupdf
+opencv-python
+numpy
+pillow
+pytesseract
+arabic-reshaper
+python-bidi
+pandas
