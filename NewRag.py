@@ -3,12 +3,12 @@ import importlib.metadata
 _original_version = importlib.metadata.version
 def patched_version(package_name: str) -> str:
     if package_name == "bitsandbytes":
-        return "0.47.0"  # set to your installed version
+        return "0.47.0"  # set to your installed version if different
     return _original_version(package_name)
 importlib.metadata.version = patched_version
 # ==============================================================================
 
-import os, re, json, time, pickle, warnings, hashlib
+import os, re, json, time, pickle, warnings, hashlib, sys
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional, Any, Set
 from pathlib import Path
@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore")
 
 # ---------------- Optional deps ----------------
 try:
-    import faiss  # faiss-cpu
+    import faiss  # faiss-cpu/ -gpu
 except Exception:
     faiss = None
 
@@ -76,7 +76,6 @@ def sent_split(s: str) -> List[str]:
 # ======================= Data model =======================
 @dataclass
 class DocumentChunk:
-    """Represents a document chunk with metadata"""
     id: str
     text_display: str
     text_embed: str
@@ -86,20 +85,41 @@ class DocumentChunk:
     chunk_no: int
     embedding: Optional[np.ndarray] = None
 
+# ======================= Robust JSON helpers =======================
+_TEXT_KEYS = {"text","text_display","content","body","raw","paragraph","para","value","data","clean_text","norm"}
+_TEXT_ARRAY_KEYS = {"lines","paragraphs","paras","sentences","chunks","blocks","spans","tokens"}
+_PAGE_KEYS = {"page","page_no","page_num","pageNumber","page_index","Page","PageNo"}
+_ID_KEYS = {"id","chunk_id","cid","idx","index","Id","ID"}
+
+def _as_text(v):
+    if isinstance(v, str):
+        v = v.strip()
+        return v if v else None
+    if isinstance(v, list):
+        parts = [str(x).strip() for x in v if isinstance(x, (str,int,float)) and str(x).strip()]
+        return "\n".join(parts) if parts else None
+    return None
+
+def _get_any(d: dict, keys: set):
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    lower = {k.lower(): k for k in d.keys()}
+    for k in keys:
+        lk = k.lower()
+        if lk in lower and d[lower[lk]] not in (None, ""):
+            return d[lower[lk]]
+    return None
+
 # ======================= Hybrid Arabic Retriever =======================
 class HybridArabicRetriever:
     """
     - Dense: SentenceTransformer + (FAISS IP) or NumPy fallback
-    - Sparse: TF-IDF (char 2–5 + word 1–2), automatically disabled if sklearn not available
-    - Index persistence: embeddings.npy, faiss.index, tfidf pickles + meta.json in artifact_dir
-    - Input format: JSONL rows containing at least: id, text_display or text_embed, language, source, page, chunk_no
+    - Sparse: TF-IDF (char 2–5 + word 1–2), auto-disabled if sklearn missing
+    - Index persistence under artifact_dir: embeddings.npy, faiss.index, tfidf pickles + meta.json
     """
 
-    def __init__(
-        self,
-        model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        artifact_dir: str = "./artifacts"
-    ):
+    def __init__(self, model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", artifact_dir="./artifacts"):
         self.model_name = model_name
         print("🔄 Loading embedding model…")
         t0 = time.time()
@@ -133,22 +153,27 @@ class HybridArabicRetriever:
         return data
 
     def load_documents(self, rows: List[Dict]) -> None:
-        """Use provided chunk fields; normalize text_embed if missing."""
+        """Accepts flexible schemas; prefers text_display, falls back to arrays/other keys."""
         self.chunks.clear()
         for i, item in enumerate(rows):
-            disp = item.get("text_display") or item.get("text") or ""
-            embtxt = item.get("text_embed") or disp
-            embtxt = ar_normalize(embtxt)
+            disp = _as_text(_get_any(item, _TEXT_KEYS)) or _as_text(_get_any(item, _TEXT_ARRAY_KEYS)) or ""
+            embtxt = _as_text(_get_any(item, _TEXT_KEYS)) or disp
+            page = _get_any(item, _PAGE_KEYS)
+            try: page = int(page) if page is not None else 0
+            except Exception: page = 0
+            cid = _get_any(item, _ID_KEYS)
+            cid = str(cid) if cid is not None else f"row{i}"
+            embtxt = ar_normalize(embtxt or "")
             if not embtxt: continue
             self.chunks.append(
                 DocumentChunk(
-                    id=str(item.get("id", f"row{i}")),
+                    id=cid,
                     text_display=(disp or embtxt).strip(),
                     text_embed=embtxt,
-                    language=item.get("language","ar"),
-                    source=item.get("source","unknown"),
-                    page=int(item.get("page",0)),
-                    chunk_no=int(item.get("chunk_no",0))
+                    language=str(item.get("language","ar")),
+                    source=str(item.get("source","Data_pdf.pdf")),
+                    page=page,
+                    chunk_no=int(item.get("chunk_no", i))
                 )
             )
         print(f"✅ Prepared {len(self.chunks)} chunks")
@@ -157,7 +182,7 @@ class HybridArabicRetriever:
     def _dataset_hash(self) -> str:
         h = hashlib.sha256()
         for c in self.chunks[:200]:
-            h.update(c.id.encode("utf-8"))
+            h.update(str(c.id).encode("utf-8"))
             h.update(c.text_embed[:256].encode("utf-8"))
         return h.hexdigest()[:16]
 
@@ -263,8 +288,9 @@ class HybridArabicRetriever:
     def _sparse_scores(self, q: str):
         if self.tf_char is None or self.tf_word is None:
             return None, None
-        qc = self.tf_char.transform([ar_normalize(q)])
-        qw = self.tf_word.transform([ar_normalize(q)])
+        qn = ar_normalize(q)
+        qc = self.tf_char.transform([qn])
+        qw = self.tf_word.transform([qn])
         c_scores = (self.char_mat @ qc.T).toarray().ravel()
         w_scores = (self.word_mat @ qw.T).toarray().ravel()
         return c_scores, w_scores
@@ -313,13 +339,6 @@ class HybridArabicRetriever:
 
 # ======================= Optimized SambaLingo RAG =======================
 class OptimizedSambaLingoRAG:
-    """
-    Fast, Arabic-first RAG:
-      - Hybrid retriever (dense + TF-IDF) with caching
-      - SambaLingo Arabic chat model (4-bit NF4 by default)
-      - Short, focused prompt (keeps latency low)
-    """
-
     def __init__(self, jsonl_filepath: str, artifact_dir: str = "./artifacts", use_cache: bool = True):
         print("🚀 Initializing Optimized Arabic RAG System…")
         t0 = time.time()
@@ -362,7 +381,6 @@ class OptimizedSambaLingoRAG:
     # ---------- model ----------
     def _setup_sambanova_model(self):
         model_name = "sambanovasystems/SambaLingo-Arabic-Chat"
-        # quant config (good on RTX 4060+)
         try:
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -398,7 +416,6 @@ class OptimizedSambaLingoRAG:
         model.eval()
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
-
         try:
             if torch.__version__ >= "2.0":
                 model = torch.compile(model, mode="reduce-overhead")
@@ -473,7 +490,7 @@ class OptimizedSambaLingoRAG:
                 "answer": answer,
                 "context": context,
                 "metadata": meta,
-                "confidence": 0.8,   # simple heuristic baseline
+                "confidence": 0.8,
                 "time_taken": time.time()-t0
             }
         except Exception as e:
@@ -528,11 +545,45 @@ class OptimizedSambaLingoRAG:
         torch.cuda.empty_cache()
         print("✅ تم")
 
+# ======================= Auto-locate KB + Artifacts =======================
+def _auto_locate_kb() -> str:
+    """Find a sensible default KB file in your repo."""
+    # 1) env var
+    env = os.environ.get("AR_KB_JSONL")
+    if env and Path(env).exists():
+        print(f"📂 Using KB from AR_KB_JSONL={env}")
+        return env
+    # 2) common file names in your repo
+    candidates = [
+        "Data_pdf_clean_chunks.jsonl",
+        "arabic_chatbot_knowledge.jsonl",
+        "devset_10q.jsonl"
+    ]
+    for c in candidates:
+        if Path(c).exists():
+            print(f"📂 Using KB: {c}")
+            return c
+    # 3) helpful diagnostic
+    here = "\n".join(sorted([p.name for p in Path(".").iterdir()]))
+    raise FileNotFoundError(
+        "No KB JSONL found. Looked for: " + ", ".join(candidates) +
+        "\nSet AR_KB_JSONL=/path/to/your.jsonl\nRepo contents:\n" + here
+    )
+
+def _auto_artifact_dir() -> str:
+    """Prefer existing .artifact dir (matches your repo), else ./artifacts."""
+    if Path(".artifact").exists():
+        print("🗂  Using artifact dir: .artifact")
+        return ".artifact"
+    print("🗂  Using artifact dir: ./artifacts")
+    return "./artifacts"
+
 # ======================= Main =======================
 if __name__ == "__main__":
     try:
-        kb_path = os.environ.get("AR_KB_JSONL", "arabic_chatbot_knowledge.jsonl")
-        rag = OptimizedSambaLingoRAG(kb_path, artifact_dir="./artifacts", use_cache=True)
+        kb_path = _auto_locate_kb()
+        artifact_dir = _auto_artifact_dir()
+        rag = OptimizedSambaLingoRAG(kb_path, artifact_dir=artifact_dir, use_cache=True)
 
         # quick bench
         test_qs = [
