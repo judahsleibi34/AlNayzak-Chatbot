@@ -1,34 +1,40 @@
 # -*- coding: utf-8 -*-
 """
-Arabic RAG (Qwen2.5-7B-Instruct + multilingual-e5-base + optional reranker)
+NewRag.py — Arabic RAG with hybrid retrieval and configurable LLM.
 
-Fixes applied:
-- Grounded prompt (force citations, forbid speculation)
-- Embeddings upgrade to intfloat/multilingual-e5-base with proper prefixes
-- Hybrid retrieval (dense + TF-IDF) with weights tuned for policy docs
-- Optional Cross-Encoder reranker (Jina v2 multilingual) top40 -> keep topK
-- Robust KB detection, safer caching (adds file size+mtime to cache key)
-- Clean generation params (no deprecated flags), pad_token fix
-- Configurable top_k & context budget; light sentence-level selection
+✅ Fix included:
+    - Knowledge base path now uses a safe default.
+      Priority: --kb CLI  >  AR_KB_JSONL env  >  Data_pdf_clean_chunks.jsonl
 
-Usage:
-  python arabic_rag_qwen.py --kb Data_pdf_clean_chunks.jsonl --artifact .artifact --rerank
+Features:
+- Robust JSONL loader (tolerant to field naming)
+- Arabic normalization + sentence splitting
+- Hybrid retrieval (dense intfloat/multilingual-e5-base + TF-IDF char/word)
+- Optional Cross-Encoder reranker (Jina multilingual or mMiniLM)
+- Artifact caching (embeddings, FAISS, TF-IDF) keyed to file fingerprint
+- Grounded Arabic prompt with explicit citation style
+- LLM configurable (default Qwen2.5-7B-Instruct; SambaLingo also supported)
 
-Colab env:
+Run examples (Colab):
   %cd /content/AlNayzak-Chatbot
-  !python arabic_rag_qwen.py --kb Data_pdf_clean_chunks.jsonl --rerank
+  # If your file is Data_pdf_clean_chunks.jsonl (default):
+  !python NewRag.py --rerank
+  # Or select explicitly:
+  !python NewRag.py --kb Data_pdf_clean_chunks.jsonl --rerank
+  # Switch LLM to SambaLingo:
+  !python NewRag.py --llm sambanovasystems/SambaLingo-Arabic-Chat --rerank
 """
 
-import os, re, json, time, hashlib
+import os, re, json, time, hashlib, sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 
 import numpy as np
 
-# Optional deps
+# -------- optional deps ----------
 try:
-    import faiss
+    import faiss  # faiss-cpu
 except Exception:
     faiss = None
 
@@ -59,7 +65,7 @@ except Exception:
 AR_DIAC = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]')
 AR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"٠١٢٣٤٥٦٧٨٩")}
 IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
-SENT_SPLIT_RE = re.compile(r'(?<=[\.\!\؟\?،؛]|[\n—])\s+')
+SENT_SPLIT_RE = re.compile(r'(?<=[\.\!\؟\?،；;]|[\n—])\s+')
 
 def ar_normalize(s: str) -> str:
     if not s: return ""
@@ -121,7 +127,7 @@ class HybridRetriever:
         t0 = time.time()
         self.model = SentenceTransformer(model_name)
         self.model.max_seq_length = 384
-        print(f"✅ Embeddings ready in {time.time()-t0:.2f}s")
+        print(f"✅ Embedding model loaded in {time.time()-t0:.2f}s")
         self.chunks: List[Chunk] = []
         self.emb: Optional[np.ndarray] = None
         self.faiss = None
@@ -130,7 +136,6 @@ class HybridRetriever:
 
     def _encode(self, texts: List[str], is_query: bool) -> np.ndarray:
         tnorm = [ar_normalize(t) for t in texts]
-        # e5 requires prefixes
         if "intfloat/multilingual-e5" in self.model_name:
             pref = "query: " if is_query else "passage: "
             tnorm = [pref + t for t in tnorm]
@@ -138,14 +143,18 @@ class HybridRetriever:
 
     def load_jsonl(self, path: str) -> List[Dict]:
         rows = []
-        with open(path, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f, 1):
-                line = line.strip()
-                if not line: continue
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError as e:
-                    if i <= 10: print(f"⚠️ JSON error at line {i}: {e}")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for i, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line: continue
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        if i <= 10: print(f"⚠️ JSON error at line {i}: {e}")
+        except FileNotFoundError:
+            print(f"❌ File not found: {path}")
+            return []
         print(f"✅ Loaded {len(rows)} rows from {path}")
         return rows
 
@@ -291,7 +300,6 @@ class HybridRetriever:
         return reranked
 
     def sentence_pick(self, question: str, text: str) -> List[str]:
-        """Light sentence-level selection to reduce fluff."""
         qnorm = set([w for w in ar_normalize(question).split() if len(w)>=3])
         out = []
         for s in sent_split(text):
@@ -330,28 +338,25 @@ class HybridRetriever:
                 break
         return "\n\n".join(parts), meta
 
-# ---------------- Qwen2.5-7B LLM ----------------
-class QwenRAG:
+# ---------------- LLM wrapper ----------------
+class RAGPipeline:
     def __init__(self, kb_path: str, artifact_dir: str = ".artifact",
                  use_cache: bool = True, llm_name: str = "Qwen/Qwen2.5-7B-Instruct",
                  use_rerank: bool = False, top_k: int = 10, max_chars: int = 2200):
-        self.kb_path = kb_path
-        self.use_rerank = use_rerank
-        self.top_k = top_k
-        self.max_chars = max_chars
-
-        # retriever
+        print("🚀 Initializing Optimized Arabic RAG System…")
         print("📚 Setting up hybrid retriever…")
-        self.ret = HybridRetriever(artifact_dir=artifact_dir,
-                                   model_name="intfloat/multilingual-e5-base")
+        self.use_rerank = use_rerank; self.top_k = top_k; self.max_chars = max_chars
+
+        self.ret = HybridRetriever(artifact_dir=artifact_dir, model_name="intfloat/multilingual-e5-base")
         rows = self.ret.load_jsonl(kb_path)
         if not rows:
-            raise ValueError(f"Knowledge base is empty: {kb_path}")
+            raise ValueError("No data loaded from JSONL file")
         self.ret.prepare_chunks(rows)
         self.ret.build_or_load(kb_path, use_cache=use_cache)
 
-        # LLM
-        print("🧠 Loading Qwen model…")
+        print("🧠 Loading LLM…")
+        self.tok = AutoTokenizer.from_pretrained(llm_name, trust_remote_code=True)
+        if self.tok.pad_token is None: self.tok.pad_token = self.tok.eos_token
         quant = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
@@ -359,8 +364,6 @@ class QwenRAG:
             bnb_4bit_compute_dtype=torch.float16,
             llm_int8_enable_fp32_cpu_offload=True
         )
-        self.tok = AutoTokenizer.from_pretrained(llm_name, trust_remote_code=True)
-        if self.tok.pad_token is None: self.tok.pad_token = self.tok.eos_token
         self.model = AutoModelForCausalLM.from_pretrained(
             llm_name,
             device_map="auto",
@@ -374,13 +377,13 @@ class QwenRAG:
         try:
             if hasattr(torch, "compile") and torch.__version__ >= "2.0":
                 self.model = torch.compile(self.model, mode="reduce-overhead")
-                print("🚀 compiled with torch.compile")
+                print("🚀 Model compiled for faster inference")
         except Exception as e:
             print("ℹ️ compile skipped:", e)
         print(f"📊 Model on: {self.model.device}")
+        print("✅ RAG System initialized")
 
     def _prompt(self, question: str, context: str) -> str:
-        # Grounded, Arabic, with citations and fallback
         return (
             "أنت مساعد عربي دقيق. أجب فقط من النصوص الواردة في (السياق) أدناه. "
             "ضع إشارة مصدر بعد كل حقيقة بالشكل [المصدر n]. "
@@ -390,7 +393,7 @@ class QwenRAG:
             "الإجابة:"
         )
 
-    def generate(self, question: str, max_new_tokens: int = 320, temperature: float = 0.2) -> Dict:
+    def generate(self, question: str, max_new_tokens: int = 320, temperature: float = 0.2) -> Dict[str, Any]:
         t0 = time.time()
         context, meta = self.ret.build_context(
             question, max_chars=self.max_chars, top_k=self.top_k, use_rerank=self.use_rerank
@@ -427,12 +430,22 @@ class QwenRAG:
             print("\n🤖", r["answer"], "\n")
 
 # ---------------- main ----------------
-def auto_kb() -> str:
+def resolve_kb_path(cli_kb: Optional[str]) -> str:
+    """
+    Priority: CLI --kb > AR_KB_JSONL env > Data_pdf_clean_chunks.jsonl
+    """
+    if cli_kb:
+        return cli_kb
     env = os.environ.get("AR_KB_JSONL")
-    if env and Path(env).exists(): return env
-    for c in ["Data_pdf_clean_chunks.jsonl","arabic_chatbot_knowledge.jsonl"]:
-        if Path(c).exists(): return c
-    raise FileNotFoundError("KB JSONL not found. Set AR_KB_JSONL or pass --kb path.")
+    if env and Path(env).exists():
+        return env
+    default = "Data_pdf_clean_chunks.jsonl"
+    if Path(default).exists():
+        return default
+    raise FileNotFoundError(
+        "Knowledge base JSONL not found. "
+        "Set --kb, or AR_KB_JSONL, or place Data_pdf_clean_chunks.jsonl in the working directory."
+    )
 
 if __name__ == "__main__":
     import argparse
@@ -445,36 +458,41 @@ if __name__ == "__main__":
     ap.add_argument("--rerank", action="store_true", help="Enable cross-encoder reranker")
     ap.add_argument("--top-k", type=int, default=10, help="Top K chunks for context")
     ap.add_argument("--max-chars", type=int, default=2200, help="Context character budget")
-    ap.add_argument("--llm", type=str, default="Qwen/Qwen2.5-7B-Instruct", help="LLM name")
+    ap.add_argument("--llm", type=str, default="Qwen/Qwen2.5-7B-Instruct",
+                    help="LLM, e.g., 'Qwen/Qwen2.5-7B-Instruct' or 'sambanovasystems/SambaLingo-Arabic-Chat'")
     args = ap.parse_args()
 
-    kb = args.kb or auto_kb()
-    print(f"📂 Using KB: {kb}")
-    print(f"🗂  Using artifact dir: {args.artifact}")
+    try:
+        kb_path = resolve_kb_path(args.kb)
+        print(f"📂 Using KB: {kb_path}")
+        print(f"🗂  Using artifact dir: {args.artifact}")
 
-    rag = QwenRAG(
-        kb_path=kb,
-        artifact_dir=args.artifact,
-        use_cache=not args.no_cache,
-        llm_name=args.llm,
-        use_rerank=args.rerank,
-        top_k=args.top_k,
-        max_chars=args.max_chars
-    )
+        rag = RAGPipeline(
+            kb_path=kb_path,
+            artifact_dir=args.artifact,
+            use_cache=not args.no_cache,
+            llm_name=args.llm,
+            use_rerank=args.rerank,
+            top_k=args.top_k,
+            max_chars=args.max_chars
+        )
 
-    # Quick smoke test
-    print("\n🧪 Benchmark…")
-    qs = [
-        "ما هي سياسات التوظيف في مؤسسة النيزك؟",
-        "كيف يمكن التقدم للوظائف؟",
-        "ما هي المستندات المطلوبة للموظف الجديد؟",
-    ]
-    tot = 0.0
-    for q in qs:
-        print(f"\n1. {q}")
-        r = rag.generate(q)
-        print(f"⏱ {r['time']:.2f}s | 🤖 {r['answer'][:220]}…")
+        # Quick smoke test
+        print("\n🧪 Benchmark…")
+        tests = [
+            "ما هي سياسات التوظيف في مؤسسة النيزك؟",
+            "كيف يمكن التقدم للوظائف؟",
+            "ما هي المستندات المطلوبة للموظف الجديد؟",
+        ]
+        for q in tests:
+            print(f"\n• {q}")
+            r = rag.generate(q)
+            print(f"⏱ {r['time']:.2f}s | 🤖 {r['answer'][:220]}…")
 
-    print("\n💬 Starting chat…")
-    # Comment the next line if you don't want interactive mode in Colab:
-    # rag.chat()
+        # Start chat (comment out in notebooks if undesired)
+        print("\n💬 Starting chat…")
+        # rag.chat()
+
+    except Exception as e:
+        print(f"❌ خطأ في النظام: {e}")
+        raise
