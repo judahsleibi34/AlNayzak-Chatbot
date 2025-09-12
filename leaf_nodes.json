@@ -1,0 +1,93 @@
+[
+  {
+    "path": [
+      "قسم غير معنون",
+      "غير مصنف"
+    ],
+    "title": "غير مصنف"
+  },
+  {
+    "path": [
+      "ساعات العمل",
+      "HR:WorkHours"
+    ],
+    "title": "HR:WorkHours"
+  },
+  {
+    "path": [
+      "العمل الإضافي",
+      "HR:Overtime"
+    ],
+    "title": "HR:Overtime"
+  },
+  {
+    "path": [
+      "الإجازات",
+      "HR:Leaves"
+    ],
+    "title": "HR:Leaves"
+  },
+  {
+    "path": [
+      "التدريب",
+      "HR:Training"
+    ],
+    "title": "HR:Training"
+  },
+  {
+    "path": [
+      "التوظيف",
+      "HR:Recruitment"
+    ],
+    "title": "HR:Recruitment"
+  },
+  {
+    "path": [
+      "الرواتب",
+      "HR:Payroll"
+    ],
+    "title": "HR:Payroll"
+  },
+  {
+    "path": [
+      "المشتريات",
+      "Finance:Procurement"
+    ],
+    "title": "Finance:Procurement"
+  },
+  {
+    "path": [
+      "الأصول والعهدة",
+      "Finance:Assets"
+    ],
+    "title": "Finance:Assets"
+  },
+  {
+    "path": [
+      "السفر",
+      "Admin:Travel"
+    ],
+    "title": "Admin:Travel"
+  },
+  {
+    "path": [
+      "مدونة السلوك",
+      "Ethics:Code"
+    ],
+    "title": "Ethics:Code"
+  },
+  {
+    "path": [
+      "العمل عن بعد",
+      "HR:RemoteWork"
+    ],
+    "title": "HR:RemoteWork"
+  },
+  {
+    "path": [
+      "النثريات",
+      "Finance:PettyCash"
+    ],
+    "title": "Finance:PettyCash"
+  }
+]

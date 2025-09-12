@@ -1,0 +1,10 @@
+{"q": "ما مدة الإجازة السنوية؟", "expect_section": "الإجازات", "numeric_expected": true, "expected_units": ["يوم", "أيام"], "expect_substrings": ["الاجازة", "سنوية"]}
+{"q": "كم يومًا تكون إجازة العيد؟", "expect_section": "الإجازات", "numeric_expected": true, "expected_units": ["يوم", "أيام"], "expect_substrings": ["العيد", "اجازة"]}
+{"q": "إجراءات طلب الإجازة المرضية", "expect_section": "الإجازات", "numeric_expected": false, "expected_units": [], "expect_substrings": ["اجازة", "مرض"]}
+{"q": "ساعات العمل الرسمية أسبوعيًا؟", "expect_section": "ساعات العمل", "numeric_expected": true, "expected_units": ["ساعة", "ساعات", "أسبوع", "أسابيع"], "expect_substrings": ["ساعات", "العمل"]}
+{"q": "متى يبدأ وينتهي الدوام اليومي؟", "expect_section": "ساعات العمل", "numeric_expected": false, "expected_units": [], "expect_substrings": ["دوام", "يومي"]}
+{"q": "من المؤهل للعمل عن بعد؟", "expect_section": "العمل عن بعد", "numeric_expected": false, "expected_units": [], "expect_substrings": ["عن بعد", "مؤهل"]}
+{"q": "ما سياسة أيام العمل عن بعد؟", "expect_section": "العمل عن بعد", "numeric_expected": true, "expected_units": ["يوم", "أيام", "أسبوع", "أسابيع", "شهر", "أشهر"], "expect_substrings": ["سياسة", "عن بعد"]}
+{"q": "متى يتم صرف الرواتب؟", "expect_section": "الرواتب", "numeric_expected": false, "expected_units": [], "expect_substrings": ["صرف", "رواتب"]}
+{"q": "ما هي مدونة السلوك؟", "expect_section": "مدونة السلوك", "numeric_expected": false, "expected_units": [], "expect_substrings": ["مدونة", "السلوك"]}
+{"q": "ما عقوبة انتهاك مدونة السلوك؟", "expect_section": "مدونة السلوك", "numeric_expected": false, "expected_units": [], "expect_substrings": ["عقوبة", "مدونة", "السلوك"]}
