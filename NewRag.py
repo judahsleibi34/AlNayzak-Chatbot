@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — Fixed version with direct work hours extraction
+RAG Orchestrator (Arabic) — Fixed version that properly uses your retrieval system
 """
 
 import os, re, time, argparse, logging
@@ -51,109 +51,32 @@ def split_sources_block(extractive: str) -> Tuple[str, List[str]]:
             srcs.append(s)
     return body, srcs
 
-# ---------------- File hash helper ----------------
-
-def _file_hash(path: str) -> str:
-    """Calculate file hash - copied from retrieval model to ensure consistency"""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(1<<20)
-            if not b: break
-            h.update(b)
-    return h.hexdigest()
-
 # ---------------- Work Hours Specific Handler ----------------
 
 def extract_work_hours_answer(index: RET.HybridIndex, question: str, intent: str) -> str:
     """
-    Directly extract work hours information using the retrieval model's built-in functions
+    Directly use your retrieval system's built-in work hours extraction
     """
-    # Use the retrieval model's answer function first
+    # Use your retrieval system's answer function with rerank enabled
     extractive_answer = RET.answer(question, index, intent, use_rerank_flag=True)
     
-    # Try to extract time ranges from the extractive answer
-    body, sources = split_sources_block(extractive_answer)
+    # If the extractive answer contains actual work hours, return it
+    if "ساعات الدوام" in extractive_answer and ("من" in extractive_answer and "إلى" in extractive_answer):
+        return extractive_answer
     
-    # Look for time ranges in the body
-    if body:
-        ranges = RET.extract_all_ranges(body, intent)
-        if ranges:
-            best_range = RET.pick_best_range(ranges)
-            if best_range:
-                a, b = best_range
-                suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
-                answer = f"ساعات الدوام{suffix} من {a} إلى {b}."
-                return f"⏱ 0.10s | 🤖 {answer}\n{join_sources(sources[:3])}"
-    
-    # If that fails, do a more thorough search through retrieved chunks
+    # If not, try to extract time ranges manually from the retrieved chunks
     hits = RET.retrieve(index, question, rerank=True)
     if hits:
-        for _, i in hits[:15]:  # Check top 15 hits
-            chunk = index.chunks[i]
-            sentences = RET.sent_split(chunk.text)
-            for s in sentences:
-                # Check for time ranges in each sentence
-                ranges = RET.extract_all_ranges(s, intent)
-                if ranges:
-                    best_range = RET.pick_best_range(ranges)
-                    if best_range:
-                        a, b = best_range
-                        suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
-                        answer = f"ساعات الدوام{suffix} من {a} إلى {b}."
-                        sources = [f"1. Data_pdf.pdf - page {chunk.page}"]
-                        return f"⏱ 0.15s | 🤖 {answer}\n{join_sources(sources)}"
+        chunks = index.chunks
+        # Use your retrieval system's compose hours answer function directly
+        composed = RET._compose_hours_answer(chunks, hits, intent)
+        if composed:
+            return composed
     
-    # Manual search for common work hour patterns
-    work_hour_patterns = [
-        r"من\s*(\d{1,2}[:.]\d{2}?)\s*(?:الى|إلى|حتى)\s*(\d{1,2}[:.]\d{2}?)",
-        r"(\d{1,2}[:.]\d{2}?)\s*(?:الى|إلى|حتى)\s*(\d{1,2}[:.]\d{2}?)",
-        r"الساعة\s*(\d{1,2}[:.]\d{2}?)\s*(?:الى|إلى|حتى)\s*(\d{1,2}[:.]\d{2}?)"
-    ]
-    
-    if hits:
-        for _, i in hits[:10]:
-            chunk = index.chunks[i]
-            text = chunk.text
-            for pattern in work_hour_patterns:
-                matches = re.findall(pattern, text, re.IGNORECASE)
-                if matches:
-                    for match in matches:
-                        start_time, end_time = match
-                        # Normalize time format
-                        start_time = start_time.replace('.', ':')
-                        end_time = end_time.replace('.', ':')
-                        if ':' not in start_time:
-                            start_time += ":00"
-                        if ':' not in end_time:
-                            end_time += ":00"
-                        suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
-                        answer = f"ساعات الدوام{suffix} من {start_time} إلى {end_time}."
-                        sources = [f"1. Data_pdf.pdf - page {chunk.page}"]
-                        return f"⏱ 0.20s | 🤖 {answer}\n{join_sources(sources)}"
-    
-    # If we still can't find specific hours, fall back to the extractive answer
-    if body and len(body) > 10:
-        # Check if the body contains work hour keywords
-        work_keywords = ["ساعات", "دوام", "العمل", "من", "الى", "إلى", "حتى"]
-        normalized_body = RET.ar_normalize(body)
-        if any(keyword in normalized_body for keyword in work_keywords):
-            return f"⏱ 0.25s | 🤖 {body}\n{join_sources(sources[:3])}"
-    
-    # Ultimate fallback - search for any sentence with work hour keywords
-    if hits:
-        for _, i in hits[:5]:
-            chunk = index.chunks[i]
-            sentences = RET.sent_split(chunk.text)
-            for s in sentences:
-                normalized_s = RET.ar_normalize(s)
-                if any(keyword in normalized_s for keyword in ["ساعات", "دوام", "العمل"]):
-                    return f"⏱ 0.30s | 🤖 {s}\nالمصادر:\n1. Data_pdf.pdf - page {chunk.page}"
-    
-    # If nothing works, return a more informative message
-    return f"⏱ 0.35s | 🤖 لا توجد معلومات كافية عن ساعات الدوام في المستندات المتوفرة."
+    # Fallback to the original extractive answer
+    return extractive_answer
 
-# ---------------- General Answer Handler ----------------
+# ---------------- Answer Handler ----------------
 
 def ask_once(index: RET.HybridIndex,
              tokenizer, model,
@@ -162,20 +85,26 @@ def ask_once(index: RET.HybridIndex,
     t0 = time.time()
     intent = RET.classify_intent(question)
     
-    # Special handling for work hours questions
+    # Special handling for work hours questions - use your retrieval system directly
     if intent in ("work_hours", "ramadan_hours"):
-        return extract_work_hours_answer(index, question, intent)
+        result = extract_work_hours_answer(index, question, intent)
+        # Add timing if not present
+        if not result.startswith("⏱"):
+            dt = time.time() - t0
+            if not result.startswith("🤖"):
+                result = f"⏱ {dt:.2f}s | 🤖 {result}"
+        return result
     
-    # For other intents, use the retrieval model's answer function
+    # For other intents, use your retrieval system's answer function
     extractive_answer = RET.answer(question, index, intent, use_rerank_flag=True)
     
     # If not using LLM, return extractive answer directly
     if not use_llm or tokenizer is None or model is None:
         dt = time.time() - t0
-        # Just clean up the timing
-        if extractive_answer.startswith("⏱"):
-            return extractive_answer
-        return f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
+        # Add timing if not present
+        if not extractive_answer.startswith("⏱"):
+            return f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
+        return extractive_answer
     
     # Use LLM for refinement (if enabled)
     body, sources = split_sources_block(extractive_answer)
@@ -233,6 +162,18 @@ def run_sanity(index: RET.HybridIndex, tokenizer, model, use_llm: bool):
         out = ask_once(index, tokenizer, model, q, use_llm=use_llm)
         print(out, "\n")
 
+# ---------------- File hash helper (to match your retrieval system) ----------------
+
+def _file_hash(path: str) -> str:
+    """Calculate file hash - copied from retrieval model to ensure consistency"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1<<20)
+            if not b: break
+            h.update(b)
+    return h.hexdigest()
+
 # ---------------- CLI ----------------
 
 def main():
@@ -250,10 +191,10 @@ def main():
     ap.add_argument("--use-8bit", action="store_true")
     args = ap.parse_args()
 
-    # Build/load index from your retriever
+    # Build/load index from your retriever - ensure hash consistency
     hier = RET.load_hierarchy(args.hier_index, args.aliases)
     
-    # Load chunks and calculate hash
+    # Load chunks and calculate hash (using your retrieval system's function)
     if not os.path.exists(args.chunks):
         LOG.error("Chunks file not found: %s", args.chunks)
         return
@@ -261,15 +202,27 @@ def main():
     chunks, chunks_hash = RET.load_chunks(path=args.chunks)
     index = RET.HybridIndex(chunks, chunks_hash, hier=hier)
 
-    # Try to load existing index
+    # Try to load existing index with better error handling
     loaded = False
     if args.load_index and os.path.exists(args.load_index):
         try:
+            # Temporarily suppress warnings to avoid hash mismatch noise
+            import logging
+            retrieval_logger = logging.getLogger("retrival_model")
+            original_level = retrieval_logger.level
+            retrieval_logger.setLevel(logging.ERROR)
+            
             loaded = index.load(args.load_index)
-            if not loaded:
-                LOG.warning("Failed to load index artifacts, will rebuild")
+            
+            # Restore original logging level
+            retrieval_logger.setLevel(original_level)
+            
+            if loaded:
+                LOG.info("Index loaded successfully")
+            else:
+                LOG.info("Will rebuild index")
         except Exception as e:
-            LOG.warning(f"Error loading index: {e}, will rebuild")
+            LOG.warning(f"Could not load index, will rebuild: {e}")
     
     # Build index if not loaded
     if not loaded:
