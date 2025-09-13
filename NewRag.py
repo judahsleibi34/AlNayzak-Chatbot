@@ -2,24 +2,26 @@
 """
 RAG Orchestrator (Arabic) — Fixed version
 
-- Improved prompt engineering for better LLM responses
-- Better evidence selection with relevance scoring
-- More robust fallback mechanisms
-- Cleaner response formatting
+- Calls your retriever with rerank=True (better hits)
+- Softer intent satisfaction (don't require times to exist to accept work_hours)
+- Two-pass evidence mining: strict (with numbers) then soft (keywords)
+- Single-paragraph Arabic answer
+- Numeric guard: if LLM injects numbers not in evidence -> fallback to extractive
+- Clean 'المصادر:' block (no duplicate 'Sources:')
 
 Usage
 -----
 # Build index once and cache:
-python rag_qwen_fixed.py --chunks Data_pdf_clean_chunks.jsonl --save-index .artifact --sanity --model Qwen/Qwen2.5-7B-Instruct
+python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --save-index .artifact --sanity --model Qwen/Qwen2.5-7B-Instruct
 
 # Load cached index and run sanity:
-python rag_qwen_fixed.py --load-index .artifact --sanity --model Qwen/Qwen2.5-7B-Instruct
+python NewRag.py --load-index .artifact --sanity --model Qwen/Qwen2.5-7B-Instruct
 
 # Ask one question:
-python rag_qwen_fixed.py --load-index .artifact --ask "ما هي ساعات الدوام الرسمية من وإلى؟" --model Qwen/Qwen2.5-7B-Instruct
+python NewRag.py --load-index .artifact --ask "ما هي ساعات الدوام الرسمية من وإلى؟" --model Qwen/Qwen2.5-7B-Instruct
 
 # Extractive only (no LLM):
-python rag_qwen_fixed.py --load-index .artifact --no-llm --ask "ما ساعات العمل في شهر رمضان؟ وهل تتغير؟"
+python NewRag.py --load-index .artifact --no-llm --ask "ما ساعات العمل في شهر رمضان؟ وهل تتغير؟"
 """
 
 import os, re, time, argparse, logging
@@ -129,56 +131,122 @@ def extractive_answers_intent(question: str, intent: str, body: str) -> bool:
     # generic relaxed check
     return sentence_satisfies_intent_soft(body, intent)
 
-# ---------------- Evidence miner: improved with relevance scoring ----------------
+# ---------------- Evidence miner: strict -> soft ----------------
 
 def mine_intent_evidence(index: RET.HybridIndex, question: str, intent: str,
-                         topk: int = 15, max_snippets: int = 4) -> Tuple[str, List[str]]:
+                         topk: int = 12, max_snippets: int = 3) -> Tuple[str, List[str]]:
     """
-    Improved evidence mining with better relevance scoring
+    Strict pass: sentences that fully satisfy intent with numbers (when applicable).
+    Soft pass: relaxed keyword-based satisfaction if strict found nothing.
     """
     hits = RET.retrieve(index, question, rerank=True)
     if not hits:
         return "", []
 
-    # Score sentences based on relevance to question
-    scored_sentences = []
-    question_norm = RET.ar_normalize(question)
-    q_terms = set(question_norm.split())
+    picked, srcs, seen = [], [], set()
+    # ---- STRICT PASS ----
+    for _, i in hits[:topk]:
+        ch = index.chunks[i]
+        for s in RET.sent_split(ch.text):
+            ss = s.strip()
+            if not ss or ss in seen: 
+                continue
+            ok = False
+            if intent in ("work_hours", "ramadan_hours"):
+                ok = bool(RET.extract_all_ranges(ss, intent))
+            elif intent in ("overtime", "leave", "procurement", "per_diem"):
+                # Prefer sentences with numbers for these intents
+                ok = sentence_satisfies_intent_soft(ss, intent) and bool(numbers_in(ss))
+            else:
+                ok = sentence_satisfies_intent_soft(ss, intent)
+            if ok:
+                picked.append(ss)
+                srcs.append(f"{len(srcs)+1}. Data_pdf.pdf - page {ch.page}")
+                seen.add(ss)
+                if len(picked) >= max_snippets:
+                    break
+        if len(picked) >= max_snippets:
+            break
+
+    # ---- SOFT PASS (if nothing strict) ----
+    if not picked:
+        for _, i in hits[:topk]:
+            ch = index.chunks[i]
+            for s in RET.sent_split(ch.text):
+                ss = s.strip()
+                if not ss or ss in seen:
+                    continue
+                if sentence_satisfies_intent_soft(ss, intent):
+                    picked.append(ss)
+                    srcs.append(f"{len(srcs)+1}. Data_pdf.pdf - page {ch.page}")
+                    seen.add(ss)
+                    if len(picked) >= max_snippets:
+                        break
+            if len(picked) >= max_snippets:
+                break
+
+    if not picked:
+        return "", []
+    return " ".join(picked), srcs
+
+def mine_work_hours_evidence(index: RET.HybridIndex, question: str, intent: str,
+                           topk: int = 20, max_snippets: int = 5) -> Tuple[str, List[str]]:
+    """
+    Specialized evidence mining for work hours intents
+    """
+    hits = RET.retrieve(index, question, rerank=True)
+    if not hits:
+        return "", []
+
+    picked = []
+    sources = []
+    seen = set()
+    
+    # First pass: Look for sentences with explicit time ranges
+    for _, i in hits[:topk]:
+        ch = index.chunks[i]
+        for s in RET.sent_split(ch.text):
+            ss = s.strip()
+            if not ss or ss in seen:
+                continue
+                
+            # Check if this sentence contains time ranges
+            ranges = RET.extract_all_ranges(s, intent)
+            if ranges:
+                picked.append(ss)
+                sources.append(f"{len(sources)+1}. Data_pdf.pdf - page {ch.page}")
+                seen.add(ss)
+                if len(picked) >= max_snippets:
+                    break
+        if len(picked) >= max_snippets:
+            break
+    
+    # If we found time ranges, return them
+    if picked:
+        return " ".join(picked), sources
+    
+    # Second pass: Look for work hour keywords
+    work_hour_keywords = ["ساعات", "دوام", "العمل", "من", "الى", "حتى", "إلى", "الساعة", "الوقت", "الحضور", "المغادرة"]
     
     for _, i in hits[:topk]:
         ch = index.chunks[i]
         for s in RET.sent_split(ch.text):
             ss = s.strip()
-            if not ss:
+            if not ss or ss in seen:
                 continue
                 
-            # Calculate relevance score
-            s_norm = RET.ar_normalize(ss)
-            s_terms = set(s_norm.split())
-            overlap = len(q_terms & s_terms)
-            
-            # Intent-specific bonuses
-            intent_match = sentence_satisfies_intent_soft(ss, intent)
-            
-            score = overlap + (2 if intent_match else 0)
-            
-            if score > 0:
-                scored_sentences.append((score, ss, ch.page))
+            sn = RET.ar_normalize(ss)
+            # Check if sentence contains work hour related terms
+            if any(keyword in sn for keyword in work_hour_keywords):
+                picked.append(ss)
+                sources.append(f"{len(sources)+1}. Data_pdf.pdf - page {ch.page}")
+                seen.add(ss)
+                if len(picked) >= max_snippets:
+                    break
+        if len(picked) >= max_snippets:
+            break
     
-    # Sort by score and take top snippets
-    scored_sentences.sort(key=lambda x: x[0], reverse=True)
-    
-    picked = []
-    sources = []
-    seen = set()
-    
-    for score, sentence, page in scored_sentences[:max_snippets]:
-        if sentence not in seen:
-            picked.append(sentence)
-            sources.append(f"{len(sources)+1}. Data_pdf.pdf - page {page}")
-            seen.add(sentence)
-    
-    return "\n".join(picked), sources
+    return " ".join(picked), sources
 
 # ---------------- LLM (Qwen) editor ----------------
 
@@ -269,8 +337,12 @@ def ask_once(index: RET.HybridIndex,
     t0 = time.time()
     intent = RET.classify_intent(question)
 
-    # Get evidence first with improved mining
-    evidence_text, sources = mine_intent_evidence(index, question, intent, topk=15, max_snippets=4)
+    # Special handling for work hours intents
+    if intent in ("work_hours", "ramadan_hours"):
+        evidence_text, sources = mine_work_hours_evidence(index, question, intent, topk=20, max_snippets=5)
+    else:
+        # Use regular evidence mining for other intents
+        evidence_text, sources = mine_intent_evidence(index, question, intent, topk=15, max_snippets=4)
     
     # If no good evidence found, fall back to extractive
     if not evidence_text.strip():
@@ -282,7 +354,20 @@ def ask_once(index: RET.HybridIndex,
             dt = time.time() - t0
             return f"⏱ {dt:.2f}s | 🤖 لا توجد معلومات كافية في السياق للإجابة على هذا السؤال."
 
-    # Use LLM to synthesize answer
+    # For work hours, try to extract explicit time ranges first
+    if intent in ("work_hours", "ramadan_hours"):
+        for sentence in RET.sent_split(evidence_text):
+            ranges = RET.extract_all_ranges(sentence, intent)
+            if ranges:
+                best_range = RET.pick_best_range(ranges)
+                if best_range:
+                    a, b = best_range
+                    suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
+                    answer = f"ساعات الدوام{suffix} من {a} إلى {b}."
+                    dt = time.time() - t0
+                    return f"⏱ {dt:.2f}s | 🤖 {answer}\n{join_sources(sources[:2])}"
+
+    # Use LLM to synthesize answer (only if not using --no-llm)
     if use_llm and tokenizer is not None and model is not None:
         try:
             response = llm_generate_answer(tokenizer, model, question, evidence_text)
@@ -298,11 +383,18 @@ def ask_once(index: RET.HybridIndex,
     # Fallback to evidence-based answer
     dt = time.time() - t0
     if evidence_text.strip():
-        # Simple extraction of relevant info
+        # For work hours, prioritize sentences with time information
+        if intent in ("work_hours", "ramadan_hours"):
+            sentences = RET.sent_split(evidence_text)
+            for s in sentences:
+                if any(word in RET.ar_normalize(s) for word in ["ساعات", "دوام", "من", "الى", "إلى", "حتى"]):
+                    return f"⏱ {dt:.2f}s | 🤖 {s}\n{join_sources(sources[:2])}"
+        
+        # General fallback
         sentences = RET.sent_split(evidence_text)
         if sentences:
             answer = sentences[0]  # Take the most relevant sentence
-            return f"⏱ {dt:.2f}s | 🤖 {answer}\n{join_sources(sources)}"
+            return f"⏱ {dt:.2f}s | 🤖 {answer}\n{join_sources(sources[:3])}"
     
     return f"⏱ {dt:.2f}s | 🤖 لا توجد معلومات كافية في السياق للإجابة على هذا السؤال."
 
