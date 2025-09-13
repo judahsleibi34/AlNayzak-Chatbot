@@ -1,383 +1,346 @@
 # -*- coding: utf-8 -*-
 """
-RAG (Arabic) with Qwen2.5-7B-Instruct, using YOUR retriever (retrival_model.py).
+RAG driver on top of your retriever (retrival_model.py), tuned for Arabic.
 
-- Loads HybridIndex from your artifacts (fast) or builds/saves if needed
-- Uses your `retrieve(...)`, `best_snippet(...)`, `classify_intent(...)`
-- Extractive-style context + concise Arabic answer
-- Safe defaults: if no --chunks passed, it tries Data_pdf_clean_chunks.jsonl in CWD
-- Fixes attention_mask warning, avoids invalid generation flags
+- Uses your HybridIndex / combine_scores exactly as-is
+- Adds Arabic reranking with BAAI/bge-reranker-v2-m3
+- Expands time-range lines to ±2 sentences
+- Builds compact context (<=1400 chars)
+- Prompts Qwen2.5-7B-Instruct via chat template
+- Outputs ONE continuous Arabic paragraph (no bullets)
 
-Usage examples
---------------
-# 1) Fast load from saved index
-python rag_qwen25_external.py --chunks Data_pdf_clean_chunks.jsonl --load-index .artifact --rerank --chat
+Usage (examples):
+  # build/load index, then run sanity questions with Qwen
+  python rag_qwen25.py --chunks Data_pdf_clean_chunks.jsonl --load-index .artifact --model Qwen/Qwen2.5-7B-Instruct --sanity
 
-# 2) Build then save artifacts (first run), then sanity test
-python rag_qwen25_external.py --chunks Data_pdf_clean_chunks.jsonl --save-index .artifact --sanity --rerank
+  # interactive chat
+  python rag_qwen25.py --chunks Data_pdf_clean_chunks.jsonl --load-index .artifact --model Qwen/Qwen2.5-7B-Instruct
 
-# 3) Quick benchmark on a few HR questions
-python rag_qwen25_external.py --chunks Data_pdf_clean_chunks.jsonl --load-index .artifact --bench
+Colab/T4 note:
+- 4-bit quantization is enabled (BitsAndBytes). If bnb is missing, it falls back.
 """
 
-import os, sys, argparse, time, re
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+import os, re, json, argparse, time, logging
+from typing import List, Tuple, Optional
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
-# Optional quantization (BitsAndBytes)
-_USE_BNB = True
-try:
-    from transformers import BitsAndBytesConfig
-except Exception:
-    _USE_BNB = False
+# ---- your retriever (keep it unchanged) ----
+from retrival_model import (
+    HybridIndex, load_chunks, load_hierarchy, combine_scores,
+    ar_normalize, sent_split, classify_intent
+)
 
-# ----------------------------
-# Bring in YOUR retriever bits
-# ----------------------------
-# Make sure this file is in the same folder as retrival_model.py
-try:
-    from retrival_model import (
-        HybridIndex, load_chunks, load_hierarchy,
-        retrieve, best_snippet, classify_intent, ar_normalize, SANITY_PROMPTS
-    )
-except Exception as e:
-    print("❌ Could not import retrival_model.py. Make sure it exists next to this script.")
-    raise
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+LOG = logging.getLogger("rag")
 
-DEFAULT_CHUNKS = "Data_pdf_clean_chunks.jsonl"
-DEFAULT_HIER   = "heading_inverted_index.json"
-DEFAULT_ALIAS  = "section_aliases.json"
-DEFAULT_ART    = ".artifact"
+# Arabic time-range regex (same spirit as your retriever)
+TIME_RE = re.compile(
+    r'(?:من\s*)?(\d{1,2}(?::|\.)?\d{0,2})\s*(?:[-–—]|الى|إلى|حتي|حتى)\s*(\d{1,2}(?::|\.)?\d{0,2})'
+)
 
-@dataclass
-class Hit:
-    score: float
-    idx: int
-    page: int
-    source: str
-    text: str
-    snippet: str
+def has_time_range(s: str) -> bool:
+    return bool(TIME_RE.search(ar_normalize(s)))
 
-def _fmt_source(page: int, source: str = "Data_pdf.pdf") -> str:
-    return f"{source} - ص{page}"
+# -------------- Arabic reranker --------------
+CE_MODEL = "BAAI/bge-reranker-v2-m3"
+_ce = None
+def ensure_reranker(device: str):
+    global _ce
+    if _ce is not None:
+        return _ce
+    try:
+        from sentence_transformers.cross_encoder import CrossEncoder
+        _ce = CrossEncoder(CE_MODEL, device=device)
+        LOG.info("Loaded Arabic reranker: %s", CE_MODEL)
+    except Exception as e:
+        LOG.warning("Could not load reranker (%s). Proceeding without.", e)
+        _ce = None
+    return _ce
 
-def _select_snippets(
-    question: str,
-    intent: str,
-    index: HybridIndex,
-    prelim: List[Tuple[float,int]],
-    top_k: int = 8,
-    max_snippet_len: int = 320
-) -> List[Hit]:
-    """Turn (score, idx) into ready-to-pack context snippets with pages/sources."""
-    qn = ar_normalize(question)
-    hits: List[Hit] = []
-    used_ids = set()
-    for sc, i in prelim[:top_k]:
-        if i in used_ids:
-            continue
-        used_ids.add(i)
-        ch = index.chunks[i]
-        sn = best_snippet(ch, qn, intent, max_len=max_snippet_len)
-        if not sn:
-            # fallback to trimmed chunk text
-            raw = (ch.text or "").strip()
-            sn = raw[:max_snippet_len] + ("…" if len(raw) > max_snippet_len else "")
-        hits.append(Hit(score=float(sc), idx=int(i), page=int(ch.page), source="Data_pdf.pdf", text=ch.text, snippet=sn))
-    return hits
+# -------------- Retrieval → candidates --------------
+def retrieve_candidates(index: HybridIndex, query: str,
+                        topk_dense=120, hybrid_topk=30,
+                        w_dense=0.70, w_char=0.15, w_word=0.15) -> List[Tuple[float, int]]:
+    qn = ar_normalize(query)
+    dS, dI = index.dense(qn, topk=topk_dense, restrict_ids=None)
+    cS, wS = index.sparse(qn)
+    prelim = combine_scores(dS, dI, cS, wS, w_dense=w_dense, w_char=w_char, w_word=w_word, topk=hybrid_topk)
+    # prelim = [(score, idx), ...]
+    return prelim
 
-def _build_context_blocks(hits: List[Hit], max_chars: int = 1600) -> Tuple[str, List[Dict]]:
-    """Pack snippets into a single string with per-source headers; keep under max_chars."""
+def apply_rerank(index: HybridIndex, query: str, prelim: List[Tuple[float, int]],
+                 device: str, keep_top=8) -> List[Tuple[float, int]]:
+    ce = ensure_reranker(device)
+    if ce is None or len(prelim) <= 1:
+        return prelim[:keep_top]
+
+    pairs = [(query, index.chunks[i].text) for _, i in prelim]
+    try:
+        ce_scores = ce.predict(pairs)  # higher is better
+        scored = list(zip([float(s) for s in ce_scores], [i for _, i in prelim]))
+        scored.sort(key=lambda x: -x[0])
+        return scored[:keep_top]
+    except Exception as e:
+        LOG.warning("Rerank failed: %s", e)
+        return prelim[:keep_top]
+
+# -------------- Snippet/window builder --------------
+def best_sentence_idx(text: str, query_norm: str) -> Optional[int]:
+    sents = sent_split(text)
+    if not sents:
+        return None
+    q_terms = set([w for w in query_norm.split() if len(w) >= 3])
+    best_k, best_score = None, -1e9
+    for k, s in enumerate(sents):
+        sn = ar_normalize(s)
+        overlap = len(q_terms & set(sn.split()))
+        score = overlap
+        if has_time_range(s):  # strong signal for hours/policies
+            score += 1.5
+        if score > best_score:
+            best_score, best_k = score, k
+    return best_k
+
+def window_around_sentence(text: str, center_idx: int, win=2) -> str:
+    sents = sent_split(text)
+    if not sents:
+        return text.strip()
+    lo = max(0, center_idx - win)
+    hi = min(len(sents), center_idx + win + 1)
+    return " ".join(sents[lo:hi]).strip()
+
+def build_context(index: HybridIndex, query: str, hits: List[Tuple[float,int]],
+                  max_chars=1400, prefer_time: bool = False) -> Tuple[str, List[Tuple[int,int]]]:
+    """
+    Returns (context, [(rank, chunk_idx), ...]).
+    Each context block is prefixed with [المصدر N: filename - صX]
+    """
+    used = []
     parts: List[str] = []
-    meta: List[Dict] = []
     total = 0
-    for k, h in enumerate(hits, 1):
-        header = f"[المصدر {k}: {h.source} - ص{h.page}]"
-        block = f"{header}\n{h.snippet}"
-        add = len(block) + 2
-        if total + add > max_chars:
-            # try a smaller tail if we still can add something meaningful
-            room = max_chars - total - len(header) - 2
-            if room > 80:
-                short = h.snippet[:room] + "…"
-                parts.append(f"{header}\n{short}")
-                meta.append({"k": k, "page": h.page, "source": h.source, "score": h.score, "truncated": True, "idx": h.idx})
-                total = max_chars
+    qn = ar_normalize(query)
+
+    # Prefer lines with explicit time-ranges for hour-related intents
+    ordered = []
+    for rank, (_, i) in enumerate(hits, 1):
+        txt = index.chunks[i].text
+        if prefer_time and has_time_range(txt):
+            ordered.append((0, rank, i))  # priority 0
+        else:
+            ordered.append((1, rank, i))
+    ordered.sort()
+
+    for _, rank, i in ordered:
+        ch = index.chunks[i]
+        # pick the best sentence and expand window
+        k = best_sentence_idx(ch.text, qn)
+        snippet = window_around_sentence(ch.text, k if k is not None else 0, win=2)
+
+        head = f"[المصدر {len(parts)+1}: Data_pdf.pdf - ص{ch.page}]"
+        block = f"{head}\n{snippet}"
+        if total + len(block) + 2 > max_chars:
+            # allow a small last block if still empty
+            if total == 0:
+                block = block[:max_chars-3] + "…"
+                parts.append(block)
+                used.append((rank, i))
             break
         parts.append(block)
-        meta.append({"k": k, "page": h.page, "source": h.source, "score": h.score, "truncated": False, "idx": h.idx})
-        total += add
-    return "\n\n".join(parts), meta
+        used.append((rank, i))
+        total += len(block) + 2
 
-def _make_prompt_ar(context: str, question: str) -> str:
-    """
-    A compact Arabic-first instruction with strong grounding requirement.
-    Uses simple ChatML-style markers that Qwen2.5 understands well.
-    """
+        if total >= max_chars:
+            break
+
+    return "\n\n".join(parts), used
+
+# -------------- LLM (Qwen2.5-7B-Instruct) --------------
+def load_qwen(model_name: str):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+    # Prefer 4-bit on T4
+    quant_cfg = None
+    use_bnb = False
+    try:
+        quant_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16
+        )
+        use_bnb = True
+    except Exception as e:
+        LOG.warning("BitsAndBytes not available: %s", e)
+
+    kwargs = dict(
+        trust_remote_code=True,
+        device_map="auto",
+        low_cpu_mem_usage=True
+    )
+    if use_bnb:
+        kwargs["quantization_config"] = quant_cfg
+    else:
+        kwargs["torch_dtype"] = torch.float16 if device == "cuda" else torch.float32
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    model.eval()
+
+    # Avoid the header echo: use chat template
+    return tokenizer, model, device
+
+def generate_answer(tokenizer, model, device, query: str, context: str,
+                    paragraph_style: bool = True,
+                    max_new_tokens=256, temperature=0.3, top_p=0.9) -> str:
     sys_msg = (
         "أنت مساعد عربي يعتمد فقط على السياق المقدم. "
-        "أجب بدقة وباختصار وبنقاط مرتبة. "
-        "إن لم تجد الإجابة في السياق، قل: «لا توجد معلومات كافية في السياق للإجابة»."
+        "اكتب الجواب بالعربية الفصحى كفقرة واحدة متصلة بدون تعداد نقطي أو عناوين. "
+        "إن لم تجد الإجابة في السياق، اكتب: لا توجد معلومات كافية في السياق للإجابة."
     )
     user_msg = (
-        f"السياق المقتبس من الدليل (لا تضف معلومات خارج ما يلي):\n\n{context}\n\n"
-        f"السؤال: {question}\n\n"
-        "التعليمات للإخراج:\n"
-        "- جواب موجز ومنظم (نقاط مختصرة).\n"
-        "- إن وجدت أرقام/أوقات في السياق فاذكرها كما هي.\n"
-        "- لا تضف مصادر داخل النص؛ سأضيفها لاحقًا."
-    )
-    return (
-        "<|im_start|>system\n" + sys_msg + "\n<|im_end|>\n"
-        "<|im_start|>user\n" + user_msg + "\n<|im_end|>\n"
-        "<|im_start|>assistant\n"
+        "السياق المقتبس من الدليل (اعتمد عليه فقط):\n\n"
+        f"{context}\n\n"
+        f"السؤال: {query}"
     )
 
-class QwenRAG:
-    def __init__(
-        self,
-        chunks_path: Optional[str] = None,
-        hier_index: Optional[str] = DEFAULT_HIER,
-        aliases_path: Optional[str] = DEFAULT_ALIAS,
-        load_index_dir: Optional[str] = DEFAULT_ART,
-        save_index_dir: Optional[str] = None,
-        use_rerank: bool = False,
-        model_name: str = "Qwen/Qwen2.5-7B-Instruct",
-        top_k: int = 8,
-        max_ctx_chars: int = 1600,
-        max_new_tokens: int = 320,
-        temperature: float = 0.2,
-    ):
-        self.top_k = top_k
-        self.max_ctx_chars = max_ctx_chars
-        self.max_new_tokens = max_new_tokens
-        self.temperature = temperature
-        self.use_rerank = use_rerank
+    messages = [
+        {"role": "system", "content": sys_msg},
+        {"role": "user", "content": user_msg},
+    ]
 
-        # ---------- 1) Load chunks + hierarchy
-        kb = chunks_path or DEFAULT_CHUNKS
-        if not os.path.exists(kb):
-            print(f"⚠️  Chunks file not found at '{kb}'. I will try default '{DEFAULT_CHUNKS}' in CWD.")
-            kb = DEFAULT_CHUNKS
-            if not os.path.exists(kb):
-                raise FileNotFoundError(
-                    f"Chunks file not found. Provide --chunks path or put '{DEFAULT_CHUNKS}' in this folder."
-                )
-
-        hier = load_hierarchy(hier_index, aliases_path)
-        chunks, chunks_hash = load_chunks(path=kb)
-        self.index = HybridIndex(chunks, chunks_hash, hier=hier)
-
-        # ---------- 2) Load or build index artifacts
-        loaded = False
-        if load_index_dir and os.path.isdir(load_index_dir):
-            loaded = self.index.load(load_index_dir)
-
-        if not loaded:
-            print("🔄 Building dense+TF-IDF indexes (first run)…")
-            self.index.build()
-            if save_index_dir:
-                self.index.save(save_index_dir)
-        else:
-            print("✅ Index loaded from artifacts")
-
-        # ---------- 3) Load LLM (quantized if possible)
-        self._load_llm(model_name)
-
-    # LLM loader
-    def _load_llm(self, model_name: str):
-        print("🧠 Loading Qwen2.5 model…")
-        bnb_cfg = None
-        model_kwargs = dict(
-            device_map="auto",
-            trust_remote_code=True,
+    # Chat template ensures the model sees roles properly (no literal 'system/user' in output)
+    try:
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors="pt"
+        )
+    except TypeError:
+        # Older HF versions
+        prompt_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        inputs = tokenizer(
+            prompt_text, return_tensors="pt", padding="longest", truncation=True
         )
 
-        if torch.cuda.is_available() and _USE_BNB:
-            try:
-                bnb_cfg = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=torch.float16,
-                )
-                model_kwargs["quantization_config"] = bnb_cfg
-                model_kwargs["torch_dtype"] = torch.float16
-            except Exception as e:
-                print(f"⚠️  4-bit quantization setup failed: {e}. Falling back to fp16 if GPU.")
-                model_kwargs["torch_dtype"] = torch.float16
-        else:
-            # CPU or BnB not available
-            model_kwargs["torch_dtype"] = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        self.tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        # Qwen warns if pad == eos and no attention_mask; we'll build attention_mask manually.
-        if self.tok.pad_token_id is None:
-            self.tok.pad_token = self.tok.eos_token
+    # Deterministic for consistency; switch to do_sample=True if you want more “creative” phrasing
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        temperature=temperature,
+        top_p=top_p,
+        repetition_penalty=1.1,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        use_cache=True,
+    )
 
-        self.llm = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
-        self.llm.eval()
+    with torch.no_grad():
+        out = model.generate(**inputs, **gen_kwargs)
 
-        # Compile (PyTorch 2+); safe try
-        try:
-            if hasattr(torch, "compile"):
-                self.llm = torch.compile(self.llm, mode="reduce-overhead")
-                print("🚀 Model compiled for faster inference")
-        except Exception as e:
-            print(f"⚠️  torch.compile skipped: {e}")
+    # Cut the prompt off (new tokens only)
+    new_tokens = out[0][inputs["input_ids"].shape[-1]:]
+    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    # Clean minimal artifacts
+    return text.strip()
 
-        device = next(self.llm.parameters()).device
-        print(f"📊 Model on: {device}")
-
-    # Core QA
-    def generate(self, question: str) -> Dict:
-        t0 = time.time()
-        intent = classify_intent(question)
-
-        # 1) retrieve via YOUR function
-        prelim = retrieve(self.index, question, self.use_rerank)
-        if not prelim:
-            return {
-                "answer": "لا توجد معلومات كافية في السياق للإجابة.",
-                "context": "",
-                "meta": [],
-                "time": time.time() - t0,
-            }
-
-        # 2) turn into snippets + context
-        hits = _select_snippets(question, intent, self.index, prelim, top_k=self.top_k)
-        context, meta = _build_context_blocks(hits, max_chars=self.max_ctx_chars)
-        if not context.strip():
-            return {
-                "answer": "لا توجد معلومات كافية في السياق للإجابة.",
-                "context": "",
-                "meta": meta,
-                "time": time.time() - t0,
-            }
-
-        # 3) prompt & generate
-        prompt = _make_prompt_ar(context, question)
-        enc = self.tok(prompt, return_tensors="pt", add_special_tokens=False)
-        # Build explicit attention mask to avoid pad/eos ambiguity warnings
-        if "attention_mask" not in enc:
-            enc["attention_mask"] = torch.ones_like(enc["input_ids"])
-        enc = {k: v.to(self.llm.device) for k, v in enc.items()}
-
-        with torch.no_grad():
-            out = self.llm.generate(
-                **enc,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=(self.temperature > 0),
-                temperature=self.temperature,
-                top_p=0.9,
-                repetition_penalty=1.08,
-                pad_token_id=self.tok.eos_token_id,
-                eos_token_id=self.tok.eos_token_id,
-                use_cache=True,
-            )
-        text = self.tok.decode(out[0], skip_special_tokens=True)
-
-        # Extract only the assistant tail after our ChatML tag to avoid echo
-        ans = text.split("<|im_start|>assistant")[-1]
-        ans = ans.replace("<|im_end|>", "").strip()
-        if not ans:
-            ans = text.strip()
-
-        # 4) add sources block
-        refs = "\n".join([f"{m['k']}. {m['source']} - ص{m['page']}" for m in meta])
-        final = ans + ("\n\nالمراجع:\n" + refs if refs else "")
-
-        return {
-            "answer": final,
-            "context": context,
-            "meta": meta,
-            "time": time.time() - t0,
-        }
-
-    # helpers
-    def ask(self, q: str) -> str:
-        return self.generate(q)["answer"]
-
-    def sanity(self, subset: Optional[int] = None):
-        qs = SANITY_PROMPTS[:subset] if subset else SANITY_PROMPTS
-        print("\n🧪 Sanity run…")
-        total = 0.0
-        for q in qs:
-            r = self.generate(q)
-            total += r["time"]
-            print(f"\n• {q}\n⏱ {r['time']:.2f}s | 🤖 {r['answer'][:500]}{'…' if len(r['answer'])>500 else ''}")
-        print(f"\n📊 Avg: {total/len(qs):.2f}s | Total: {total:.2f}s")
-
-    def chat(self):
-        print("\n=== Arabic Q&A (Qwen2.5 + your retriever) ===")
-        print("أكتب سؤالك. اكتب exit للخروج.\n")
-        while True:
-            try:
-                q = input("سؤالك: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nخروج."); break
-            if not q:
-                continue
-            if q.lower() in ("exit", "quit", "q"):
-                print("خروج."); break
-            r = self.generate(q)
-            print("\n" + r["answer"] + "\n")
+# -------------- Sanity prompts (same spirit as your file) --------------
+SANITY_QS = [
+    "ما هي ساعات الدوام الرسمية من وإلى؟",
+    "هل يوجد مرونة في الحضور والانصراف؟ وكيف تُحسب دقائق التأخير؟",
+    "هل توجد استراحة خلال الدوام؟ وكم مدتها؟",
+    "ما ساعات العمل في شهر رمضان؟ وهل تتغير؟",
+    "ما أيام الدوام الرسمي؟ وهل السبت يوم عمل؟",
+    "كيف يُحتسب الأجر عن الساعات الإضافية في الأيام العادية؟",
+    "ما التعويض عند العمل في العطل الرسمية؟",
+    "هل يحتاج العمل الإضافي لموافقة مسبقة؟ ومن يعتمدها؟",
+    "كم مدة الإجازة السنوية لموظف جديد؟ ومتى تزيد؟",
+    "هل تُرحّل الإجازات غير المستخدمة؟ وما الحد الأقصى؟",
+    "ما سياسة الإجازة المرضية؟ وعدد أيامها؟ وهل يلزم تقرير طبي؟",
+    "ما هو بدل المواصلات؟ وهل يشمل الذهاب من المنزل للعمل؟ وكيف يُصرف؟",
+    "ما سقف الشراء الذي يستلزم ثلاثة عروض أسعار؟",
+    "ما ضوابط تضارب المصالح في المشتريات؟",
+]
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--chunks", type=str, default=DEFAULT_CHUNKS, help="Path to chunks JSON/JSONL")
-    ap.add_argument("--hier-index", type=str, default=DEFAULT_HIER, help="(optional) heading_inverted_index.json")
-    ap.add_argument("--aliases", type=str, default=DEFAULT_ALIAS, help="(optional) section_aliases.json")
-    ap.add_argument("--load-index", type=str, default=DEFAULT_ART, help="dir to load saved index")
-    ap.add_argument("--save-index", type=str, default=None, help="dir to save built index")
-    ap.add_argument("--rerank", action="store_true", help="enable CrossEncoder re-ranking in retriever")
-    ap.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct", help="HF model id")
-    ap.add_argument("--top-k", type=int, default=8)
-    ap.add_argument("--max-ctx", type=int, default=1600)
-    ap.add_argument("--max-new", type=int, default=320)
-    ap.add_argument("--temp", type=float, default=0.2)
+    ap.add_argument("--chunks", type=str, default="Data_pdf_clean_chunks.jsonl")
+    ap.add_argument("--hier-index", type=str, default="heading_inverted_index.json")
+    ap.add_argument("--aliases", type=str, default="section_aliases.json")
+    ap.add_argument("--load-index", type=str, default=".artifact")
+    ap.add_argument("--save-index", type=str, default=None)
+    ap.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--sanity", action="store_true")
-    ap.add_argument("--bench", action="store_true")
-    ap.add_argument("--chat", action="store_true")
+    ap.add_argument("--no-rerank", action="store_true", help="Disable CE reranker")
     args = ap.parse_args()
 
-    rag = QwenRAG(
-        chunks_path=args.chunks,
-        hier_index=args.hier_index,
-        aliases_path=args.aliases,
-        load_index_dir=args.load_index,
-        save_index_dir=args.save_index,
-        use_rerank=args.rerank,
-        model_name=args.model,
-        top_k=args.top_k,
-        max_ctx_chars=args.max_ctx,
-        max_new_tokens=args.max_new,
-        temperature=args.temp,
-    )
+    # 1) Load / build retriever artifacts
+    hier = load_hierarchy(args.hier_index, args.aliases)
+    chunks, chunks_hash = load_chunks(path=args.chunks)
+    index = HybridIndex(chunks, chunks_hash, hier=hier)
+
+    loaded = False
+    if args.load_index and os.path.isdir(args.load_index):
+        loaded = index.load(args.load_index)
+    if not loaded:
+        LOG.info("Building dense+TF-IDF indexes (first run)…")
+        index.build()
+        if args.save_index:
+            index.save(args.save_index)
+
+    # 2) Load LLM
+    LOG.info("Loading Qwen model…")
+    tokenizer, model, device = load_qwen(args.model)
+    _ = ensure_reranker(device) if not args.no_rerank else None
+    LOG.info("Ready.")
+
+    def ask(q: str) -> str:
+        t0 = time.time()
+        # intent helps us prefer time-range snippets for hours questions
+        intent = classify_intent(q)
+        prefer_time = intent in ("work_hours", "ramadan_hours")
+
+        prelim = retrieve_candidates(index, q, topk_dense=120, hybrid_topk=30,
+                                     w_dense=0.70, w_char=0.15, w_word=0.15)
+        if not args.no_rerank:
+            hits = apply_rerank(index, q, prelim, device=device, keep_top=8)
+        else:
+            hits = prelim[:8]
+
+        # if time intent but no candidates with time, keep as is (fallback)
+        ctx, used = build_context(index, q, hits, max_chars=1400, prefer_time=prefer_time)
+        if not ctx.strip():
+            return "لا توجد معلومات كافية في السياق للإجابة."
+
+        ans = generate_answer(tokenizer, model, device, q, ctx,
+                              paragraph_style=True, max_new_tokens=256, temperature=0.3, top_p=0.9)
+        dt = time.time() - t0
+        print(f"⏱ {dt:.2f}s | 🤖 {ans}\n")
+        return ans
 
     if args.sanity:
-        rag.sanity(subset=None)
+        print("\n🧪 Sanity run…\n")
+        for q in SANITY_QS:
+            print(f"• {q}")
+            ask(q)
         return
 
-    if args.bench:
-        qs = [
-            "ما هي سياسات التوظيف في مؤسسة النيزك؟",
-            "كيف يمكن التقدم للوظائف؟",
-            "ما هي المستندات المطلوبة للموظف الجديد؟",
-        ]
-        print("\n🧪 Benchmark…")
-        total = 0.0
-        for q in qs:
-            r = rag.generate(q)
-            total += r["time"]
-            print(f"\n• {q}\n⏱ {r['time']:.2f}s | 🤖 {r['answer'][:600]}{'…' if len(r['answer'])>600 else ''}")
-        print(f"\n📊 Avg time: {total/len(qs):.2f}s | Total: {total:.2f}s")
-
-    if args.chat:
-        rag.chat()
+    # Interactive loop
+    print("\n💬 Ready (Arabic). Type 'خروج' to exit.\n")
+    while True:
+        try:
+            q = input("سؤالك: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nانتهينا."); break
+        if not q:
+            continue
+        if q.lower() in ("خروج", "exit", "quit", "q"):
+            print("انتهينا."); break
+        ask(q)
 
 if __name__ == "__main__":
     main()
