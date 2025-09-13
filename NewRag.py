@@ -2,19 +2,10 @@
 """
 NewRag.py — Arabic RAG with hybrid retrieval and Qwen2.5 chat formatting.
 
-What’s inside (fixed & improved):
-- Safe KB path resolution:  --kb  >  AR_KB_JSONL env  >  Data_pdf_clean_chunks.jsonl
-- Float-index bug fixed (we now use the idx from (score, idx))
-- Qwen2.5 chat-template via tokenizer.apply_chat_template(...)
-- Tight Arabic system prompt (grounded RAG; no hallucinations)
-- Hybrid retrieval: dense (intfloat/multilingual-e5-base) + TF-IDF (char+word), FAISS
-- Optional multilingual reranker (Jina v2), fallback to mMiniLM cross-encoder
-- Artifacts cache (embeddings/FAISS/TF-IDF) keyed by file fingerprint
-- Better sentence picking for coherent snippets
-
-Usage (Colab T4):
-  %cd /content/AlNayzak-Chatbot
-  !python NewRag.py --llm Qwen/Qwen2.5-7B-Instruct --rerank --top-k 8 --max-chars 2400
+Fixes in this build:
+- Arabic-only guard (prompt + sanitizer) to stop Chinese/English spillover.
+- Pass attention_mask to generation (no more pad==eos warning).
+- Keep earlier fixes: safe KB default, float-index bug, artifacts cache, rerank.
 """
 
 import os, re, json, time, hashlib
@@ -70,6 +61,29 @@ def ar_normalize(s: str) -> str:
 def sent_split(s: str) -> List[str]:
     parts = [p.strip() for p in SENT_SPLIT_RE.split(s) if p and p.strip()]
     return parts if parts else ([s.strip()] if s and s.strip() else [])
+
+def sanitize_arabic_output(text: str) -> str:
+    """
+    Remove non-Arabic spillover (e.g., Chinese/English artifacts, role labels).
+    Keeps Arabic letters, digits, whitespace, and common punctuation.
+    """
+    # Drop chat role echoes
+    text = re.sub(r'^\s*(user|assistant)\s*:?[\s\n]+', '', text, flags=re.I|re.M)
+    # Remove CJK blocks
+    text = re.sub(r'[\u4E00-\u9FFF\u3400-\u4DBF]+', '', text)
+    # Remove long Latin runs (words >= 2 letters)
+    text = re.sub(r'[A-Za-z]{2,}', '', text)
+    # Normalize tricky typos
+    text = (text
+            .replace("المصدار", "المصدر")
+            .replace("المصدـر", "المصدر")
+            .replace("المصد~r", "المصدر"))
+    # Compact excessive spaces
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    # Strip stray lines that became empty after cleanup
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines).strip()
 
 # ---------------- Data model ----------------
 @dataclass
@@ -328,7 +342,7 @@ class HybridRetriever:
 
     def build_context(self, question: str, max_chars: int = 2200, top_k: int = 10, use_rerank: bool = False) -> Tuple[str, List[Dict]]:
         pre = self.semantic_search(question, top_k=top_k, pre_candidates=80)  # [(score, idx)]
-        cand = [idx for _, idx in pre]  # use index, not score  ✅
+        cand = [idx for _, idx in pre]  # ✅ use index, not score
 
         if use_rerank:
             cand = self.rerank(question, cand, max_keep=top_k)
@@ -337,7 +351,7 @@ class HybridRetriever:
 
         parts, meta, total = [], [], 0
         for rank, idx in enumerate(cand, 1):
-            idx = int(idx)  # safety
+            idx = int(idx)
             c = self.chunks[idx]
             head = f"[المصدر {rank}: {c.source} - ص{c.page}]"
             picked = self.sentence_pick(question, c.text_display)
@@ -376,6 +390,7 @@ class RAGPipeline:
         print("🧠 Loading LLM…")
         self.tok = AutoTokenizer.from_pretrained(llm_name, trust_remote_code=True)
         if self.tok.pad_token is None:
+            # keep equal to eos, but we will pass attention_mask explicitly
             self.tok.pad_token = self.tok.eos_token
         quant = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -403,25 +418,26 @@ class RAGPipeline:
         print(f"📊 Model on: {self.model.device}")
         print("✅ RAG System initialized")
 
-    # ---- Qwen2.5 chat messages ----
     def _chat_messages(self, question: str, context: str):
         system = (
             "أنت مساعد عربي دقيق يعمل بأسلوب RAG. "
-            "أجب فقط من (السياق) المرفق. لا تُخمن ولا تضف معلومات خارج السياق. "
-            "ضع إشارة مرجعية [المصدر n] بعد كل جملة/حقيقة مستندة إلى النص. "
+            "اكتب بالعربية الفصحى فقط، ويُمنع إدراج كلمات من لغات أخرى. "
+            "أجب حصراً من (السياق) أدناه، ولا تضف معلومات خارجية. "
+            "ضع إشارة مرجعية [المصدر n] بعد كل حقيقة مستندة إلى النص، "
+            "واستخدم فقط أرقام المصادر الظاهرة في السياق. "
             "إن لم تجد الإجابة في السياق فقل: غير متوفر في السياق."
         )
         user = (
             f"السياق:\n{context}\n\n"
             f"السؤال: {question}\n\n"
-            "أجب بلغة عربية واضحة ومختصرة، مع وضع [المصدر n] بعد كل حقيقة."
+            "رجاءً التزم بالعربية حصراً وبنمط مُرَكَّز."
         )
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
 
-    def generate(self, question: str, max_new_tokens: int = 280, temperature: float = 0.15) -> Dict[str, Any]:
+    def generate(self, question: str, max_new_tokens: int = 260, temperature: float = 0.1) -> Dict[str, Any]:
         t0 = time.time()
         context, meta = self.ret.build_context(
             question, max_chars=self.max_chars, top_k=self.top_k, use_rerank=self.use_rerank
@@ -429,34 +445,35 @@ class RAGPipeline:
         if not context.strip():
             return {"answer":"عذراً، لا يوجد سياق ذي صلة.","context":"","meta":meta,"time":time.time()-t0,"confidence":0.0}
 
-        # build chat template for Qwen
         messages = self._chat_messages(question, context)
-        prompt_ids = self.tok.apply_chat_template(
+        input_ids = self.tok.apply_chat_template(
             messages,
             add_generation_prompt=True,
             return_tensors="pt"
         ).to(self.model.device)
 
+        # explicit attention_mask to silence HF warning and stabilize decoding
+        attn_mask = torch.ones_like(input_ids, dtype=torch.long, device=input_ids.device)
+
         with torch.no_grad():
             out = self.model.generate(
-                prompt_ids,
+                input_ids=input_ids,
+                attention_mask=attn_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=(temperature > 0),
                 temperature=temperature,
-                top_p=0.85,
+                top_p=0.8,
                 repetition_penalty=1.18,
-                no_repeat_ngram_size=4,
+                no_repeat_ngram_size=6,
                 pad_token_id=self.tok.eos_token_id,
                 eos_token_id=self.tok.eos_token_id,
                 use_cache=True
             )
-        # decode only the new tokens
-        gen = out[0][prompt_ids.shape[-1]:]
-        answer = self.tok.decode(gen, skip_special_tokens=True).strip()
-        # small cleanup for common drift
-        answer = answer.replace("المصدار", "المصدر").replace("المصدَر", "المصدر")
+        gen = out[0][input_ids.shape[-1]:]
+        raw_answer = self.tok.decode(gen, skip_special_tokens=True).strip()
+        answer = sanitize_arabic_output(raw_answer)
 
-        return {"answer": answer, "context": context, "meta": meta, "time": time.time()-t0, "confidence": 0.85}
+        return {"answer": answer, "context": context, "meta": meta, "time": time.time()-t0, "confidence": 0.88}
 
     def chat(self):
         print("\n🤖 جاهز. اكتب سؤالك (أو 'خروج').\n")
@@ -518,7 +535,6 @@ if __name__ == "__main__":
             max_chars=args.max_chars
         )
 
-        # quick smoke benchmark
         print("\n🧪 Benchmark…")
         tests = [
             "ما هي سياسات التوظيف في مؤسسة النيزك؟",
