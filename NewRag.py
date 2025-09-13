@@ -1,28 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-NewRag.py — Arabic RAG with hybrid retrieval and configurable LLM.
+NewRag.py — Arabic RAG with hybrid retrieval and Qwen2.5 chat formatting.
 
-Fixes included:
-- Knowledge base path: --kb CLI > AR_KB_JSONL env > Data_pdf_clean_chunks.jsonl
-- Float-index bug fixed: semantic_search returns (score, idx) and build_context uses idx.
-- Removed 'early_stopping' warning; generation args cleaned.
+What’s inside (fixed & improved):
+- Safe KB path resolution:  --kb  >  AR_KB_JSONL env  >  Data_pdf_clean_chunks.jsonl
+- Float-index bug fixed (we now use the idx from (score, idx))
+- Qwen2.5 chat-template via tokenizer.apply_chat_template(...)
+- Tight Arabic system prompt (grounded RAG; no hallucinations)
+- Hybrid retrieval: dense (intfloat/multilingual-e5-base) + TF-IDF (char+word), FAISS
+- Optional multilingual reranker (Jina v2), fallback to mMiniLM cross-encoder
+- Artifacts cache (embeddings/FAISS/TF-IDF) keyed by file fingerprint
+- Better sentence picking for coherent snippets
 
-Features:
-- Robust JSONL loader (lenient field names)
-- Arabic normalization + sentence splitting
-- Hybrid retrieval: dense (intfloat/multilingual-e5-base) + TF-IDF (char+word)
-- Optional Cross-Encoder reranker
-- Artifact caching keyed to file fingerprint
-- Grounded Arabic prompt with inline citations [المصدر n]
-- Default LLM: Qwen/Qwen2.5-7B-Instruct (4-bit)
-
-Run (Colab):
+Usage (Colab T4):
   %cd /content/AlNayzak-Chatbot
-  !python NewRag.py --rerank
-  # or select KB:
-  !python NewRag.py --kb Data_pdf_clean_chunks.jsonl --rerank
-  # switch LLM:
-  !python NewRag.py --llm Qwen/Qwen2.5-7B-Instruct
+  !python NewRag.py --llm Qwen/Qwen2.5-7B-Instruct --rerank --top-k 8 --max-chars 2400
 """
 
 import os, re, json, time, hashlib
@@ -34,7 +26,7 @@ import numpy as np
 
 # ---------------- Optional deps ----------------
 try:
-    import faiss  # faiss-cpu
+    import faiss  # faiss-cpu or faiss-gpu if available
 except Exception:
     faiss = None
 
@@ -309,16 +301,30 @@ class HybridRetriever:
         return [int(candidates[i]) for i in order[:max_keep]]
 
     def sentence_pick(self, question: str, text: str) -> List[str]:
-        qnorm = set([w for w in ar_normalize(question).split() if len(w)>=3])
-        out = []
-        for s in sent_split(text):
+        # improved coherence picker
+        qset = set([w for w in ar_normalize(question).split() if len(w) >= 3])
+        sents = sent_split(text)
+        scored = []
+        for s in sents:
             sn = ar_normalize(s)
-            overlap = len(qnorm & set(sn.split())) > 0
-            has_numbers = bool(re.search(r'\d', sn))
-            has_time_hint = any(t in sn for t in ["من","الى","إلى","حتى",":","."])
-            if overlap or has_numbers or has_time_hint:
-                out.append(s.strip())
-        return out[:6] if out else sent_split(text)[:2]
+            overlap = len(qset & set(sn.split()))
+            has_num = bool(re.search(r'\d', sn))
+            has_time = any(t in sn for t in ["من","الى","إلى","حتى",":","."])
+            score = 1.2*overlap + 0.8*has_num + 0.6*has_time
+            scored.append((score, s))
+        scored.sort(key=lambda x: -x[0])
+        if not scored:
+            return sents[:2]
+        top_idx = [sents.index(scored[0][1])]
+        if len(scored) > 1:
+            top_idx.append(sents.index(scored[1][1]))
+        keep = set()
+        for i in top_idx:
+            for j in [i-1, i, i+1]:
+                if 0 <= j < len(sents):
+                    keep.add(j)
+        ordered = [sents[i] for i in sorted(keep)]
+        return ordered[:6]
 
     def build_context(self, question: str, max_chars: int = 2200, top_k: int = 10, use_rerank: bool = False) -> Tuple[str, List[Dict]]:
         pre = self.semantic_search(question, top_k=top_k, pre_candidates=80)  # [(score, idx)]
@@ -397,17 +403,25 @@ class RAGPipeline:
         print(f"📊 Model on: {self.model.device}")
         print("✅ RAG System initialized")
 
-    def _prompt(self, question: str, context: str) -> str:
-        return (
-            "أنت مساعد عربي دقيق. أجب فقط من النصوص الواردة في (السياق) أدناه. "
-            "ضع إشارة مصدر بعد كل حقيقة بالشكل [المصدر n]. "
-            "إن لم تجد الإجابة في السياق فقل: \"غير متوفر في السياق\" دون اختلاق.\n\n"
+    # ---- Qwen2.5 chat messages ----
+    def _chat_messages(self, question: str, context: str):
+        system = (
+            "أنت مساعد عربي دقيق يعمل بأسلوب RAG. "
+            "أجب فقط من (السياق) المرفق. لا تُخمن ولا تضف معلومات خارج السياق. "
+            "ضع إشارة مرجعية [المصدر n] بعد كل جملة/حقيقة مستندة إلى النص. "
+            "إن لم تجد الإجابة في السياق فقل: غير متوفر في السياق."
+        )
+        user = (
             f"السياق:\n{context}\n\n"
             f"السؤال: {question}\n\n"
-            "الإجابة:"
+            "أجب بلغة عربية واضحة ومختصرة، مع وضع [المصدر n] بعد كل حقيقة."
         )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
 
-    def generate(self, question: str, max_new_tokens: int = 320, temperature: float = 0.2) -> Dict[str, Any]:
+    def generate(self, question: str, max_new_tokens: int = 280, temperature: float = 0.15) -> Dict[str, Any]:
         t0 = time.time()
         context, meta = self.ret.build_context(
             question, max_chars=self.max_chars, top_k=self.top_k, use_rerank=self.use_rerank
@@ -415,27 +429,34 @@ class RAGPipeline:
         if not context.strip():
             return {"answer":"عذراً، لا يوجد سياق ذي صلة.","context":"","meta":meta,"time":time.time()-t0,"confidence":0.0}
 
-        prompt = self._prompt(question, context)
-        inputs = self.tok(
-            prompt, return_tensors="pt", truncation=True, max_length=1800, padding=False
+        # build chat template for Qwen
+        messages = self._chat_messages(question, context)
+        prompt_ids = self.tok.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt"
         ).to(self.model.device)
 
         with torch.no_grad():
             out = self.model.generate(
-                **inputs,
+                prompt_ids,
                 max_new_tokens=max_new_tokens,
+                do_sample=(temperature > 0),
                 temperature=temperature,
-                do_sample=temperature>0,
                 top_p=0.85,
-                repetition_penalty=1.12,
-                no_repeat_ngram_size=3,
+                repetition_penalty=1.18,
+                no_repeat_ngram_size=4,
                 pad_token_id=self.tok.eos_token_id,
                 eos_token_id=self.tok.eos_token_id,
                 use_cache=True
             )
-        full = self.tok.decode(out[0], skip_special_tokens=True)
-        answer = full[len(prompt):].strip()
-        return {"answer": answer, "context": context, "meta": meta, "time": time.time()-t0, "confidence": 0.8}
+        # decode only the new tokens
+        gen = out[0][prompt_ids.shape[-1]:]
+        answer = self.tok.decode(gen, skip_special_tokens=True).strip()
+        # small cleanup for common drift
+        answer = answer.replace("المصدار", "المصدر").replace("المصدَر", "المصدر")
+
+        return {"answer": answer, "context": context, "meta": meta, "time": time.time()-t0, "confidence": 0.85}
 
     def chat(self):
         print("\n🤖 جاهز. اكتب سؤالك (أو 'خروج').\n")
@@ -497,7 +518,7 @@ if __name__ == "__main__":
             max_chars=args.max_chars
         )
 
-        # Smoke test
+        # quick smoke benchmark
         print("\n🧪 Benchmark…")
         tests = [
             "ما هي سياسات التوظيف في مؤسسة النيزك؟",
@@ -510,7 +531,7 @@ if __name__ == "__main__":
             print(f"⏱ {r['time']:.2f}s | 🤖 {r['answer'][:220]}…")
 
         print("\n💬 Starting chat…")
-        # rag.chat()  # uncomment if you want interactive mode
+        # rag.chat()  # uncomment for interactive mode
 
     except Exception as e:
         print(f"❌ خطأ في النظام: {e}")
