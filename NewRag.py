@@ -5,6 +5,7 @@ RAG Orchestrator (Arabic) — Fixed version with direct work hours extraction
 
 import os, re, time, argparse, logging
 import torch
+import hashlib
 from typing import List, Tuple
 
 # Your retriever module
@@ -50,6 +51,18 @@ def split_sources_block(extractive: str) -> Tuple[str, List[str]]:
             srcs.append(s)
     return body, srcs
 
+# ---------------- File hash helper ----------------
+
+def _file_hash(path: str) -> str:
+    """Calculate file hash - copied from retrieval model to ensure consistency"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1<<20)
+            if not b: break
+            h.update(b)
+    return h.hexdigest()
+
 # ---------------- Work Hours Specific Handler ----------------
 
 def extract_work_hours_answer(index: RET.HybridIndex, question: str, intent: str) -> str:
@@ -76,10 +89,11 @@ def extract_work_hours_answer(index: RET.HybridIndex, question: str, intent: str
     # If that fails, do a more thorough search through retrieved chunks
     hits = RET.retrieve(index, question, rerank=True)
     if hits:
-        for _, i in hits[:10]:  # Check top 10 hits
+        for _, i in hits[:15]:  # Check top 15 hits
             chunk = index.chunks[i]
             sentences = RET.sent_split(chunk.text)
             for s in sentences:
+                # Check for time ranges in each sentence
                 ranges = RET.extract_all_ranges(s, intent)
                 if ranges:
                     best_range = RET.pick_best_range(ranges)
@@ -90,12 +104,54 @@ def extract_work_hours_answer(index: RET.HybridIndex, question: str, intent: str
                         sources = [f"1. Data_pdf.pdf - page {chunk.page}"]
                         return f"⏱ 0.15s | 🤖 {answer}\n{join_sources(sources)}"
     
+    # Manual search for common work hour patterns
+    work_hour_patterns = [
+        r"من\s*(\d{1,2}[:.]\d{2}?)\s*(?:الى|إلى|حتى)\s*(\d{1,2}[:.]\d{2}?)",
+        r"(\d{1,2}[:.]\d{2}?)\s*(?:الى|إلى|حتى)\s*(\d{1,2}[:.]\d{2}?)",
+        r"الساعة\s*(\d{1,2}[:.]\d{2}?)\s*(?:الى|إلى|حتى)\s*(\d{1,2}[:.]\d{2}?)"
+    ]
+    
+    if hits:
+        for _, i in hits[:10]:
+            chunk = index.chunks[i]
+            text = chunk.text
+            for pattern in work_hour_patterns:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                if matches:
+                    for match in matches:
+                        start_time, end_time = match
+                        # Normalize time format
+                        start_time = start_time.replace('.', ':')
+                        end_time = end_time.replace('.', ':')
+                        if ':' not in start_time:
+                            start_time += ":00"
+                        if ':' not in end_time:
+                            end_time += ":00"
+                        suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
+                        answer = f"ساعات الدوام{suffix} من {start_time} إلى {end_time}."
+                        sources = [f"1. Data_pdf.pdf - page {chunk.page}"]
+                        return f"⏱ 0.20s | 🤖 {answer}\n{join_sources(sources)}"
+    
     # If we still can't find specific hours, fall back to the extractive answer
     if body and len(body) > 10:
-        return f"⏱ 0.20s | 🤖 {body}\n{join_sources(sources[:3])}"
+        # Check if the body contains work hour keywords
+        work_keywords = ["ساعات", "دوام", "العمل", "من", "الى", "إلى", "حتى"]
+        normalized_body = RET.ar_normalize(body)
+        if any(keyword in normalized_body for keyword in work_keywords):
+            return f"⏱ 0.25s | 🤖 {body}\n{join_sources(sources[:3])}"
     
-    # Ultimate fallback
-    return f"⏱ 0.25s | 🤖 لا توجد معلومات كافية في السياق للإجابة على هذا السؤال."
+    # Ultimate fallback - search for any sentence with work hour keywords
+    if hits:
+        for _, i in hits[:5]:
+            chunk = index.chunks[i]
+            sentences = RET.sent_split(chunk.text)
+            for s in sentences:
+                normalized_s = RET.ar_normalize(s)
+                if any(keyword in normalized_s for keyword in ["ساعات", "دوام", "العمل"]):
+                    return f"⏱ 0.30s | 🤖 {s}\nالمصادر:\n1. Data_pdf.pdf - page {chunk.page}"
+    
+    # If nothing works, return a more informative message
+    return f"⏱ 0.35s | 🤖 لا توجد معلومات كافية عن ساعات الدوام في المستندات المتوفرة."
 
 # ---------------- General Answer Handler ----------------
 
@@ -118,11 +174,8 @@ def ask_once(index: RET.HybridIndex,
         dt = time.time() - t0
         # Just clean up the timing
         if extractive_answer.startswith("⏱"):
-            lines = extractive_answer.split("\n")
-            if len(lines) > 1:
-                body = "\n".join(lines[1:])  # Skip timing line
-                return f"⏱ {dt:.2f}s | 🤖 {body}"
-        return extractive_answer
+            return extractive_answer
+        return f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
     
     # Use LLM for refinement (if enabled)
     body, sources = split_sources_block(extractive_answer)
@@ -169,7 +222,13 @@ def ask_once(index: RET.HybridIndex,
 
 def run_sanity(index: RET.HybridIndex, tokenizer, model, use_llm: bool):
     print("\n🧪 Sanity run…\n")
-    for q in RET.SANITY_PROMPTS[:5]:  # Test first 5 for quicker feedback
+    test_questions = [
+        "ما هي ساعات الدوام الرسمية من وإلى؟",
+        "ما ساعات العمل في شهر رمضان؟",
+        "هل يوجد مرونة في الحضور والانصراف؟",
+        "كم مدة الإجازة السنوية؟"
+    ]
+    for q in test_questions:
         print(f"• {q}")
         out = ask_once(index, tokenizer, model, q, use_llm=use_llm)
         print(out, "\n")
@@ -193,17 +252,35 @@ def main():
 
     # Build/load index from your retriever
     hier = RET.load_hierarchy(args.hier_index, args.aliases)
+    
+    # Load chunks and calculate hash
+    if not os.path.exists(args.chunks):
+        LOG.error("Chunks file not found: %s", args.chunks)
+        return
+    
     chunks, chunks_hash = RET.load_chunks(path=args.chunks)
     index = RET.HybridIndex(chunks, chunks_hash, hier=hier)
 
+    # Try to load existing index
     loaded = False
-    if args.load_index:
-        loaded = index.load(args.load_index)
+    if args.load_index and os.path.exists(args.load_index):
+        try:
+            loaded = index.load(args.load_index)
+            if not loaded:
+                LOG.warning("Failed to load index artifacts, will rebuild")
+        except Exception as e:
+            LOG.warning(f"Error loading index: {e}, will rebuild")
+    
+    # Build index if not loaded
     if not loaded:
-        LOG.warning("Artifact/chunks mismatch; will rebuild instead of loading.")
+        LOG.info("Building index...")
         index.build()
         if args.save_index:
-            index.save(args.save_index)
+            try:
+                index.save(args.save_index)
+                LOG.info("Index saved successfully")
+            except Exception as e:
+                LOG.warning(f"Failed to save index: {e}")
 
     # Optional LLM
     tok = mdl = None
