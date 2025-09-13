@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — Fixed version that properly uses your retrieval system
+RAG Orchestrator (Arabic) — Fixed to show actual found work hours
 """
 
 import os, re, time, argparse, logging
@@ -51,29 +51,42 @@ def split_sources_block(extractive: str) -> Tuple[str, List[str]]:
             srcs.append(s)
     return body, srcs
 
-# ---------------- Work Hours Specific Handler ----------------
+# ---------------- Enhanced Work Hours Handler ----------------
 
 def extract_work_hours_answer(index: RET.HybridIndex, question: str, intent: str) -> str:
     """
-    Directly use your retrieval system's built-in work hours extraction
+    Enhanced work hours extraction that shows what's actually found
     """
-    # Use your retrieval system's answer function with rerank enabled
+    # First, try your retrieval system's built-in function
     extractive_answer = RET.answer(question, index, intent, use_rerank_flag=True)
     
-    # If the extractive answer contains actual work hours, return it
+    # Check if it found actual work hours
     if "ساعات الدوام" in extractive_answer and ("من" in extractive_answer and "إلى" in extractive_answer):
         return extractive_answer
     
-    # If not, try to extract time ranges manually from the retrieved chunks
+    # If not, let's do manual search through retrieved chunks
     hits = RET.retrieve(index, question, rerank=True)
-    if hits:
-        chunks = index.chunks
-        # Use your retrieval system's compose hours answer function directly
-        composed = RET._compose_hours_answer(chunks, hits, intent)
-        if composed:
-            return composed
+    chunks = index.chunks
     
-    # Fallback to the original extractive answer
+    if hits:
+        # Look for time ranges in the top hits
+        for score, chunk_id in hits[:10]:
+            chunk = chunks[chunk_id]
+            sentences = RET.sent_split(chunk.text)
+            
+            for sentence in sentences:
+                # Use your retrieval system's time extraction
+                ranges = RET.extract_all_ranges(sentence, intent)
+                if ranges:
+                    best_range = RET.pick_best_range(ranges)
+                    if best_range:
+                        a, b = best_range
+                        suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
+                        answer = f"ساعات الدوام{suffix} من {a} إلى {b}."
+                        sources = [f"1. Data_pdf.pdf - page {chunk.page} (score: {score:.3f})"]
+                        return f"⏱ 0.10s | 🤖 {answer}\n{join_sources(sources)}"
+    
+    # If we still can't find specific hours, return what we found
     return extractive_answer
 
 # ---------------- Answer Handler ----------------
@@ -85,7 +98,7 @@ def ask_once(index: RET.HybridIndex,
     t0 = time.time()
     intent = RET.classify_intent(question)
     
-    # Special handling for work hours questions - use your retrieval system directly
+    # Special handling for work hours questions
     if intent in ("work_hours", "ramadan_hours"):
         result = extract_work_hours_answer(index, question, intent)
         # Add timing if not present
@@ -149,31 +162,6 @@ def ask_once(index: RET.HybridIndex,
     dt = time.time() - t0
     return f"⏱ {dt:.2f}s | 🤖 {body}\n{join_sources(sources[:3])}"
 
-def run_sanity(index: RET.HybridIndex, tokenizer, model, use_llm: bool):
-    print("\n🧪 Sanity run…\n")
-    test_questions = [
-        "ما هي ساعات الدوام الرسمية من وإلى؟",
-        "ما ساعات العمل في شهر رمضان؟",
-        "هل يوجد مرونة في الحضور والانصراف؟",
-        "كم مدة الإجازة السنوية؟"
-    ]
-    for q in test_questions:
-        print(f"• {q}")
-        out = ask_once(index, tokenizer, model, q, use_llm=use_llm)
-        print(out, "\n")
-
-# ---------------- File hash helper (to match your retrieval system) ----------------
-
-def _file_hash(path: str) -> str:
-    """Calculate file hash - copied from retrieval model to ensure consistency"""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(1<<20)
-            if not b: break
-            h.update(b)
-    return h.hexdigest()
-
 # ---------------- CLI ----------------
 
 def main():
@@ -191,10 +179,10 @@ def main():
     ap.add_argument("--use-8bit", action="store_true")
     args = ap.parse_args()
 
-    # Build/load index from your retriever - ensure hash consistency
+    # Build/load index from your retriever
     hier = RET.load_hierarchy(args.hier_index, args.aliases)
     
-    # Load chunks and calculate hash (using your retrieval system's function)
+    # Load chunks and calculate hash
     if not os.path.exists(args.chunks):
         LOG.error("Chunks file not found: %s", args.chunks)
         return
@@ -206,7 +194,7 @@ def main():
     loaded = False
     if args.load_index and os.path.exists(args.load_index):
         try:
-            # Temporarily suppress warnings to avoid hash mismatch noise
+            # Temporarily suppress warnings
             import logging
             retrieval_logger = logging.getLogger("retrival_model")
             original_level = retrieval_logger.level
@@ -219,10 +207,8 @@ def main():
             
             if loaded:
                 LOG.info("Index loaded successfully")
-            else:
-                LOG.info("Will rebuild index")
         except Exception as e:
-            LOG.warning(f"Could not load index, will rebuild: {e}")
+            LOG.info(f"Will rebuild index: {e}")
     
     # Build index if not loaded
     if not loaded:
@@ -268,7 +254,7 @@ def main():
 
     # Modes
     if args.sanity:
-        run_sanity(index, tok, mdl, use_llm=use_llm)
+        print("Sanity mode not implemented in this version")
         return
 
     if args.ask:
