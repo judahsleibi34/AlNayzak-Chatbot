@@ -1,27 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — fixed version
+RAG Orchestrator (Arabic) — Fixed version
 
-- Calls your retriever with rerank=True (better hits)
-- Softer intent satisfaction (don’t require times to exist to accept work_hours)
-- Two-pass evidence mining: strict (with numbers) then soft (keywords)
-- Single-paragraph Arabic answer
-- Numeric guard: if LLM injects numbers not in evidence -> fallback to extractive
-- Clean 'المصادر:' block (no duplicate 'Sources:')
+- Improved prompt engineering for better LLM responses
+- Better evidence selection with relevance scoring
+- More robust fallback mechanisms
+- Cleaner response formatting
 
 Usage
 -----
 # Build index once and cache:
-python rag_qwen_editor.py --chunks Data_pdf_clean_chunks.jsonl --save-index .artifact --sanity --model Qwen/Qwen2.5-7B-Instruct
+python rag_qwen_fixed.py --chunks Data_pdf_clean_chunks.jsonl --save-index .artifact --sanity --model Qwen/Qwen2.5-7B-Instruct
 
 # Load cached index and run sanity:
-python rag_qwen_editor.py --load-index .artifact --sanity --model Qwen/Qwen2.5-7B-Instruct
+python rag_qwen_fixed.py --load-index .artifact --sanity --model Qwen/Qwen2.5-7B-Instruct
 
 # Ask one question:
-python rag_qwen_editor.py --load-index .artifact --ask "ما هي ساعات الدوام الرسمية من وإلى؟" --model Qwen/Qwen2.5-7B-Instruct
+python rag_qwen_fixed.py --load-index .artifact --ask "ما هي ساعات الدوام الرسمية من وإلى؟" --model Qwen/Qwen2.5-7B-Instruct
 
 # Extractive only (no LLM):
-python rag_qwen_editor.py --load-index .artifact --no-llm --ask "ما ساعات العمل في شهر رمضان؟ وهل تتغير؟"
+python rag_qwen_fixed.py --load-index .artifact --no-llm --ask "ما ساعات العمل في شهر رمضان؟ وهل تتغير؟"
 """
 
 import os, re, time, argparse, logging
@@ -131,133 +129,136 @@ def extractive_answers_intent(question: str, intent: str, body: str) -> bool:
     # generic relaxed check
     return sentence_satisfies_intent_soft(body, intent)
 
-# ---------------- Evidence miner: strict -> soft ----------------
+# ---------------- Evidence miner: improved with relevance scoring ----------------
 
 def mine_intent_evidence(index: RET.HybridIndex, question: str, intent: str,
-                         topk: int = 12, max_snippets: int = 3) -> Tuple[str, List[str]]:
+                         topk: int = 15, max_snippets: int = 4) -> Tuple[str, List[str]]:
     """
-    Strict pass: sentences that fully satisfy intent with numbers (when applicable).
-    Soft pass: relaxed keyword-based satisfaction if strict found nothing.
+    Improved evidence mining with better relevance scoring
     """
     hits = RET.retrieve(index, question, rerank=True)
     if not hits:
         return "", []
 
-    picked, srcs, seen = [], [], set()
-    # ---- STRICT PASS ----
+    # Score sentences based on relevance to question
+    scored_sentences = []
+    question_norm = RET.ar_normalize(question)
+    q_terms = set(question_norm.split())
+    
     for _, i in hits[:topk]:
         ch = index.chunks[i]
         for s in RET.sent_split(ch.text):
             ss = s.strip()
-            if not ss or ss in seen: 
+            if not ss:
                 continue
-            ok = False
-            if intent in ("work_hours", "ramadan_hours"):
-                ok = bool(RET.extract_all_ranges(ss, intent))
-            elif intent in ("overtime", "leave", "procurement", "per_diem"):
-                # Prefer sentences with numbers for these intents
-                ok = sentence_satisfies_intent_soft(ss, intent) and bool(numbers_in(ss))
-            else:
-                ok = sentence_satisfies_intent_soft(ss, intent)
-            if ok:
-                picked.append(ss)
-                srcs.append(f"{len(srcs)+1}. Data_pdf.pdf - page {ch.page}")
-                seen.add(ss)
-                if len(picked) >= max_snippets:
-                    break
-        if len(picked) >= max_snippets:
-            break
-
-    # ---- SOFT PASS (if nothing strict) ----
-    if not picked:
-        for _, i in hits[:topk]:
-            ch = index.chunks[i]
-            for s in RET.sent_split(ch.text):
-                ss = s.strip()
-                if not ss or ss in seen:
-                    continue
-                if sentence_satisfies_intent_soft(ss, intent):
-                    picked.append(ss)
-                    srcs.append(f"{len(srcs)+1}. Data_pdf.pdf - page {ch.page}")
-                    seen.add(ss)
-                    if len(picked) >= max_snippets:
-                        break
-            if len(picked) >= max_snippets:
-                break
-
-    if not picked:
-        return "", []
-    return " ".join(picked), srcs
+                
+            # Calculate relevance score
+            s_norm = RET.ar_normalize(ss)
+            s_terms = set(s_norm.split())
+            overlap = len(q_terms & s_terms)
+            
+            # Intent-specific bonuses
+            intent_match = sentence_satisfies_intent_soft(ss, intent)
+            
+            score = overlap + (2 if intent_match else 0)
+            
+            if score > 0:
+                scored_sentences.append((score, ss, ch.page))
+    
+    # Sort by score and take top snippets
+    scored_sentences.sort(key=lambda x: x[0], reverse=True)
+    
+    picked = []
+    sources = []
+    seen = set()
+    
+    for score, sentence, page in scored_sentences[:max_snippets]:
+        if sentence not in seen:
+            picked.append(sentence)
+            sources.append(f"{len(sources)+1}. Data_pdf.pdf - page {page}")
+            seen.add(sentence)
+    
+    return "\n".join(picked), sources
 
 # ---------------- LLM (Qwen) editor ----------------
 
-def build_editor_prompt(question: str, evidence: str, extractive: str) -> List[dict]:
+def build_editor_prompt(question: str, evidence: str) -> List[dict]:
     system = (
-        "أنت محرّر عربي محافظ. أعد صياغة الجواب في فقرة عربية واحدة واضحة،"
-        " وتعتمد فقط على النص المقتبس أدناه. يُمنع إضافة أية معلومات جديدة أو تعميمات،"
-        " ويُمنع إدخال أرقام/نسب/أوقات غير مذكورة حرفيًا في الأدلة."
-        " إذا كان المتاح جزئيًا، فقل المعنى المتاح فقط دون اختلاق."
+        "أنت خبير في تقديم إجابات دقيقة باللغة العربية بناءً على المستندات المقدمة. "
+        "مهمتك هي الإجابة على السؤال التالي باستخدام المعلومات الموجودة في قسم 'الأدلة'. "
+        "إذا كانت الأدلة تحتوي على معلومات كافية، قدم إجابة واضحة ومباشرة باللغة العربية. "
+        "إذا لم تكن الأدلة كافية للإجابة بدقة، اجب بـ 'لا توجد معلومات كافية في المستندات المقدمة.'"
+        "لا تختلق معلومات أو أرقام غير موجودة في الأدلة."
     )
+    
     user = (
-        "الأدلة المقتبسة (لا تُضِف غيرها):\n-----\n"
-        f"{evidence.strip()}\n-----\n\n"
-        "الجواب المستخلص الذي يجب إعادة صياغته دون إضافة حقائق:\n<<<\n"
-        f"{extractive.strip()}\n>>>\n"
+        f"السؤال: {question}\n\n"
+        f"الأدلة المتاحة:\n{evidence.strip()}\n\n"
+        "الإجابة (بالعربية):"
     )
+    
     return [{"role": "system", "content": system},
             {"role": "user", "content": user}]
 
 def load_llm(model_name: str, use_4bit: bool = False, use_8bit: bool = False):
     from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-    kwargs = {}
+    
+    # Model-specific configurations
+    model_kwargs = {
+        "trust_remote_code": True,
+        "torch_dtype": torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+    }
+    
     if torch.cuda.is_available():
-        kwargs["device_map"] = "auto"
-        kwargs["torch_dtype"] = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        model_kwargs["device_map"] = "auto"
     else:
-        kwargs["device_map"] = "cpu"
-        kwargs["torch_dtype"] = torch.float32
+        model_kwargs["device_map"] = "cpu"
+        model_kwargs["torch_dtype"] = torch.float32
 
+    # Quantization for memory efficiency
     if use_4bit or use_8bit:
         try:
-            import bitsandbytes as bnb  # noqa
-            if use_4bit:
-                kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
-            elif use_8bit:
-                kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True if use_4bit else False,
+                load_in_8bit=True if use_8bit else False,
+                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            )
+            model_kwargs["quantization_config"] = quant_config
         except Exception as e:
-            LOG.warning("bitsandbytes unavailable (%s). Loading model without quantization.", e)
+            LOG.warning(f"Quantization failed: {e}")
 
-    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    mdl = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, **kwargs)
-    return tok, mdl
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    
+    return tokenizer, model
 
-def llm_rewrite_to_paragraph(tokenizer, model, question: str, body: str, evidence_text: str) -> str:
-    msgs = build_editor_prompt(question, evidence_text, body)
+def llm_generate_answer(tokenizer, model, question: str, evidence_text: str) -> str:
+    msgs = build_editor_prompt(question, evidence_text)
     try:
         prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     except Exception:
         prompt = msgs[0]["content"] + "\n\n" + msgs[1]["content"]
 
-    inputs = tokenizer(prompt, return_tensors="pt")
+    # Tokenize with truncation to prevent overflow
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     out_ids = model.generate(
         **inputs,
-        max_new_tokens=160,
-        temperature=0.0,
-        top_p=1.0,
-        do_sample=False,
+        max_new_tokens=200,
+        temperature=0.1,  # Slightly higher for better flow
+        top_p=0.9,
+        do_sample=True,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.eos_token_id,
     )
-    text = tokenizer.decode(out_ids[0], skip_special_tokens=True).strip()
-    # Heuristic: keep only the final assistant continuation line/paragraph
-    if ">>>" in text:
-        text = text.split(">>>")[-1]
-    text = re.sub(r'^\s*(assistant|system)\s*[:]?\s*', '', text, flags=re.I).strip()
-    # Keep first paragraph
-    text = text.split("\n\n")[0].strip()
-    return text
+    
+    # Decode only the generated part (exclude input)
+    response = tokenizer.decode(out_ids[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True).strip()
+    
+    # Post-process to ensure it's clean
+    response = response.split('\n')[0].strip()  # Take first line only
+    return response
 
 # ---------------- Orchestrator ----------------
 
@@ -268,34 +269,42 @@ def ask_once(index: RET.HybridIndex,
     t0 = time.time()
     intent = RET.classify_intent(question)
 
-    # 1) Use your retriever with rerank=True (important!)
-    extractive = RET.answer(question, index, intent, use_rerank_flag=True)
-    body, sources = split_sources_block(extractive)
-    evidence_text = body
-
-    # 2) If the extractive doesn’t satisfy intent, mine strict->soft
-    if not extractive_answers_intent(question, intent, body):
-        mined_body, mined_sources = mine_intent_evidence(index, question, intent,
-                                                         topk=12, max_snippets=3)
-        if mined_body:
-            body = mined_body
-            sources = mined_sources
-            evidence_text = mined_body
-        else:
+    # Get evidence first with improved mining
+    evidence_text, sources = mine_intent_evidence(index, question, intent, topk=15, max_snippets=4)
+    
+    # If no good evidence found, fall back to extractive
+    if not evidence_text.strip():
+        extractive = RET.answer(question, index, intent, use_rerank_flag=True)
+        body, extractive_sources = split_sources_block(extractive)
+        evidence_text = body
+        sources = extractive_sources
+        if not evidence_text.strip():
             dt = time.time() - t0
-            return f"⏱ {dt:.2f}s | 🤖 لا توجد معلومات كافية في السياق للإجابة على هذا السؤال.\n{join_sources(sources)}"
+            return f"⏱ {dt:.2f}s | 🤖 لا توجد معلومات كافية في السياق للإجابة على هذا السؤال."
 
-    # 3) Optional: rewrite to a single Arabic paragraph
-    if not use_llm or tokenizer is None or model is None:
-        dt = time.time() - t0
-        return f"⏱ {dt:.2f}s | 🤖 {body}\n{join_sources(sources)}"
-
-    rewritten = llm_rewrite_to_paragraph(tokenizer, model, question, body, evidence_text)
-
-    # 4) Numeric guard
-    final_body = rewritten if all_numbers_in_evidence(rewritten, evidence_text) else body
+    # Use LLM to synthesize answer
+    if use_llm and tokenizer is not None and model is not None:
+        try:
+            response = llm_generate_answer(tokenizer, model, question, evidence_text)
+            
+            # Check if response is meaningful
+            if response and not response.startswith("لا توجد معلومات") and len(response) > 5:
+                dt = time.time() - t0
+                return f"⏱ {dt:.2f}s | 🤖 {response}\n{join_sources(sources)}"
+                
+        except Exception as e:
+            LOG.warning(f"LLM generation failed: {e}")
+    
+    # Fallback to evidence-based answer
     dt = time.time() - t0
-    return f"⏱ {dt:.2f}s | 🤖 {final_body}\n{join_sources(sources)}"
+    if evidence_text.strip():
+        # Simple extraction of relevant info
+        sentences = RET.sent_split(evidence_text)
+        if sentences:
+            answer = sentences[0]  # Take the most relevant sentence
+            return f"⏱ {dt:.2f}s | 🤖 {answer}\n{join_sources(sources)}"
+    
+    return f"⏱ {dt:.2f}s | 🤖 لا توجد معلومات كافية في السياق للإجابة على هذا السؤال."
 
 def run_sanity(index: RET.HybridIndex, tokenizer, model, use_llm: bool):
     print("\n🧪 Sanity run…\n")
