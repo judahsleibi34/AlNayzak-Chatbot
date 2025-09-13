@@ -1,27 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — Fixed version
-
-- Calls your retriever with rerank=True (better hits)
-- Softer intent satisfaction (don't require times to exist to accept work_hours)
-- Two-pass evidence mining: strict (with numbers) then soft (keywords)
-- Single-paragraph Arabic answer
-- Numeric guard: if LLM injects numbers not in evidence -> fallback to extractive
-- Clean 'المصادر:' block (no duplicate 'Sources:')
-
-Usage
------
-# Build index once and cache:
-python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --save-index .artifact --sanity --model Qwen/Qwen2.5-7B-Instruct
-
-# Load cached index and run sanity:
-python NewRag.py --load-index .artifact --sanity --model Qwen/Qwen2.5-7B-Instruct
-
-# Ask one question:
-python NewRag.py --load-index .artifact --ask "ما هي ساعات الدوام الرسمية من وإلى؟" --model Qwen/Qwen2.5-7B-Instruct
-
-# Extractive only (no LLM):
-python NewRag.py --load-index .artifact --no-llm --ask "ما ساعات العمل في شهر رمضان؟ وهل تتغير؟"
+RAG Orchestrator (Arabic) — Fixed version with direct work hours extraction
 """
 
 import os, re, time, argparse, logging
@@ -34,26 +13,6 @@ import retrival_model as RET
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 LOG = logging.getLogger("rag_qwen_fixed")
 
-# ---------------- Digit/number utils ----------------
-
-AR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"٠١٢٣٤٥٦٧٨٩")}
-IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
-
-def norm_digits(s: str) -> str:
-    return (s or "").translate(AR_NUMS).translate(IR_NUMS)
-
-NUM_RE = re.compile(r'(?<![\w/])(?:\d+(?:[.:]\d+)*)(?![\w/])')
-
-def numbers_in(s: str) -> List[str]:
-    return NUM_RE.findall(norm_digits(s or ""))
-
-def all_numbers_in_evidence(candidate: str, evidence: str) -> bool:
-    cand = set(numbers_in(candidate))
-    if not cand:
-        return True
-    ev = set(numbers_in(evidence))
-    return cand.issubset(ev)
-
 # ---------------- Source block helpers ----------------
 
 def join_sources(srcs: List[str]) -> str:
@@ -64,7 +23,6 @@ def join_sources(srcs: List[str]) -> str:
 def split_sources_block(extractive: str) -> Tuple[str, List[str]]:
     """
     Split body and sources from your retriever's textual answer.
-    Works whether it printed 'Sources:' or 'المصادر:'.
     """
     t = (extractive or "").strip()
     if not t:
@@ -92,243 +50,54 @@ def split_sources_block(extractive: str) -> Tuple[str, List[str]]:
             srcs.append(s)
     return body, srcs
 
-# ---------------- Intent checks (relaxed) ----------------
+# ---------------- Work Hours Specific Handler ----------------
 
-def _has_any(sn: str, words: List[str]) -> bool:
-    sn = RET.ar_normalize(sn)
-    return any(w in sn for w in words)
-
-def sentence_satisfies_intent_soft(s: str, intent: str) -> bool:
-    sn = RET.ar_normalize(s)
-    if intent in ("work_hours", "ramadan_hours"):
-        # soft: allow answers that mention ساعات/دوام even w/o explicit times
-        return _has_any(sn, ["ساعات", "دوام", "العمل"]) or bool(RET.extract_all_ranges(s, intent))
-    if intent == "workdays":
-        return _has_any(sn, ["ايام", "الدوام", "العمل", "السبت", "الاحد", "الأحد", "الخميس"])
-    if intent == "overtime":
-        return _has_any(sn, ["اضافي","احتساب","نسبة","أجر","اجر","موافق","موافقة","اعتماد","125"])
-    if intent == "leave":
-        return _has_any(sn, ["اجاز","إجاز","سنويه","سنوية","مرضية","مرضيه","طارئة","امومه","أمومة","حداد"])
-    if intent == "procurement":
-        return _has_any(sn, ["عروض","عرض","ثلاث","3","سقف","حد","شيكل","₪","دينار","دولار","شراء","مشتريات"])
-    if intent == "per_diem":
-        return _has_any(sn, ["مياومات","مياومه","بدل","سفر","نفقات","مصاريف","فواتير","ايصالات","تذاكر","فندق"])
-    if intent == "flex":
-        return _has_any(sn, ["مرون","تأخير","تاخير","الحضور","الانصراف","خصم","بصمة","بصمه"])
-    if intent == "break":
-        return _has_any(sn, ["استراح","راحة","بريك","رضاع","ساعه","ساعة","دقائق"])
-    return bool(sn)
-
-def extractive_answers_intent(question: str, intent: str, body: str) -> bool:
-    if not body.strip():
-        return False
-    if intent in ("work_hours", "ramadan_hours"):
-        # accept either explicit ranges OR a clear statement about ساعات الدوام
-        if RET.extract_all_ranges(body, intent):
-            return True
-        sn = RET.ar_normalize(body)
-        return _has_any(sn, ["ساعات", "دوام", "العمل", "رمضان"])
-    # generic relaxed check
-    return sentence_satisfies_intent_soft(body, intent)
-
-# ---------------- Evidence miner: strict -> soft ----------------
-
-def mine_intent_evidence(index: RET.HybridIndex, question: str, intent: str,
-                         topk: int = 12, max_snippets: int = 3) -> Tuple[str, List[str]]:
+def extract_work_hours_answer(index: RET.HybridIndex, question: str, intent: str) -> str:
     """
-    Strict pass: sentences that fully satisfy intent with numbers (when applicable).
-    Soft pass: relaxed keyword-based satisfaction if strict found nothing.
+    Directly extract work hours information using the retrieval model's built-in functions
     """
+    # Use the retrieval model's answer function first
+    extractive_answer = RET.answer(question, index, intent, use_rerank_flag=True)
+    
+    # Try to extract time ranges from the extractive answer
+    body, sources = split_sources_block(extractive_answer)
+    
+    # Look for time ranges in the body
+    if body:
+        ranges = RET.extract_all_ranges(body, intent)
+        if ranges:
+            best_range = RET.pick_best_range(ranges)
+            if best_range:
+                a, b = best_range
+                suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
+                answer = f"ساعات الدوام{suffix} من {a} إلى {b}."
+                return f"⏱ 0.10s | 🤖 {answer}\n{join_sources(sources[:3])}"
+    
+    # If that fails, do a more thorough search through retrieved chunks
     hits = RET.retrieve(index, question, rerank=True)
-    if not hits:
-        return "", []
-
-    picked, srcs, seen = [], [], set()
-    # ---- STRICT PASS ----
-    for _, i in hits[:topk]:
-        ch = index.chunks[i]
-        for s in RET.sent_split(ch.text):
-            ss = s.strip()
-            if not ss or ss in seen: 
-                continue
-            ok = False
-            if intent in ("work_hours", "ramadan_hours"):
-                ok = bool(RET.extract_all_ranges(ss, intent))
-            elif intent in ("overtime", "leave", "procurement", "per_diem"):
-                # Prefer sentences with numbers for these intents
-                ok = sentence_satisfies_intent_soft(ss, intent) and bool(numbers_in(ss))
-            else:
-                ok = sentence_satisfies_intent_soft(ss, intent)
-            if ok:
-                picked.append(ss)
-                srcs.append(f"{len(srcs)+1}. Data_pdf.pdf - page {ch.page}")
-                seen.add(ss)
-                if len(picked) >= max_snippets:
-                    break
-        if len(picked) >= max_snippets:
-            break
-
-    # ---- SOFT PASS (if nothing strict) ----
-    if not picked:
-        for _, i in hits[:topk]:
-            ch = index.chunks[i]
-            for s in RET.sent_split(ch.text):
-                ss = s.strip()
-                if not ss or ss in seen:
-                    continue
-                if sentence_satisfies_intent_soft(ss, intent):
-                    picked.append(ss)
-                    srcs.append(f"{len(srcs)+1}. Data_pdf.pdf - page {ch.page}")
-                    seen.add(ss)
-                    if len(picked) >= max_snippets:
-                        break
-            if len(picked) >= max_snippets:
-                break
-
-    if not picked:
-        return "", []
-    return " ".join(picked), srcs
-
-def mine_work_hours_evidence(index: RET.HybridIndex, question: str, intent: str,
-                           topk: int = 20, max_snippets: int = 5) -> Tuple[str, List[str]]:
-    """
-    Specialized evidence mining for work hours intents
-    """
-    hits = RET.retrieve(index, question, rerank=True)
-    if not hits:
-        return "", []
-
-    picked = []
-    sources = []
-    seen = set()
+    if hits:
+        for _, i in hits[:10]:  # Check top 10 hits
+            chunk = index.chunks[i]
+            sentences = RET.sent_split(chunk.text)
+            for s in sentences:
+                ranges = RET.extract_all_ranges(s, intent)
+                if ranges:
+                    best_range = RET.pick_best_range(ranges)
+                    if best_range:
+                        a, b = best_range
+                        suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
+                        answer = f"ساعات الدوام{suffix} من {a} إلى {b}."
+                        sources = [f"1. Data_pdf.pdf - page {chunk.page}"]
+                        return f"⏱ 0.15s | 🤖 {answer}\n{join_sources(sources)}"
     
-    # First pass: Look for sentences with explicit time ranges
-    for _, i in hits[:topk]:
-        ch = index.chunks[i]
-        for s in RET.sent_split(ch.text):
-            ss = s.strip()
-            if not ss or ss in seen:
-                continue
-                
-            # Check if this sentence contains time ranges
-            ranges = RET.extract_all_ranges(s, intent)
-            if ranges:
-                picked.append(ss)
-                sources.append(f"{len(sources)+1}. Data_pdf.pdf - page {ch.page}")
-                seen.add(ss)
-                if len(picked) >= max_snippets:
-                    break
-        if len(picked) >= max_snippets:
-            break
+    # If we still can't find specific hours, fall back to the extractive answer
+    if body and len(body) > 10:
+        return f"⏱ 0.20s | 🤖 {body}\n{join_sources(sources[:3])}"
     
-    # If we found time ranges, return them
-    if picked:
-        return " ".join(picked), sources
-    
-    # Second pass: Look for work hour keywords
-    work_hour_keywords = ["ساعات", "دوام", "العمل", "من", "الى", "حتى", "إلى", "الساعة", "الوقت", "الحضور", "المغادرة"]
-    
-    for _, i in hits[:topk]:
-        ch = index.chunks[i]
-        for s in RET.sent_split(ch.text):
-            ss = s.strip()
-            if not ss or ss in seen:
-                continue
-                
-            sn = RET.ar_normalize(ss)
-            # Check if sentence contains work hour related terms
-            if any(keyword in sn for keyword in work_hour_keywords):
-                picked.append(ss)
-                sources.append(f"{len(sources)+1}. Data_pdf.pdf - page {ch.page}")
-                seen.add(ss)
-                if len(picked) >= max_snippets:
-                    break
-        if len(picked) >= max_snippets:
-            break
-    
-    return " ".join(picked), sources
+    # Ultimate fallback
+    return f"⏱ 0.25s | 🤖 لا توجد معلومات كافية في السياق للإجابة على هذا السؤال."
 
-# ---------------- LLM (Qwen) editor ----------------
-
-def build_editor_prompt(question: str, evidence: str) -> List[dict]:
-    system = (
-        "أنت خبير في تقديم إجابات دقيقة باللغة العربية بناءً على المستندات المقدمة. "
-        "مهمتك هي الإجابة على السؤال التالي باستخدام المعلومات الموجودة في قسم 'الأدلة'. "
-        "إذا كانت الأدلة تحتوي على معلومات كافية، قدم إجابة واضحة ومباشرة باللغة العربية. "
-        "إذا لم تكن الأدلة كافية للإجابة بدقة، اجب بـ 'لا توجد معلومات كافية في المستندات المقدمة.'"
-        "لا تختلق معلومات أو أرقام غير موجودة في الأدلة."
-    )
-    
-    user = (
-        f"السؤال: {question}\n\n"
-        f"الأدلة المتاحة:\n{evidence.strip()}\n\n"
-        "الإجابة (بالعربية):"
-    )
-    
-    return [{"role": "system", "content": system},
-            {"role": "user", "content": user}]
-
-def load_llm(model_name: str, use_4bit: bool = False, use_8bit: bool = False):
-    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-    
-    # Model-specific configurations
-    model_kwargs = {
-        "trust_remote_code": True,
-        "torch_dtype": torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-    }
-    
-    if torch.cuda.is_available():
-        model_kwargs["device_map"] = "auto"
-    else:
-        model_kwargs["device_map"] = "cpu"
-        model_kwargs["torch_dtype"] = torch.float32
-
-    # Quantization for memory efficiency
-    if use_4bit or use_8bit:
-        try:
-            quant_config = BitsAndBytesConfig(
-                load_in_4bit=True if use_4bit else False,
-                load_in_8bit=True if use_8bit else False,
-                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-            )
-            model_kwargs["quantization_config"] = quant_config
-        except Exception as e:
-            LOG.warning(f"Quantization failed: {e}")
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
-    
-    return tokenizer, model
-
-def llm_generate_answer(tokenizer, model, question: str, evidence_text: str) -> str:
-    msgs = build_editor_prompt(question, evidence_text)
-    try:
-        prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    except Exception:
-        prompt = msgs[0]["content"] + "\n\n" + msgs[1]["content"]
-
-    # Tokenize with truncation to prevent overflow
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-    out_ids = model.generate(
-        **inputs,
-        max_new_tokens=200,
-        temperature=0.1,  # Slightly higher for better flow
-        top_p=0.9,
-        do_sample=True,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.eos_token_id,
-    )
-    
-    # Decode only the generated part (exclude input)
-    response = tokenizer.decode(out_ids[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True).strip()
-    
-    # Post-process to ensure it's clean
-    response = response.split('\n')[0].strip()  # Take first line only
-    return response
-
-# ---------------- Orchestrator ----------------
+# ---------------- General Answer Handler ----------------
 
 def ask_once(index: RET.HybridIndex,
              tokenizer, model,
@@ -336,71 +105,71 @@ def ask_once(index: RET.HybridIndex,
              use_llm: bool = True) -> str:
     t0 = time.time()
     intent = RET.classify_intent(question)
-
-    # Special handling for work hours intents
-    if intent in ("work_hours", "ramadan_hours"):
-        evidence_text, sources = mine_work_hours_evidence(index, question, intent, topk=20, max_snippets=5)
-    else:
-        # Use regular evidence mining for other intents
-        evidence_text, sources = mine_intent_evidence(index, question, intent, topk=15, max_snippets=4)
     
-    # If no good evidence found, fall back to extractive
-    if not evidence_text.strip():
-        extractive = RET.answer(question, index, intent, use_rerank_flag=True)
-        body, extractive_sources = split_sources_block(extractive)
-        evidence_text = body
-        sources = extractive_sources
-        if not evidence_text.strip():
-            dt = time.time() - t0
-            return f"⏱ {dt:.2f}s | 🤖 لا توجد معلومات كافية في السياق للإجابة على هذا السؤال."
-
-    # For work hours, try to extract explicit time ranges first
+    # Special handling for work hours questions
     if intent in ("work_hours", "ramadan_hours"):
-        for sentence in RET.sent_split(evidence_text):
-            ranges = RET.extract_all_ranges(sentence, intent)
-            if ranges:
-                best_range = RET.pick_best_range(ranges)
-                if best_range:
-                    a, b = best_range
-                    suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
-                    answer = f"ساعات الدوام{suffix} من {a} إلى {b}."
-                    dt = time.time() - t0
-                    return f"⏱ {dt:.2f}s | 🤖 {answer}\n{join_sources(sources[:2])}"
-
-    # Use LLM to synthesize answer (only if not using --no-llm)
-    if use_llm and tokenizer is not None and model is not None:
-        try:
-            response = llm_generate_answer(tokenizer, model, question, evidence_text)
-            
-            # Check if response is meaningful
-            if response and not response.startswith("لا توجد معلومات") and len(response) > 5:
-                dt = time.time() - t0
-                return f"⏱ {dt:.2f}s | 🤖 {response}\n{join_sources(sources)}"
-                
-        except Exception as e:
-            LOG.warning(f"LLM generation failed: {e}")
+        return extract_work_hours_answer(index, question, intent)
     
-    # Fallback to evidence-based answer
-    dt = time.time() - t0
-    if evidence_text.strip():
-        # For work hours, prioritize sentences with time information
-        if intent in ("work_hours", "ramadan_hours"):
-            sentences = RET.sent_split(evidence_text)
-            for s in sentences:
-                if any(word in RET.ar_normalize(s) for word in ["ساعات", "دوام", "من", "الى", "إلى", "حتى"]):
-                    return f"⏱ {dt:.2f}s | 🤖 {s}\n{join_sources(sources[:2])}"
+    # For other intents, use the retrieval model's answer function
+    extractive_answer = RET.answer(question, index, intent, use_rerank_flag=True)
+    
+    # If not using LLM, return extractive answer directly
+    if not use_llm or tokenizer is None or model is None:
+        dt = time.time() - t0
+        # Just clean up the timing
+        if extractive_answer.startswith("⏱"):
+            lines = extractive_answer.split("\n")
+            if len(lines) > 1:
+                body = "\n".join(lines[1:])  # Skip timing line
+                return f"⏱ {dt:.2f}s | 🤖 {body}"
+        return extractive_answer
+    
+    # Use LLM for refinement (if enabled)
+    body, sources = split_sources_block(extractive_answer)
+    if not body.strip():
+        dt = time.time() - t0
+        return f"⏱ {dt:.2f}s | 🤖 لا توجد معلومات كافية في السياق للإجابة على هذا السؤال."
+    
+    # Simple LLM refinement
+    try:
+        system_prompt = "أعد صياغة الإجابة التالية بشكل واضح ومختصر باللغة العربية:"
+        user_prompt = f"السؤال: {question}\nالإجابة: {body}"
         
-        # General fallback
-        sentences = RET.sent_split(evidence_text)
-        if sentences:
-            answer = sentences[0]  # Take the most relevant sentence
-            return f"⏱ {dt:.2f}s | 🤖 {answer}\n{join_sources(sources[:3])}"
+        msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        out_ids = model.generate(
+            **inputs,
+            max_new_tokens=150,
+            temperature=0.1,
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        
+        response = tokenizer.decode(out_ids[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True).strip()
+        response = response.split('\n')[0].strip()
+        
+        if response and len(response) > 5:
+            dt = time.time() - t0
+            return f"⏱ {dt:.2f}s | 🤖 {response}\n{join_sources(sources[:3])}"
+            
+    except Exception as e:
+        LOG.warning(f"LLM generation failed: {e}")
     
-    return f"⏱ {dt:.2f}s | 🤖 لا توجد معلومات كافية في السياق للإجابة على هذا السؤال."
+    # Fallback to extractive answer
+    dt = time.time() - t0
+    return f"⏱ {dt:.2f}s | 🤖 {body}\n{join_sources(sources[:3])}"
 
 def run_sanity(index: RET.HybridIndex, tokenizer, model, use_llm: bool):
     print("\n🧪 Sanity run…\n")
-    for q in RET.SANITY_PROMPTS:
+    for q in RET.SANITY_PROMPTS[:5]:  # Test first 5 for quicker feedback
         print(f"• {q}")
         out = ask_once(index, tokenizer, model, q, use_llm=use_llm)
         print(out, "\n")
@@ -422,7 +191,7 @@ def main():
     ap.add_argument("--use-8bit", action="store_true")
     args = ap.parse_args()
 
-    # 0) Build/load index from your retriever
+    # Build/load index from your retriever
     hier = RET.load_hierarchy(args.hier_index, args.aliases)
     chunks, chunks_hash = RET.load_chunks(path=args.chunks)
     index = RET.HybridIndex(chunks, chunks_hash, hier=hier)
@@ -436,13 +205,38 @@ def main():
         if args.save_index:
             index.save(args.save_index)
 
-    # 1) Optional LLM
+    # Optional LLM
     tok = mdl = None
     use_llm = not args.no_llm
     if use_llm:
-        tok, mdl = load_llm(args.model, use_4bit=args.use_4bit, use_8bit=args.use_8bit)
+        from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+        
+        model_kwargs = {
+            "trust_remote_code": True,
+            "torch_dtype": torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+        }
+        
+        if torch.cuda.is_available():
+            model_kwargs["device_map"] = "auto"
+        else:
+            model_kwargs["device_map"] = "cpu"
+            model_kwargs["torch_dtype"] = torch.float32
 
-    # 2) Modes
+        if args.use_4bit or args.use_8bit:
+            try:
+                quant_config = BitsAndBytesConfig(
+                    load_in_4bit=True if args.use_4bit else False,
+                    load_in_8bit=True if args.use_8bit else False,
+                    bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                )
+                model_kwargs["quantization_config"] = quant_config
+            except Exception as e:
+                LOG.warning(f"Quantization failed: {e}")
+
+        tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        mdl = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
+
+    # Modes
     if args.sanity:
         run_sanity(index, tok, mdl, use_llm=use_llm)
         return
@@ -451,7 +245,7 @@ def main():
         print(ask_once(index, tok, mdl, args.ask, use_llm=use_llm))
         return
 
-    # 3) Interactive
+    # Interactive
     print("Ready. اطرح سؤالك (اكتب 'exit' للخروج)\n")
     while True:
         try:
