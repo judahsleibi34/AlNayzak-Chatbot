@@ -1,255 +1,174 @@
-# -*- coding: utf-8 -*-
-"""
-RAG driver on top of your retriever (retrival_model.py), tuned for Arabic.
+# NewRag_qwen_fixed.py
+# Arabic RAG with Qwen2.5-7B-Instruct + your hybrid retriever
+# - Single-paragraph answers
+# - Reranker toggle (--rerank / --no-rerank, default: ON)
+# - Works with .artifact index cache
+# - Fixes tensor/dict device move by creating attention_mask when needed
 
-- Uses your HybridIndex / combine_scores exactly as-is
-- Adds Arabic reranking with BAAI/bge-reranker-v2-m3
-- Expands time-range lines to ±2 sentences
-- Builds compact context (<=1400 chars)
-- Prompts Qwen2.5-7B-Instruct via chat template
-- Outputs ONE continuous Arabic paragraph (no bullets)
+import os, argparse, time, torch
+from typing import List, Tuple
+from dataclasses import dataclass
 
-Usage (examples):
-  # build/load index, then run sanity questions with Qwen
-  python rag_qwen25.py --chunks Data_pdf_clean_chunks.jsonl --load-index .artifact --model Qwen/Qwen2.5-7B-Instruct --sanity
+# --- your retriever pieces ---
+from retrival_model import (
+    HybridIndex, load_hierarchy, load_chunks,
+    retrieve, classify_intent, best_snippet, ar_normalize,
+)
 
-  # interactive chat
-  python rag_qwen25.py --chunks Data_pdf_clean_chunks.jsonl --load-index .artifact --model Qwen/Qwen2.5-7B-Instruct
-
-Colab/T4 note:
-- 4-bit quantization is enabled (BitsAndBytes). If bnb is missing, it falls back.
-"""
-
-import os, re, json, argparse, time, logging
-from typing import List, Tuple, Optional
-
-import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
-# ---- your retriever (keep it unchanged) ----
-from retrival_model import (
-    HybridIndex, load_chunks, load_hierarchy, combine_scores,
-    ar_normalize, sent_split, classify_intent
-)
+# ----------------- Config -----------------
+DEFAULT_CHUNKS = "Data_pdf_clean_chunks.jsonl"
+DEFAULT_HIER   = "heading_inverted_index.json"
+DEFAULT_ALIAS  = "section_aliases.json"
+DEFAULT_IDXDIR = ".artifact"
+DEFAULT_MODEL  = "Qwen/Qwen2.5-7B-Instruct"
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-LOG = logging.getLogger("rag")
+MAX_CTX_CHARS  = 1100   # keep prompts lean for speed/quality
+TOPK_DOCS      = 3      # how many snippets to pass to the LLM
+MAX_NEW_TOKENS = 320
+TEMP           = 0.2
+TOP_P          = 0.9
+REPETITION_P   = 1.05
 
-# Arabic time-range regex (same spirit as your retriever)
-TIME_RE = re.compile(
-    r'(?:من\s*)?(\d{1,2}(?::|\.)?\d{0,2})\s*(?:[-–—]|الى|إلى|حتي|حتى)\s*(\d{1,2}(?::|\.)?\d{0,2})'
-)
+# ----------------- LLM -----------------
 
-def has_time_range(s: str) -> bool:
-    return bool(TIME_RE.search(ar_normalize(s)))
+@dataclass
+class QwenBundle:
+    tok: AutoTokenizer
+    model: AutoModelForCausalLM
+    device: str
 
-# -------------- Arabic reranker --------------
-CE_MODEL = "BAAI/bge-reranker-v2-m3"
-_ce = None
-def ensure_reranker(device: str):
-    global _ce
-    if _ce is not None:
-        return _ce
-    try:
-        from sentence_transformers.cross_encoder import CrossEncoder
-        _ce = CrossEncoder(CE_MODEL, device=device)
-        LOG.info("Loaded Arabic reranker: %s", CE_MODEL)
-    except Exception as e:
-        LOG.warning("Could not load reranker (%s). Proceeding without.", e)
-        _ce = None
-    return _ce
-
-# -------------- Retrieval → candidates --------------
-def retrieve_candidates(index: HybridIndex, query: str,
-                        topk_dense=120, hybrid_topk=30,
-                        w_dense=0.70, w_char=0.15, w_word=0.15) -> List[Tuple[float, int]]:
-    qn = ar_normalize(query)
-    dS, dI = index.dense(qn, topk=topk_dense, restrict_ids=None)
-    cS, wS = index.sparse(qn)
-    prelim = combine_scores(dS, dI, cS, wS, w_dense=w_dense, w_char=w_char, w_word=w_word, topk=hybrid_topk)
-    # prelim = [(score, idx), ...]
-    return prelim
-
-def apply_rerank(index: HybridIndex, query: str, prelim: List[Tuple[float, int]],
-                 device: str, keep_top=8) -> List[Tuple[float, int]]:
-    ce = ensure_reranker(device)
-    if ce is None or len(prelim) <= 1:
-        return prelim[:keep_top]
-
-    pairs = [(query, index.chunks[i].text) for _, i in prelim]
-    try:
-        ce_scores = ce.predict(pairs)  # higher is better
-        scored = list(zip([float(s) for s in ce_scores], [i for _, i in prelim]))
-        scored.sort(key=lambda x: -x[0])
-        return scored[:keep_top]
-    except Exception as e:
-        LOG.warning("Rerank failed: %s", e)
-        return prelim[:keep_top]
-
-# -------------- Snippet/window builder --------------
-def best_sentence_idx(text: str, query_norm: str) -> Optional[int]:
-    sents = sent_split(text)
-    if not sents:
-        return None
-    q_terms = set([w for w in query_norm.split() if len(w) >= 3])
-    best_k, best_score = None, -1e9
-    for k, s in enumerate(sents):
-        sn = ar_normalize(s)
-        overlap = len(q_terms & set(sn.split()))
-        score = overlap
-        if has_time_range(s):  # strong signal for hours/policies
-            score += 1.5
-        if score > best_score:
-            best_score, best_k = score, k
-    return best_k
-
-def window_around_sentence(text: str, center_idx: int, win=2) -> str:
-    sents = sent_split(text)
-    if not sents:
-        return text.strip()
-    lo = max(0, center_idx - win)
-    hi = min(len(sents), center_idx + win + 1)
-    return " ".join(sents[lo:hi]).strip()
-
-def build_context(index: HybridIndex, query: str, hits: List[Tuple[float,int]],
-                  max_chars=1400, prefer_time: bool = False) -> Tuple[str, List[Tuple[int,int]]]:
-    """
-    Returns (context, [(rank, chunk_idx), ...]).
-    Each context block is prefixed with [المصدر N: filename - صX]
-    """
-    used = []
-    parts: List[str] = []
-    total = 0
-    qn = ar_normalize(query)
-
-    # Prefer lines with explicit time-ranges for hour-related intents
-    ordered = []
-    for rank, (_, i) in enumerate(hits, 1):
-        txt = index.chunks[i].text
-        if prefer_time and has_time_range(txt):
-            ordered.append((0, rank, i))  # priority 0
-        else:
-            ordered.append((1, rank, i))
-    ordered.sort()
-
-    for _, rank, i in ordered:
-        ch = index.chunks[i]
-        # pick the best sentence and expand window
-        k = best_sentence_idx(ch.text, qn)
-        snippet = window_around_sentence(ch.text, k if k is not None else 0, win=2)
-
-        head = f"[المصدر {len(parts)+1}: Data_pdf.pdf - ص{ch.page}]"
-        block = f"{head}\n{snippet}"
-        if total + len(block) + 2 > max_chars:
-            # allow a small last block if still empty
-            if total == 0:
-                block = block[:max_chars-3] + "…"
-                parts.append(block)
-                used.append((rank, i))
-            break
-        parts.append(block)
-        used.append((rank, i))
-        total += len(block) + 2
-
-        if total >= max_chars:
-            break
-
-    return "\n\n".join(parts), used
-
-# -------------- LLM (Qwen2.5-7B-Instruct) --------------
-def load_qwen(model_name: str):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-
-    # Prefer 4-bit on T4
-    quant_cfg = None
-    use_bnb = False
-    try:
-        quant_cfg = BitsAndBytesConfig(
+def load_qwen(model_name: str = DEFAULT_MODEL) -> QwenBundle:
+    use_bnb = True
+    bnb_cfg = None
+    if use_bnb:
+        bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16
+            bnb_4bit_compute_dtype=torch.float16,
         )
-        use_bnb = True
-    except Exception as e:
-        LOG.warning("BitsAndBytes not available: %s", e)
+    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token  # avoid attention_mask warnings
 
-    kwargs = dict(
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
         trust_remote_code=True,
         device_map="auto",
-        low_cpu_mem_usage=True
+        torch_dtype=torch.float16,
+        quantization_config=bnb_cfg,
+        low_cpu_mem_usage=True,
     )
-    if use_bnb:
-        kwargs["quantization_config"] = quant_cfg
-    else:
-        kwargs["torch_dtype"] = torch.float16 if device == "cuda" else torch.float32
-
-    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
     model.eval()
+    try:
+        if torch.__version__ >= "2.0":
+            model = torch.compile(model, mode="reduce-overhead", fullgraph=False)  # safe compile
+    except Exception:
+        pass
 
-    # Avoid the header echo: use chat template
-    return tokenizer, model, device
+    device = str(model.device)
+    return QwenBundle(tok, model, device)
 
-def generate_answer(tokenizer, model, device, query: str, context: str,
-                    paragraph_style: bool = True,
-                    max_new_tokens=256, temperature=0.3, top_p=0.9) -> str:
+# ----------------- Prompting -----------------
+
+def make_messages(question: str, stitched_context: str) -> List[dict]:
     sys_msg = (
-        "أنت مساعد عربي يعتمد فقط على السياق المقدم. "
-        "اكتب الجواب بالعربية الفصحى كفقرة واحدة متصلة بدون تعداد نقطي أو عناوين. "
-        "إن لم تجد الإجابة في السياق، اكتب: لا توجد معلومات كافية في السياق للإجابة."
+        "أنت مساعد عربي يعتمد فقط على السياق المقتبس. "
+        "أجب بجملة أو فقرتين متصلتين وبأسلوب واضح ومباشر. "
+        "إن لم تجد الإجابة في السياق، قل: لا توجد معلومات كافية في السياق للإجابة."
     )
     user_msg = (
-        "السياق المقتبس من الدليل (اعتمد عليه فقط):\n\n"
-        f"{context}\n\n"
-        f"السؤال: {query}"
+        "السياق المقتبس من الدليل (استخدمه فقط):\n\n"
+        f"{stitched_context}\n\n"
+        f"السؤال: {question}\n\n"
+        "الجواب:"
+    )
+    return [{"role": "system", "content": sys_msg},
+            {"role": "user",   "content": user_msg}]
+
+def generate_answer(qwen: QwenBundle, question: str, context: str) -> str:
+    messages = make_messages(question, context)
+
+    # Qwen chat template -> Tensor (not dict!)
+    input_ids = qwen.tok.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt",
+        truncation=True,
+        max_length=4096  # guardrail; actual will be shorter
     )
 
-    messages = [
-        {"role": "system", "content": sys_msg},
-        {"role": "user", "content": user_msg},
-    ]
-
-    # Chat template ensures the model sees roles properly (no literal 'system/user' in output)
-    try:
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_tensors="pt"
-        )
-    except TypeError:
-        # Older HF versions
-        prompt_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-        inputs = tokenizer(
-            prompt_text, return_tensors="pt", padding="longest", truncation=True
-        )
-
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-
-    # Deterministic for consistency; switch to do_sample=True if you want more “creative” phrasing
-    gen_kwargs = dict(
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        temperature=temperature,
-        top_p=top_p,
-        repetition_penalty=1.1,
-        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        use_cache=True,
-    )
+    # --- FIX: wrap tensor + create attention_mask ---
+    if isinstance(input_ids, torch.Tensor):
+        input_ids = input_ids.to(qwen.device)
+        if qwen.tok.pad_token_id is not None:
+            attention_mask = (input_ids != qwen.tok.pad_token_id).long()
+        else:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+        model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+    else:
+        # (rare) older tokenizers may return dict
+        model_inputs = {k: v.to(qwen.device) for k, v in input_ids.items()}
 
     with torch.no_grad():
-        out = model.generate(**inputs, **gen_kwargs)
+        out = qwen.model.generate(
+            **model_inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=TEMP,
+            top_p=TOP_P,
+            repetition_penalty=REPETITION_P,
+            do_sample=(TEMP > 0),
+            eos_token_id=qwen.tok.eos_token_id,
+            pad_token_id=qwen.tok.eos_token_id,
+            use_cache=True,
+        )
 
-    # Cut the prompt off (new tokens only)
-    new_tokens = out[0][inputs["input_ids"].shape[-1]:]
-    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-    # Clean minimal artifacts
-    return text.strip()
+    # strip the prompt from the decoded text to keep only the assistant part
+    prompt_txt = qwen.tok.decode(model_inputs["input_ids"][0], skip_special_tokens=True)
+    gen_txt    = qwen.tok.decode(out[0], skip_special_tokens=True)
+    ans = gen_txt[len(prompt_txt):].strip()
+    # normalize some stray artifacts
+    ans = ans.replace("\n\n", "\n").strip()
+    return ans if ans else "لا توجد معلومات كافية في السياق للإجابة."
 
-# -------------- Sanity prompts (same spirit as your file) --------------
-SANITY_QS = [
+# ----------------- Context builder -----------------
+
+def build_context(index: HybridIndex, question: str, rerank: bool) -> Tuple[str, str]:
+    """Return stitched short context + a sources line."""
+    intent = classify_intent(question)
+    hits = retrieve(index, question, rerank)
+    if not hits:
+        return "", ""
+
+    parts = []
+    srcs  = []
+    used  = 0
+    for rank, (_, i) in enumerate(hits, 1):
+        if used >= TOPK_DOCS:
+            break
+        ch = index.chunks[i]
+        snip = best_snippet(ch, ar_normalize(question), intent, max_len=420)
+        if not snip:
+            continue
+        # avoid near-duplicates
+        if any(snip in p or p in snip for p in parts):
+            continue
+        parts.append(f"[المصدر {rank}: Data_pdf.pdf - ص{ch.page}]\n{snip}")
+        srcs.append(f"{rank}. Data_pdf.pdf - ص{ch.page}")
+        used += 1
+        if sum(len(p) for p in parts) > MAX_CTX_CHARS:
+            break
+
+    stitched = "\n\n".join(parts)
+    sources_line = "المصادر:\n" + "\n".join(srcs) if srcs else ""
+    return stitched, sources_line
+
+# ----------------- Sanity set -----------------
+
+SANITY = [
     "ما هي ساعات الدوام الرسمية من وإلى؟",
     "هل يوجد مرونة في الحضور والانصراف؟ وكيف تُحسب دقائق التأخير؟",
     "هل توجد استراحة خلال الدوام؟ وكم مدتها؟",
@@ -258,89 +177,78 @@ SANITY_QS = [
     "كيف يُحتسب الأجر عن الساعات الإضافية في الأيام العادية؟",
     "ما التعويض عند العمل في العطل الرسمية؟",
     "هل يحتاج العمل الإضافي لموافقة مسبقة؟ ومن يعتمدها؟",
-    "كم مدة الإجازة السنوية لموظف جديد؟ ومتى تزيد؟",
-    "هل تُرحّل الإجازات غير المستخدمة؟ وما الحد الأقصى؟",
-    "ما سياسة الإجازة المرضية؟ وعدد أيامها؟ وهل يلزم تقرير طبي؟",
-    "ما هو بدل المواصلات؟ وهل يشمل الذهاب من المنزل للعمل؟ وكيف يُصرف؟",
-    "ما سقف الشراء الذي يستلزم ثلاثة عروض أسعار؟",
-    "ما ضوابط تضارب المصالح في المشتريات؟",
 ]
+
+# ----------------- Main -----------------
+
+def run_sanity(index: HybridIndex, qwen: QwenBundle, rerank: bool):
+    print("🧪 Sanity run…\n")
+    for q in SANITY:
+        ctx, srcs = build_context(index, q, rerank)
+        print(f"• {q}")
+        if not ctx:
+            print("لا توجد معلومات كافية في السياق للإجابة.\n")
+            continue
+        t0 = time.time()
+        a = generate_answer(qwen, q, ctx)
+        dt = time.time() - t0
+        # one clean paragraph + sources
+        a = a.replace("\n", " ").strip()
+        print(f"⏱ {dt:.2f}s | 🤖 {a}\n{srcs}\n")
+
+def chat_loop(index: HybridIndex, qwen: QwenBundle, rerank: bool):
+    print("\n💬 اكتب سؤالك (اكتب exit للخروج):")
+    while True:
+        try:
+            q = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not q: 
+            continue
+        if q.lower() in ("exit","quit","q"):
+            break
+        ctx, srcs = build_context(index, q, rerank)
+        if not ctx:
+            print("🤖 لا توجد معلومات كافية في السياق للإجابة.\n")
+            continue
+        a = generate_answer(qwen, q, ctx).replace("\n"," ").strip()
+        print(f"🤖 {a}\n{srcs}\n")
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--chunks", type=str, default="Data_pdf_clean_chunks.jsonl")
-    ap.add_argument("--hier-index", type=str, default="heading_inverted_index.json")
-    ap.add_argument("--aliases", type=str, default="section_aliases.json")
-    ap.add_argument("--load-index", type=str, default=".artifact")
+    ap.add_argument("--chunks", type=str, default=DEFAULT_CHUNKS)
+    ap.add_argument("--hier-index", type=str, default=DEFAULT_HIER)
+    ap.add_argument("--aliases", type=str, default=DEFAULT_ALIAS)
+    ap.add_argument("--load-index", type=str, default=DEFAULT_IDXDIR)
     ap.add_argument("--save-index", type=str, default=None)
-    ap.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
+    ap.add_argument("--model", type=str, default=DEFAULT_MODEL)
     ap.add_argument("--sanity", action="store_true")
-    ap.add_argument("--no-rerank", action="store_true", help="Disable CE reranker")
+    # rerank toggle (default ON)
+    ap.add_argument("--rerank",     dest="rerank", action="store_true")
+    ap.add_argument("--no-rerank",  dest="rerank", action="store_false")
+    ap.set_defaults(rerank=True)
     args = ap.parse_args()
 
-    # 1) Load / build retriever artifacts
+    # Build/Load index
     hier = load_hierarchy(args.hier_index, args.aliases)
-    chunks, chunks_hash = load_chunks(path=args.chunks)
-    index = HybridIndex(chunks, chunks_hash, hier=hier)
+    chunks, chash = load_chunks(path=args.chunks)
+    index = HybridIndex(chunks, chash, hier=hier)
 
     loaded = False
     if args.load_index and os.path.isdir(args.load_index):
         loaded = index.load(args.load_index)
     if not loaded:
-        LOG.info("Building dense+TF-IDF indexes (first run)…")
         index.build()
         if args.save_index:
             index.save(args.save_index)
 
-    # 2) Load LLM
-    LOG.info("Loading Qwen model…")
-    tokenizer, model, device = load_qwen(args.model)
-    _ = ensure_reranker(device) if not args.no_rerank else None
-    LOG.info("Ready.")
-
-    def ask(q: str) -> str:
-        t0 = time.time()
-        # intent helps us prefer time-range snippets for hours questions
-        intent = classify_intent(q)
-        prefer_time = intent in ("work_hours", "ramadan_hours")
-
-        prelim = retrieve_candidates(index, q, topk_dense=120, hybrid_topk=30,
-                                     w_dense=0.70, w_char=0.15, w_word=0.15)
-        if not args.no_rerank:
-            hits = apply_rerank(index, q, prelim, device=device, keep_top=8)
-        else:
-            hits = prelim[:8]
-
-        # if time intent but no candidates with time, keep as is (fallback)
-        ctx, used = build_context(index, q, hits, max_chars=1400, prefer_time=prefer_time)
-        if not ctx.strip():
-            return "لا توجد معلومات كافية في السياق للإجابة."
-
-        ans = generate_answer(tokenizer, model, device, q, ctx,
-                              paragraph_style=True, max_new_tokens=256, temperature=0.3, top_p=0.9)
-        dt = time.time() - t0
-        print(f"⏱ {dt:.2f}s | 🤖 {ans}\n")
-        return ans
+    # LLM
+    qwen = load_qwen(args.model)
 
     if args.sanity:
-        print("\n🧪 Sanity run…\n")
-        for q in SANITY_QS:
-            print(f"• {q}")
-            ask(q)
-        return
-
-    # Interactive loop
-    print("\n💬 Ready (Arabic). Type 'خروج' to exit.\n")
-    while True:
-        try:
-            q = input("سؤالك: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nانتهينا."); break
-        if not q:
-            continue
-        if q.lower() in ("خروج", "exit", "quit", "q"):
-            print("انتهينا."); break
-        ask(q)
+        run_sanity(index, qwen, args.rerank)
+    else:
+        chat_loop(index, qwen, args.rerank)
 
 if __name__ == "__main__":
     main()
