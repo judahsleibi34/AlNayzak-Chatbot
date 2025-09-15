@@ -1,37 +1,63 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — runs sanity prompts and refines answers robustly.
+RAG Orchestrator (Arabic) — robust refinement + persistent run artifacts.
 
-Highlights
-- Adds --sanity flag (alias of --test).
-- Uses built-in DEFAULT_SANITY_PROMPTS (merged with RET.SANITY_PROMPTS if present).
-- Retrieval-first; then optional LLM refinement (strict prompt, no fluff; safe fallback).
-- Suppresses noisy TF/XLA logs; safe if TF is not installed.
+What you get:
+- --sanity (alias of --test) to run Arabic sanity prompts.
+- Guardrails: preserve numbers/times/days; fallback if LLM drops facts.
+- --device auto|cpu|cuda, --no-rerank for VRAM safety.
+- PERSISTENT OUTPUTS: results saved to --out-dir/run_<timestamp>/:
+    - run.log         : full logging output
+    - report.txt      : the console-like transcript
+    - results.jsonl   : one JSON object per test (question, answer, sources, pass flags)
+    - summary.md      : readable pass/fail summary
+
 """
 
 import os
+import sys
+import json
 import time
 import argparse
 import logging
 import re
+from datetime import datetime
 
-# ---- Reduce TF/XLA noise (harmless if TF isn't installed) ----
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # 0=all,1=info,2=warning,3=error
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+# --- Reduce noisy progress bars that "erase" prior lines ---
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")           # TensorFlow / XLA noise
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")     # HF transformer's extra logs
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")   # HF hub progress bars
+os.environ.setdefault("TQDM_DISABLE", "1")                   # generic tqdm
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation
 
-# Optional torch (for dtype/device checks)
 try:
     import torch
 except Exception:
     torch = None
 
-# Your retriever module
 import retrival_model as RET
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-LOG = logging.getLogger("rag_orchestrator")
+# --------------- Logging ---------------
+def setup_logger(log_path: str):
+    logger = logging.getLogger("rag_orchestrator")
+    logger.setLevel(logging.INFO)
+    # Console
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    # File
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(message)s"))
+    # Reset handlers (if reloaded)
+    logger.handlers = []
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    return logger
 
-# ---------------- Built-in sanity prompts (fallback) ----------------
+LOG = logging.getLogger("rag_orchestrator")  # will be reconfigured in main()
+
+# --------------- Sanity prompts ---------------
 DEFAULT_SANITY_PROMPTS = [
     "ما هي ساعات الدوام الرسمية من وإلى؟",
     "هل يوجد مرونة في الحضور والانصراف؟ وكيف تُحسب دقائق التأخير؟",
@@ -65,7 +91,7 @@ DEFAULT_SANITY_PROMPTS = [
     "هل توجد مياومات/بدل سفر؟ وكيف تُصرف",
 ]
 
-# ---------------- Utilities ----------------
+# --------------- Cleaners & checks ---------------
 _HEADING_PATTERNS = [
     r"^\s*الإجابة\s*:?$",
     r"^\s*الإجابة\s+المختصرة\s*:?\s*$",
@@ -75,13 +101,25 @@ _HEADING_PATTERNS = [
     r"^\s*Answer\s*:?\s*$",
 ]
 
-def _clean_llm_text(txt: str) -> str:
-    """Strip boilerplate headings and whitespace; return concise text (≤4 sentences)."""
+_AR_DAYS = ["الأحد", "الإثنين", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
+_TIME_PATTERNS = [
+    r"\b\d{1,2}:\d{2}\b",           # 8:30
+    r"\b\d{1,2}[:٫]\d{2}\b",        # 8٫30
+    r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b",# 8-5
+    r"\b\d{1,2}\s*(?:ص|م)\b",       # 8 ص / 5 م
+]
+
+def _has_times_or_days(txt: str) -> bool:
+    if not txt:
+        return False
+    if any(day in txt for day in _AR_DAYS):
+        return True
+    return any(re.search(p, txt) for p in _TIME_PATTERNS)
+
+def _clean_text(txt: str) -> str:
     if not txt:
         return ""
-    # Remove code fences and markdown junk
     txt = re.sub(r"^```.*?$", "", txt, flags=re.M | re.S)
-    # Keep only non-empty lines, drop heading-only lines
     lines = [l.strip() for l in txt.splitlines() if l.strip()]
     keep = []
     for l in lines:
@@ -89,38 +127,42 @@ def _clean_llm_text(txt: str) -> str:
             continue
         keep.append(l)
     txt = " ".join(keep).strip()
-    # Limit to ~4 sentences max
     sentences = re.split(r"(?<=[.!؟])\s+", txt)
     txt = " ".join(sentences[:4]).strip()
-    # Trim trailing punctuation-only
     txt = re.sub(r"\s*[:：]\s*$", "", txt)
     return txt
 
 def _is_meaningful(txt: str) -> bool:
-    """Heuristic: ensure we have some actual content (≥~12 non-space chars)."""
-    if not txt:
-        return False
-    return len(re.sub(r"\s+", "", txt)) >= 12
+    return bool(txt and len(re.sub(r"\s+", "", txt)) >= 12)
 
-# ---------------- Answer Handler (robust) ----------------
+def _split_answer(answer_text: str):
+    """Split combined answer into (body, sources_block)."""
+    if not answer_text:
+        return "", ""
+    # Look for Sources in Arabic or English
+    parts = re.split(r"\n(?=Sources:|المصادر:)", answer_text, maxsplit=1)
+    body = parts[0].strip()
+    sources = parts[1].strip() if len(parts) > 1 else ""
+    return body, sources
+
+# --------------- Q&A ---------------
 def ask_once(index: RET.HybridIndex,
              tokenizer,
              model,
              question: str,
-             use_llm: bool = True) -> str:
+             use_llm: bool = True,
+             use_rerank_flag: bool = True) -> str:
     """
-    One Q&A round:
-      1) classify intent via RET.classify_intent
-      2) get extractive answer via RET.answer (includes sources)
-      3) optional: refine wording with LLM, preserving sources
+    1) classify intent
+    2) retrieve via RET.answer (includes sources)
+    3) optional LLM refine; preserve numerics/times; fallback if lost
     """
     t0 = time.time()
     intent = RET.classify_intent(question)
 
-    # 1) Retrieval
-    extractive_answer = RET.answer(question, index, intent, use_rerank_flag=True)
+    extractive_answer = RET.answer(question, index, intent, use_rerank_flag=use_rerank_flag)
 
-    # --- Split body / sources so we can reuse a clean fallback ---
+    # Split body/sources
     lines = str(extractive_answer).split('\n')
     body_lines, source_lines, sources_started = [], [], False
     for line in lines:
@@ -134,36 +176,30 @@ def ask_once(index: RET.HybridIndex,
             body_lines.append(line)
     body_raw = '\n'.join(body_lines).strip()
     sources = '\n'.join(source_lines).strip()
+    body_clean = _clean_text(body_raw)
 
-    # Clean the extractive BODY once here so all fallbacks are nice
-    body_clean = _clean_llm_text(body_raw)
-
-    def _finalize(dt, text):
+    def _final(dt, text):
         return f"⏱ {dt:.2f}s | 🤖 {text}\n{sources}" if sources else f"⏱ {dt:.2f}s | 🤖 {text}"
 
-    # If LLM is off or unavailable → return cleaned extractive
-    if not use_llm or tokenizer is None or model is None:
+    # If LLM unavailable or retrieval failed → cleaned extractive
+    if (not use_llm) or (tokenizer is None) or (model is None) or (not body_raw) \
+       or ("لم أعثر" in body_raw) or ("لا توجد معلومات" in body_raw):
         dt = time.time() - t0
         out = body_clean if _is_meaningful(body_clean) else body_raw
-        return _finalize(dt, out)
+        return _final(dt, out)
 
-    # For already-clean “work hours” answers, skip LLM
-    if intent in ("work_hours", "ramadan_hours") and ("ساعات الدوام" in body_raw) and ("من" in body_raw) and ("إلى" in body_raw):
+    # Shortcut: already a proper work-hours answer with times/days
+    if intent in ("work_hours", "ramadan_hours") and _has_times_or_days(body_raw):
         dt = time.time() - t0
         out = body_clean if _is_meaningful(body_clean) else body_raw
-        return _finalize(dt, out)
+        return _final(dt, out)
 
-    # If retrieval failed, skip LLM
-    if (not body_raw) or ("لم أعثر" in body_raw) or ("لا توجد معلومات" in body_raw):
-        dt = time.time() - t0
-        out = body_clean if _is_meaningful(body_clean) else body_raw
-        return _finalize(dt, out)
-
-    # 2) LLM refinement (strict, no fluff; fall back to cleaned extractive)
+    # LLM refinement
     try:
         system_prompt = (
-            "أعد صياغة النص التالي باللغة العربية بوضوح ودقة في 2–4 أسطر، "
-            "وبدون أي مقدمات أو عناوين أو خاتمة أو علامات تنسيق. أعد المحتوى فقط."
+            "أعد صياغة النص التالي بالعربية في 2–4 أسطر واضحة، دون أي مقدمات أو عناوين. "
+            "❗ هام: لا تُسقط أي أرقام أو ساعات أو نطاقات زمنية أو أيام. "
+            "أبقِ الأرقام والرموز كما هي حرفيًا."
         )
         user_prompt = f"السؤال: {question}\nالنص لإعادة الصياغة:\n{body_raw}"
         msgs = [{"role": "system", "content": system_prompt},
@@ -183,7 +219,7 @@ def ask_once(index: RET.HybridIndex,
 
         out_ids = model.generate(
             **inputs,
-            max_new_tokens=220,
+            max_new_tokens=120,   # smaller = less VRAM
             do_sample=False,
             repetition_penalty=1.05,
             eos_token_id=eos_id,
@@ -191,125 +227,184 @@ def ask_once(index: RET.HybridIndex,
         )
         start = inputs['input_ids'].shape[1]
         raw = tokenizer.decode(out_ids[0][start:], skip_special_tokens=True).strip()
-        resp = _clean_llm_text(raw)
+        resp = _clean_text(raw)
 
         dt = time.time() - t0
-        if _is_meaningful(resp):
-            return _finalize(dt, resp)
-        # fallback to cleaned extractive if LLM gave junk
+        # Guardrail: if original had times/days but resp lost them → fallback
+        if _is_meaningful(resp) and (not _has_times_or_days(body_raw) or _has_times_or_days(resp)):
+            return _final(dt, resp)
         out = body_clean if _is_meaningful(body_clean) else body_raw
-        return _finalize(dt, out)
+        return _final(dt, out)
 
     except Exception as e:
         LOG.warning(f"LLM generation failed: {e}")
         dt = time.time() - t0
         out = body_clean if _is_meaningful(body_clean) else body_raw
-        return _finalize(dt, out)
+        return _final(dt, out)
 
-# ---------------- Sanity prompts runner ----------------
+# --------------- Runner (with persistence) ---------------
 def _gather_sanity_prompts() -> list:
-    """Merge RET.SANITY_PROMPTS (if any) with DEFAULT_SANITY_PROMPTS, preserving order and uniqueness."""
     ret_prompts = []
     try:
         ret_prompts = list(getattr(RET, "SANITY_PROMPTS", []) or [])
     except Exception:
         ret_prompts = []
-    seen = set()
-    merged = []
+    seen, merged = set(), []
     for q in (ret_prompts + DEFAULT_SANITY_PROMPTS):
         if q not in seen:
-            seen.add(q)
-            merged.append(q)
+            seen.add(q); merged.append(q)
     return merged
 
-def run_test_prompts(index: RET.HybridIndex, tokenizer, model, use_llm: bool):
+def _pass_loose(answer_text: str) -> bool:
+    # same as old "PASS": just requires Sources and not explicit failure
+    return (("Sources:" in answer_text) or ("المصادر:" in answer_text)) \
+           and ("لم أعثر" not in answer_text) and ("لا توجد معلومات" not in answer_text)
+
+def _pass_strict(question: str, body_only: str) -> bool:
+    """Stricter pass: must have content; for hours/days prompts must include times/days."""
+    if not _is_meaningful(body_only):
+        return False
+    q = question or ""
+    hours_like = any(kw in q for kw in [
+        "ساعات", "الدوام", "رمضان", "أيام الدوام", "الساعات الإضافية", "العطل الرسمية"
+    ])
+    if hours_like:
+        return _has_times_or_days(body_only)
+    return True
+
+def run_test_prompts(index: RET.HybridIndex, tokenizer, model, use_llm: bool, use_rerank_flag: bool,
+                     artifacts_dir: str):
+    # Prepare artifact files
+    os.makedirs(artifacts_dir, exist_ok=True)
+    results_path = os.path.join(artifacts_dir, "results.jsonl")
+    summary_md   = os.path.join(artifacts_dir, "summary.md")
+    report_txt   = os.path.join(artifacts_dir, "report.txt")
+
+    # Open files
+    results_f = open(results_path, "w", encoding="utf-8")
+    report_f  = open(report_txt,  "w", encoding="utf-8")
+
+    def _tee(line=""):
+        print(line)
+        report_f.write(line + "\n")
+        report_f.flush()
+
     tests = _gather_sanity_prompts()
     if not tests:
-        print("❌ No sanity prompts available.")
+        _tee("❌ No sanity prompts available.")
+        results_f.close(); report_f.close()
         return
-    print("🧪 Running sanity prompts ...")
-    print("=" * 80)
 
-    passed = 0
+    _tee("🧪 Running sanity prompts ...")
+    _tee("=" * 80)
+
     total = len(tests)
+    pass_loose_count = 0
+    pass_strict_count = 0
+
     for i, q in enumerate(tests, 1):
-        print(f"\n📝 Test {i}/{total}: {q}")
-        print("-" * 60)
+        _tee(f"\n📝 Test {i}/{total}: {q}")
+        _tee("-" * 60)
         try:
-            result = ask_once(index, tokenizer, model, q, use_llm=use_llm)
-            print(result)
-            ok = (("Sources:" in result) or ("المصادر:" in result)) and ("لم أعثر" not in result) and ("لا توجد معلومات" not in result)
-            print("✅ PASS" if ok else "❌ FAIL")
-            passed += int(ok)
+            result = ask_once(index, tokenizer, model, q, use_llm=use_llm, use_rerank_flag=use_rerank_flag)
+            _tee(result)
+
+            body_only, _src_blk = _split_answer(result)
+            loose = _pass_loose(result)
+            strict = _pass_strict(q, body_only)
+
+            pass_loose_count += int(loose)
+            pass_strict_count += int(strict)
+
+            _tee("✅ PASS_LOOSE" if loose else "❌ FAIL_LOOSE")
+            _tee("✅ PASS_STRICT" if strict else "❌ FAIL_STRICT")
+            _tee("=" * 80)
+
+            # Write JSONL record
+            rec = {
+                "index": i,
+                "question": q,
+                "answer": result,
+                "body_only": body_only,
+                "pass_loose": loose,
+                "pass_strict": strict,
+            }
+            results_f.write(json.dumps(rec, ensure_ascii=False) + "\n"); results_f.flush()
+
         except Exception as e:
-            print(f"❌ Error: {e}")
-        print("=" * 80)
-    print(f"\nSummary: PASS {passed}/{total}")
+            _tee(f"❌ Error: {e}")
+            _tee("=" * 80)
 
-# ---------------- CLI ----------------
+    # Summary
+    summary = (
+        f"# Sanity Summary\n\n"
+        f"- Total: {total}\n"
+        f"- PASS_LOOSE: {pass_loose_count}/{total}\n"
+        f"- PASS_STRICT: {pass_strict_count}/{total}\n"
+        f"\nArtifacts:\n"
+        f"- results.jsonl\n- report.txt\n"
+    )
+    with open(summary_md, "w", encoding="utf-8") as f:
+        f.write(summary)
+
+    _tee(f"\nSummary: PASS_LOOSE {pass_loose_count}/{total} | PASS_STRICT {pass_strict_count}/{total}")
+    _tee(f"Artifacts saved in: {artifacts_dir}")
+
+    results_f.close(); report_f.close()
+
+# --------------- CLI ---------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--chunks", type=str, default="Data_pdf_clean_chunks.jsonl",
-                    help="Path to chunks (JSONL or JSON) used by retriever")
-    ap.add_argument("--hier-index", type=str, default="heading_inverted_index.json",
-                    help="Optional hierarchical inverted index path")
-    ap.add_argument("--aliases", type=str, default="section_aliases.json",
-                    help="Optional section aliases path")
-    ap.add_argument("--save-index", type=str, default=None,
-                    help="Directory to save index artifacts (embeddings/FAISS/TF-IDF)")
-    ap.add_argument("--load-index", type=str, default=None,
-                    help="Directory to load index artifacts from")
-    ap.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct",
-                    help="HF model id for optional refinement")
-    ap.add_argument("--ask", type=str, default=None,
-                    help="Ask a single question then exit")
-    ap.add_argument("--test", action="store_true",
-                    help="Run sanity prompts (alias: --sanity)")
-    ap.add_argument("--sanity", action="store_true",
-                    help="Alias for --test (runs sanity prompts)")
-    ap.add_argument("--no-llm", action="store_true",
-                    help="Disable LLM refinement (retrieval-only)")
-    ap.add_argument("--use-4bit", action="store_true",
-                    help="Try 4-bit quantization (requires bitsandbytes)")
-    ap.add_argument("--use-8bit", action="store_true",
-                    help="Try 8-bit quantization (requires bitsandbytes)")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--chunks", type=str, default="Data_pdf_clean_chunks.jsonl", help="Path to chunks (JSONL/JSON)")
+    parser.add_argument("--hier-index", type=str, default="heading_inverted_index.json")
+    parser.add_argument("--aliases", type=str, default="section_aliases.json")
+    parser.add_argument("--save-index", type=str, default=None)
+    parser.add_argument("--load-index", type=str, default=None)
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--ask", type=str, default=None)
+    parser.add_argument("--test", action="store_true", help="Run sanity prompts (alias: --sanity)")
+    parser.add_argument("--sanity", action="store_true", help="Alias for --test")
+    parser.add_argument("--no-llm", action="store_true", help="Disable LLM refinement")
+    parser.add_argument("--use-4bit", action="store_true", help="Try 4-bit quantization (bitsandbytes)")
+    parser.add_argument("--use-8bit", action="store_true", help="Try 8-bit quantization (bitsandbytes)")
+    parser.add_argument("--no-rerank", action="store_true", help="Disable cross-encoder reranker to save VRAM")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="LLM device")
+    parser.add_argument("--out-dir", type=str, default="runs", help="Directory to store run artifacts")
+    args = parser.parse_args()
 
-    # Build/load index via RET
+    # Make artifacts dir
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(args.out_dir, f"run_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Configure logger (file + console)
+    global LOG
+    LOG = setup_logger(os.path.join(run_dir, "run.log"))
+    LOG.info("Artifacts will be saved under: %s", run_dir)
+
+    # Build/load index
     hier = RET.load_hierarchy(args.hier_index, args.aliases)
-
     if not os.path.exists(args.chunks):
         LOG.error("Chunks file not found: %s", args.chunks)
         return
-
     chunks, chunks_hash = RET.load_chunks(path=args.chunks)
     index = RET.HybridIndex(chunks, chunks_hash, hier=hier)
 
     loaded = False
     if args.load_index and os.path.exists(args.load_index):
         try:
-            # Reduce noise while loading
-            retrieval_logger = logging.getLogger("retrival_model")
-            original_level = retrieval_logger.level
-            retrieval_logger.setLevel(logging.ERROR)
-
-            loaded = index.load(args.load_index)
-
-            retrieval_logger.setLevel(original_level)
-            if loaded:
-                LOG.info("Index loaded successfully from %s", args.load_index)
+            rlog = logging.getLogger("retrival_model"); lvl = rlog.level; rlog.setLevel(logging.ERROR)
+            loaded = index.load(args.load_index); rlog.setLevel(lvl)
+            if loaded: LOG.info("Index loaded successfully from %s", args.load_index)
         except Exception as e:
-            LOG.info(f"Will rebuild index: {e}")
-
+            LOG.info("Will rebuild index: %s", e)
     if not loaded:
-        LOG.info("Building index ...")
-        index.build()
+        LOG.info("Building index ..."); index.build()
         if args.save_index:
             try:
-                index.save(args.save_index)
-                LOG.info("Index saved to %s", args.save_index)
+                index.save(args.save_index); LOG.info("Index saved to %s", args.save_index)
             except Exception as e:
-                LOG.warning(f"Failed to save index: {e}")
+                LOG.warning("Failed to save index: %s", e)
 
     # Optional LLM
     tok = mdl = None
@@ -317,71 +412,73 @@ def main():
     if use_llm:
         try:
             from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+            use_cuda = (args.device != "cpu") and torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available()
+            if args.device == "cuda" and not use_cuda:
+                LOG.warning("CUDA requested but not available; falling back to CPU.")
+            bf16_supported = use_cuda and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+            dtype_fp16 = torch.bfloat16 if (bf16_supported and torch is not None) else (torch.float16 if (use_cuda and torch is not None) else None)
 
-            # Default dtype/device
-            bf16_supported = False
-            if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
-                bf16_supported = getattr(torch.cuda, "is_bf16_supported", lambda: False)()
-            dtype_fp16 = None
-            if torch is not None:
-                dtype_fp16 = torch.bfloat16 if bf16_supported else torch.float16
-
-            # NOTE: Some recent transformers versions warn that torch_dtype is deprecated in favor of dtype.
-            # torch_dtype still works; keep for broad compatibility.
-            model_kwargs = {
-                "trust_remote_code": True,
-                "torch_dtype": dtype_fp16 or None,
-            }
-
-            if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
-                model_kwargs["device_map"] = "auto"
-            else:
+            model_kwargs = {"trust_remote_code": True}
+            if args.device == "cpu" or not use_cuda:
                 model_kwargs["device_map"] = "cpu"
-                if torch is not None:
-                    model_kwargs["torch_dtype"] = torch.float32
+                if torch is not None: model_kwargs["torch_dtype"] = torch.float32
+            else:
+                model_kwargs["device_map"] = "auto"
+                if dtype_fp16 is not None:
+                    model_kwargs["torch_dtype"] = dtype_fp16
 
             if args.use_4bit or args.use_8bit:
                 try:
-                    quant_config = BitsAndBytesConfig(
-                        load_in_4bit=True if args.use_4bit else False,
-                        load_in_8bit=True if args.use_8bit else False,
-                        bnb_4bit_compute_dtype=(torch.bfloat16 if (torch is not None and bf16_supported) else (torch.float16 if torch is not None else None)),
+                    model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=bool(args.use_4bit),
+                        load_in_8bit=bool(args.use_8bit),
+                        bnb_4bit_compute_dtype=(torch.bfloat16 if bf16_supported else (torch.float16 if use_cuda else None)),
                     )
-                    model_kwargs["quantization_config"] = quant_config
                 except Exception as e:
-                    LOG.warning(f"Quantization setup failed: {e}")
+                    LOG.warning("Quantization setup failed: %s", e)
 
             tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
             mdl = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
         except Exception as e:
-            LOG.warning(f"Failed to load LLM (%s); continuing retrieval-only. Error: %s", args.model, e)
+            LOG.warning("Failed to load LLM (%s); continuing retrieval-only. Error: %s", args.model, e)
             tok = mdl = None
             use_llm = False
 
-    # Run sanity prompts (alias: --sanity)
+    # Execute
+    use_rerank_flag = not args.no_rerank
+
     if args.test or args.sanity:
-        run_test_prompts(index, tok, mdl, use_llm=use_llm)
+        run_test_prompts(index, tok, mdl, use_llm=use_llm, use_rerank_flag=use_rerank_flag, artifacts_dir=run_dir)
+        print(f"\n✅ Saved artifacts under: {run_dir}")
         return
 
-    # Single-question mode
     if args.ask:
-        print(ask_once(index, tok, mdl, args.ask, use_llm=use_llm))
+        ans = ask_once(index, tok, mdl, args.ask, use_llm=use_llm, use_rerank_flag=use_rerank_flag)
+        # Persist single-answer too
+        single_path = os.path.join(run_dir, "single_answer.txt")
+        with open(single_path, "w", encoding="utf-8") as f:
+            f.write(ans)
+        print(ans)
+        print(f"\n✅ Saved single answer to: {single_path}")
         return
 
-    # Interactive loop
     print("Ready. اطرح سؤالك (اكتب 'exit' للخروج)\n")
-    while True:
-        try:
-            q = input("سؤالك: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nExiting.")
-            break
-        if not q:
-            continue
-        if q.lower() in ("exit", "quit", "q"):
-            print("Exiting.")
-            break
-        print(ask_once(index, tok, mdl, q, use_llm=use_llm))
+    # Also persist interactive transcript
+    interactive_path = os.path.join(run_dir, "interactive_transcript.txt")
+    with open(interactive_path, "w", encoding="utf-8") as trans:
+        while True:
+            try:
+                q = input("سؤالك: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nExiting."); break
+            if not q:
+                continue
+            if q.lower() in ("exit", "quit", "q"):
+                print("Exiting."); break
+            ans = ask_once(index, tok, mdl, q, use_llm=use_llm, use_rerank_flag=use_rerank_flag)
+            print(ans)
+            trans.write(f"\nQ: {q}\n{ans}\n"); trans.flush()
+    print(f"\n✅ Interactive transcript saved to: {interactive_path}")
 
 
 if __name__ == "__main__":
