@@ -76,39 +76,33 @@ _HEADING_PATTERNS = [
 ]
 
 def _clean_llm_text(txt: str) -> str:
-    """Strip boilerplate headings and whitespace; return cleaned one-liner (2–4 sentences max)."""
+    """Strip boilerplate headings and whitespace; return concise text (≤4 sentences)."""
     if not txt:
         return ""
     # Remove code fences and markdown junk
     txt = re.sub(r"^```.*?$", "", txt, flags=re.M | re.S)
-    # Keep only the first 3 lines if it's long (avoid rambling)
+    # Keep only non-empty lines, drop heading-only lines
     lines = [l.strip() for l in txt.splitlines() if l.strip()]
-    cleaned = []
+    keep = []
     for l in lines:
-        skip = any(re.match(p, l) for p in _HEADING_PATTERNS)
-        if not skip:
-            cleaned.append(l)
-    txt = " ".join(cleaned).strip()
-    # Shorten to ~4 sentences for brevity
+        if any(re.match(p, l) for p in _HEADING_PATTERNS):
+            continue
+        keep.append(l)
+    txt = " ".join(keep).strip()
+    # Limit to ~4 sentences max
     sentences = re.split(r"(?<=[.!؟])\s+", txt)
     txt = " ".join(sentences[:4]).strip()
-    # Trim redundant punctuation
+    # Trim trailing punctuation-only
     txt = re.sub(r"\s*[:：]\s*$", "", txt)
     return txt
 
 def _is_meaningful(txt: str) -> bool:
-    """Heuristic: ensure we have at least ~12 visible chars and not just headings."""
+    """Heuristic: ensure we have some actual content (≥~12 non-space chars)."""
     if not txt:
         return False
-    if len(re.sub(r"\s+", "", txt)) < 12:
-        return False
-    # Avoid texts that are just section labels
-    for p in _HEADING_PATTERNS:
-        if re.fullmatch(p, txt):
-            return False
-    return True
+    return len(re.sub(r"\s+", "", txt)) >= 12
 
-# ---------------- Answer Handler (Minimal interference) ----------------
+# ---------------- Answer Handler (robust) ----------------
 def ask_once(index: RET.HybridIndex,
              tokenizer,
              model,
@@ -123,23 +117,12 @@ def ask_once(index: RET.HybridIndex,
     t0 = time.time()
     intent = RET.classify_intent(question)
 
-    # Retrieval-first
+    # 1) Retrieval
     extractive_answer = RET.answer(question, index, intent, use_rerank_flag=True)
 
-    # If LLM disabled/unavailable → return extractive (with latency tag)
-    if not use_llm or tokenizer is None or model is None:
-        dt = time.time() - t0
-        return extractive_answer if str(extractive_answer).startswith("⏱") else f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
-
-    # For work-hours style outputs that are already clean, don't over-process
-    if intent in ("work_hours", "ramadan_hours") and ("ساعات الدوام" in str(extractive_answer)) and ("من" in str(extractive_answer)) and ("إلى" in str(extractive_answer)):
-        dt = time.time() - t0
-        return extractive_answer if str(extractive_answer).startswith("⏱") else f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
-
-    # Split body/sources to preserve citations
+    # --- Split body / sources so we can reuse a clean fallback ---
     lines = str(extractive_answer).split('\n')
-    body_lines, source_lines = [], []
-    sources_started = False
+    body_lines, source_lines, sources_started = [], [], False
     for line in lines:
         ls = line.strip()
         if ls.startswith("Sources:") or ls.startswith("المصادر:"):
@@ -149,32 +132,46 @@ def ask_once(index: RET.HybridIndex,
             source_lines.append(line)
         else:
             body_lines.append(line)
-
-    body = '\n'.join(body_lines).strip()
+    body_raw = '\n'.join(body_lines).strip()
     sources = '\n'.join(source_lines).strip()
 
-    # If retrieval failed, skip LLM
-    if not body or "لم أعثر" in body or "لا توجد معلومات" in body:
-        dt = time.time() - t0
-        return extractive_answer if str(extractive_answer).startswith("⏱") else f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
+    # Clean the extractive BODY once here so all fallbacks are nice
+    body_clean = _clean_llm_text(body_raw)
 
-    # ---------------- LLM refinement (Arabic, robust) ----------------
+    def _finalize(dt, text):
+        return f"⏱ {dt:.2f}s | 🤖 {text}\n{sources}" if sources else f"⏱ {dt:.2f}s | 🤖 {text}"
+
+    # If LLM is off or unavailable → return cleaned extractive
+    if not use_llm or tokenizer is None or model is None:
+        dt = time.time() - t0
+        out = body_clean if _is_meaningful(body_clean) else body_raw
+        return _finalize(dt, out)
+
+    # For already-clean “work hours” answers, skip LLM
+    if intent in ("work_hours", "ramadan_hours") and ("ساعات الدوام" in body_raw) and ("من" in body_raw) and ("إلى" in body_raw):
+        dt = time.time() - t0
+        out = body_clean if _is_meaningful(body_clean) else body_raw
+        return _finalize(dt, out)
+
+    # If retrieval failed, skip LLM
+    if (not body_raw) or ("لم أعثر" in body_raw) or ("لا توجد معلومات" in body_raw):
+        dt = time.time() - t0
+        out = body_clean if _is_meaningful(body_clean) else body_raw
+        return _finalize(dt, out)
+
+    # 2) LLM refinement (strict, no fluff; fall back to cleaned extractive)
     try:
         system_prompt = (
             "أعد صياغة النص التالي باللغة العربية بوضوح ودقة في 2–4 أسطر، "
             "وبدون أي مقدمات أو عناوين أو خاتمة أو علامات تنسيق. أعد المحتوى فقط."
         )
-        user_prompt = f"السؤال: {question}\nالنص لإعادة الصياغة:\n{body}"
-
-        msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
+        user_prompt = f"السؤال: {question}\nالنص لإعادة الصياغة:\n{body_raw}"
+        msgs = [{"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}]
 
         if hasattr(tokenizer, "apply_chat_template"):
             prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         else:
-            # Generic fallback prompt
             prompt = f"[system]\n{system_prompt}\n\n[user]\n{user_prompt}\n\n[assistant]\n"
 
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
@@ -196,18 +193,18 @@ def ask_once(index: RET.HybridIndex,
         raw = tokenizer.decode(out_ids[0][start:], skip_special_tokens=True).strip()
         resp = _clean_llm_text(raw)
 
-        # Fallback to extractive if the LLM output isn't meaningful
-        if not _is_meaningful(resp):
-            dt = time.time() - t0
-            return extractive_answer if str(extractive_answer).startswith("⏱") else f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
-
         dt = time.time() - t0
-        return f"⏱ {dt:.2f}s | 🤖 {resp}\n{sources}" if sources else f"⏱ {dt:.2f}s | 🤖 {resp}"
+        if _is_meaningful(resp):
+            return _finalize(dt, resp)
+        # fallback to cleaned extractive if LLM gave junk
+        out = body_clean if _is_meaningful(body_clean) else body_raw
+        return _finalize(dt, out)
 
     except Exception as e:
         LOG.warning(f"LLM generation failed: {e}")
         dt = time.time() - t0
-        return extractive_answer if str(extractive_answer).startswith("⏱") else f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
+        out = body_clean if _is_meaningful(body_clean) else body_raw
+        return _finalize(dt, out)
 
 # ---------------- Sanity prompts runner ----------------
 def _gather_sanity_prompts() -> list:
@@ -329,6 +326,8 @@ def main():
             if torch is not None:
                 dtype_fp16 = torch.bfloat16 if bf16_supported else torch.float16
 
+            # NOTE: Some recent transformers versions warn that torch_dtype is deprecated in favor of dtype.
+            # torch_dtype still works; keep for broad compatibility.
             model_kwargs = {
                 "trust_remote_code": True,
                 "torch_dtype": dtype_fp16 or None,
