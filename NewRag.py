@@ -171,6 +171,7 @@ def main():
     ap.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--ask", type=str, default=None)
     ap.add_argument("--test", action="store_true", help="Run all 30 built-in test prompts")
+    ap.add_argument("--sanity", action="store_true", help="Run all 30 built-in test prompts (alias for --test)")
     ap.add_argument("--no-llm", action="store_true")
     ap.add_argument("--use-4bit", action="store_true")
     ap.add_argument("--use-8bit", action="store_true")
@@ -249,8 +250,8 @@ def main():
         tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
         mdl = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
 
-    # Test mode - run all 30 sanity prompts
-    if args.test:
+    # Test mode - run all 30 sanity prompts (support both --test and --sanity)
+    if args.test or args.sanity:
         run_test_prompts(index, tok, mdl, use_llm=use_llm)
         return
 
