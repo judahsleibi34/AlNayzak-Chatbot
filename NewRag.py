@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — Fixed to show actual found work hours
+RAG Orchestrator (Arabic) — Fixed to properly use retrieval system output
 """
 
 import os, re, time, argparse, logging
@@ -14,82 +14,7 @@ import retrival_model as RET
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 LOG = logging.getLogger("rag_qwen_fixed")
 
-# ---------------- Source block helpers ----------------
-
-def join_sources(srcs: List[str]) -> str:
-    if not srcs:
-        return ""
-    return "المصادر:\n" + "\n".join(srcs)
-
-def split_sources_block(extractive: str) -> Tuple[str, List[str]]:
-    """
-    Split body and sources from your retriever's textual answer.
-    """
-    t = (extractive or "").strip()
-    if not t:
-        return "", []
-    # Find the first occurrence of either marker
-    pos_sources = []
-    for mark in ("Sources:", "المصادر:"):
-        p = t.find(mark)
-        if p != -1:
-            pos_sources.append(p)
-    if not pos_sources:
-        return t, []
-    pos = min(pos_sources)
-    body = t[:pos].strip()
-    tail = t[pos:].splitlines()
-    # skip the header line itself
-    tail = tail[1:] if len(tail) > 0 else []
-    # keep lines that look like enumerated sources
-    srcs = []
-    for ln in tail:
-        s = ln.strip()
-        if not s:
-            continue
-        if s[0].isdigit() or s.startswith("-") or "Data_pdf.pdf" in s:
-            srcs.append(s)
-    return body, srcs
-
-# ---------------- Enhanced Work Hours Handler ----------------
-
-def extract_work_hours_answer(index: RET.HybridIndex, question: str, intent: str) -> str:
-    """
-    Enhanced work hours extraction that shows what's actually found
-    """
-    # First, try your retrieval system's built-in function
-    extractive_answer = RET.answer(question, index, intent, use_rerank_flag=True)
-    
-    # Check if it found actual work hours
-    if "ساعات الدوام" in extractive_answer and ("من" in extractive_answer and "إلى" in extractive_answer):
-        return extractive_answer
-    
-    # If not, let's do manual search through retrieved chunks
-    hits = RET.retrieve(index, question, rerank=True)
-    chunks = index.chunks
-    
-    if hits:
-        # Look for time ranges in the top hits
-        for score, chunk_id in hits[:10]:
-            chunk = chunks[chunk_id]
-            sentences = RET.sent_split(chunk.text)
-            
-            for sentence in sentences:
-                # Use your retrieval system's time extraction
-                ranges = RET.extract_all_ranges(sentence, intent)
-                if ranges:
-                    best_range = RET.pick_best_range(ranges)
-                    if best_range:
-                        a, b = best_range
-                        suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
-                        answer = f"ساعات الدوام{suffix} من {a} إلى {b}."
-                        sources = [f"1. Data_pdf.pdf - page {chunk.page} (score: {score:.3f})"]
-                        return f"⏱ 0.10s | 🤖 {answer}\n{join_sources(sources)}"
-    
-    # If we still can't find specific hours, return what we found
-    return extractive_answer
-
-# ---------------- Answer Handler ----------------
+# ---------------- Answer Handler (Minimal interference) ----------------
 
 def ask_once(index: RET.HybridIndex,
              tokenizer, model,
@@ -98,34 +23,52 @@ def ask_once(index: RET.HybridIndex,
     t0 = time.time()
     intent = RET.classify_intent(question)
     
-    # Special handling for work hours questions
-    if intent in ("work_hours", "ramadan_hours"):
-        result = extract_work_hours_answer(index, question, intent)
-        # Add timing if not present
-        if not result.startswith("⏱"):
-            dt = time.time() - t0
-            if not result.startswith("🤖"):
-                result = f"⏱ {dt:.2f}s | 🤖 {result}"
-        return result
-    
-    # For other intents, use your retrieval system's answer function
+    # Use your retrieval system directly - minimal interference
     extractive_answer = RET.answer(question, index, intent, use_rerank_flag=True)
     
-    # If not using LLM, return extractive answer directly
+    # If not using LLM, return retrieval system's answer directly
     if not use_llm or tokenizer is None or model is None:
         dt = time.time() - t0
-        # Add timing if not present
-        if not extractive_answer.startswith("⏱"):
-            return f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
-        return extractive_answer
+        # If retrieval already provided timing, use it; otherwise add timing
+        if extractive_answer.startswith("⏱"):
+            return extractive_answer
+        return f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
     
-    # Use LLM for refinement (if enabled)
-    body, sources = split_sources_block(extractive_answer)
-    if not body.strip():
+    # If retrieval system already gave a good work hours answer, don't interfere
+    if intent in ("work_hours", "ramadan_hours") and "ساعات الدوام" in extractive_answer and "من" in extractive_answer and "إلى" in extractive_answer:
         dt = time.time() - t0
-        return f"⏱ {dt:.2f}s | 🤖 لا توجد معلومات كافية في السياق للإجابة على هذا السؤال."
+        if extractive_answer.startswith("⏱"):
+            return extractive_answer
+        return f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
     
-    # Simple LLM refinement
+    # For other cases, try LLM refinement but preserve sources
+    # Extract body and sources from retrieval output
+    lines = extractive_answer.split('\n')
+    body_lines = []
+    source_lines = []
+    sources_started = False
+    
+    for line in lines:
+        line_stripped = line.strip()
+        if line_stripped.startswith("Sources:") or line_stripped.startswith("المصادر:"):
+            sources_started = True
+            source_lines.append(line_stripped)
+        elif sources_started and (line_stripped == "" or line_stripped[0].isdigit() or "Data_pdf.pdf" in line_stripped):
+            source_lines.append(line_stripped)
+        elif not sources_started:
+            body_lines.append(line)
+    
+    body = '\n'.join(body_lines).strip()
+    sources = '\n'.join(source_lines).strip()
+    
+    # If retrieval found nothing useful, don't try LLM
+    if not body.strip() or "لم أعثر" in body or "لا توجد معلومات" in body:
+        dt = time.time() - t0
+        if extractive_answer.startswith("⏱"):
+            return extractive_answer
+        return f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
+    
+    # Use LLM for refinement
     try:
         system_prompt = "أعد صياغة الإجابة التالية بشكل واضح ومختصر باللغة العربية:"
         user_prompt = f"السؤال: {question}\nالإجابة: {body}"
@@ -153,14 +96,19 @@ def ask_once(index: RET.HybridIndex,
         
         if response and len(response) > 5:
             dt = time.time() - t0
-            return f"⏱ {dt:.2f}s | 🤖 {response}\n{join_sources(sources[:3])}"
+            if sources:
+                return f"⏱ {dt:.2f}s | 🤖 {response}\n{sources}"
+            else:
+                return f"⏱ {dt:.2f}s | 🤖 {response}"
             
     except Exception as e:
         LOG.warning(f"LLM generation failed: {e}")
     
-    # Fallback to extractive answer
+    # Fallback to retrieval system's answer
     dt = time.time() - t0
-    return f"⏱ {dt:.2f}s | 🤖 {body}\n{join_sources(sources[:3])}"
+    if extractive_answer.startswith("⏱"):
+        return extractive_answer
+    return f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
 
 # ---------------- CLI ----------------
 
@@ -254,7 +202,14 @@ def main():
 
     # Modes
     if args.sanity:
-        print("Sanity mode not implemented in this version")
+        print("Testing retrieval system sanity prompts directly:")
+        print("=" * 60)
+        for q in RET.SANITY_PROMPTS[:5]:  # Test first 5
+            print(f"\nQuestion: {q}")
+            intent = RET.classify_intent(q)
+            answer = RET.answer(q, index, intent, use_rerank_flag=True)
+            print(f"Answer: {answer}")
+            print("-" * 40)
         return
 
     if args.ask:
