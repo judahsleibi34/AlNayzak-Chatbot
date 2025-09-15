@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — Fixed to properly use retrieval system output
+RAG Orchestrator (Arabic) — Fixed version with built-in sanity testing
 """
 
 import os, re, time, argparse, logging
@@ -110,6 +110,30 @@ def ask_once(index: RET.HybridIndex,
         return extractive_answer
     return f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
 
+def run_test_prompts(index: RET.HybridIndex, tokenizer, model, use_llm: bool):
+    """Run your sanity prompts as test cases"""
+    print("🧪 Running test prompts from your sanity suite...")
+    print("=" * 80)
+    
+    # Your sanity prompts
+    test_prompts = [
+        "ما هي ساعات الدوام الرسمية من وإلى؟",
+        "ما ساعات العمل في شهر رمضان؟ وهل تتغير؟",
+        "هل يوجد مرونة في الحضور والانصراف؟ وكيف تُحسب دقائق التأخير؟",
+        "هل توجد استراحة خلال الدوام؟ وكم مدتها؟",
+        "ما أيام الدوام الرسمي؟ وهل السبت يوم عمل؟"
+    ]
+    
+    for i, q in enumerate(test_prompts, 1):
+        print(f"\n📝 Test {i}: {q}")
+        print("-" * 60)
+        try:
+            result = ask_once(index, tokenizer, model, q, use_llm=use_llm)
+            print(result)
+        except Exception as e:
+            print(f"❌ Error: {e}")
+        print("=" * 80)
+
 # ---------------- CLI ----------------
 
 def main():
@@ -121,7 +145,7 @@ def main():
     ap.add_argument("--load-index", type=str, default=None)
     ap.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     ap.add_argument("--ask", type=str, default=None)
-    ap.add_argument("--sanity", action="store_true")
+    ap.add_argument("--test", action="store_true", help="Run built-in test prompts")
     ap.add_argument("--no-llm", action="store_true")
     ap.add_argument("--use-4bit", action="store_true")
     ap.add_argument("--use-8bit", action="store_true")
@@ -200,23 +224,17 @@ def main():
         tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
         mdl = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
 
-    # Modes
-    if args.sanity:
-        print("Testing retrieval system sanity prompts directly:")
-        print("=" * 60)
-        for q in RET.SANITY_PROMPTS[:5]:  # Test first 5
-            print(f"\nQuestion: {q}")
-            intent = RET.classify_intent(q)
-            answer = RET.answer(q, index, intent, use_rerank_flag=True)
-            print(f"Answer: {answer}")
-            print("-" * 40)
+    # Test mode - run your sanity prompts
+    if args.test:
+        run_test_prompts(index, tok, mdl, use_llm=use_llm)
         return
 
+    # Single question mode
     if args.ask:
         print(ask_once(index, tok, mdl, args.ask, use_llm=use_llm))
         return
 
-    # Interactive
+    # Interactive mode
     print("Ready. اطرح سؤالك (اكتب 'exit' للخروج)\n")
     while True:
         try:
