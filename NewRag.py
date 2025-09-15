@@ -3,20 +3,26 @@
 RAG Orchestrator (Arabic) — uses RET.SANITY_PROMPTS from retrival_model.py
 - Reuses the retriever's sanity prompts (single source of truth)
 - Adds --sanity flag as an alias for --test
-- Optional LLM refinement through Transformers (can be disabled via --no-llm)
+- Optional LLM refinement via Transformers (can be disabled with --no-llm)
 """
 
 import os
 import time
 import argparse
 import logging
-import torch
+
+# Optional torch (for dtype/device checks)
+try:
+    import torch
+except Exception:
+    torch = None
 
 # Your retriever module
 import retrival_model as RET
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 LOG = logging.getLogger("rag_orchestrator")
+
 
 # ---------------- Answer Handler (Minimal interference) ----------------
 
@@ -26,35 +32,34 @@ def ask_once(index: RET.HybridIndex,
              question: str,
              use_llm: bool = True) -> str:
     """
-    Runs one Q&A round:
-      1) classifies intent with RET.classify_intent
-      2) gets extractive answer via RET.answer (includes sources)
-      3) optional: refines wording with LLM, preserving sources
+    One Q&A round:
+      1) classify intent via RET.classify_intent
+      2) get extractive answer via RET.answer (includes sources)
+      3) optional: refine wording with LLM, preserving sources
     """
     t0 = time.time()
     intent = RET.classify_intent(question)
 
-    # Use your retrieval system first
+    # Retrieval-first
     extractive_answer = RET.answer(question, index, intent, use_rerank_flag=True)
 
-    # If not using LLM (or tokenizer/model missing), return extractive answer
+    # If LLM disabled/unavailable → return extractive
     if not use_llm or tokenizer is None or model is None:
         dt = time.time() - t0
         if extractive_answer.startswith("⏱"):
             return extractive_answer
         return f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
 
-    # If it's already a clean work-hours statement, don't over-process
+    # For work-hours style outputs that are already clean, don't over-process
     if intent in ("work_hours", "ramadan_hours") and ("ساعات الدوام" in extractive_answer) and ("من" in extractive_answer) and ("إلى" in extractive_answer):
         dt = time.time() - t0
         if extractive_answer.startswith("⏱"):
             return extractive_answer
         return f"⏱ {dt:.2f}s | 🤖 {extractive_answer}"
 
-    # Split body and sources to keep citations intact
+    # Split body/sources to preserve citations
     lines = extractive_answer.split('\n')
-    body_lines = []
-    source_lines = []
+    body_lines, source_lines = [], []
     sources_started = False
     for line in lines:
         ls = line.strip()
@@ -65,10 +70,11 @@ def ask_once(index: RET.HybridIndex,
             source_lines.append(line)
         elif not sources_started:
             body_lines.append(line)
+
     body = '\n'.join(body_lines).strip()
     sources = '\n'.join(source_lines).strip()
 
-    # If retrieval failed, don't try LLM
+    # If retrieval failed, skip LLM
     if not body or "لم أعثر" in body or "لا توجد معلومات" in body:
         dt = time.time() - t0
         if extractive_answer.startswith("⏱"):
@@ -87,7 +93,9 @@ def ask_once(index: RET.HybridIndex,
 
         prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        # Move to device
+        if hasattr(model, "device"):
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
         out_ids = model.generate(
             **inputs,
@@ -106,7 +114,7 @@ def ask_once(index: RET.HybridIndex,
     except Exception as e:
         LOG.warning(f"LLM generation failed: {e}")
 
-    # Fallback to extractive answer
+    # Fallback: extractive
     dt = time.time() - t0
     if extractive_answer.startswith("⏱"):
         return extractive_answer
@@ -115,8 +123,8 @@ def ask_once(index: RET.HybridIndex,
 
 def run_test_prompts(index: RET.HybridIndex, tokenizer, model, use_llm: bool):
     """
-    Runs all sanity prompts defined in retrival_model.py (RET.SANITY_PROMPTS).
-    Uses a simple heuristic for "pass": has "Sources:" and not a generic fail.
+    Run sanity prompts defined in retrival_model.py (RET.SANITY_PROMPTS).
+    PASS heuristic: has "Sources:" and not a generic fail message.
     """
     test_prompts = getattr(RET, "SANITY_PROMPTS", [])
     if not test_prompts:
@@ -135,8 +143,8 @@ def run_test_prompts(index: RET.HybridIndex, tokenizer, model, use_llm: bool):
             result = ask_once(index, tokenizer, model, q, use_llm=use_llm)
             print(result)
             ok = ("Sources:" in result) and ("لم أعثر" not in result)
-            passed += int(ok)
             print("✅ PASS" if ok else "❌ FAIL")
+            passed += int(ok)
         except Exception as e:
             print(f"❌ Error: {e}")
         print("=" * 80)
@@ -212,29 +220,37 @@ def main():
 
     # Optional LLM
     tok = mdl = None
-    use_llm = not args.no-llm if hasattr(args, "no-llm") else not args.no_llm  # guard in case of dash attr
-    use_llm = not args.no_llm  # final
+    use_llm = not args.no_llm
     if use_llm:
         try:
             from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
+            # Default dtype/device
+            bf16_supported = False
+            if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
+                bf16_supported = getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+            dtype_fp16 = None
+            if torch is not None:
+                dtype_fp16 = torch.bfloat16 if bf16_supported else torch.float16
+
             model_kwargs = {
                 "trust_remote_code": True,
-                "torch_dtype": torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
+                "torch_dtype": dtype_fp16 or None,
             }
 
-            if torch.cuda.is_available():
+            if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
                 model_kwargs["device_map"] = "auto"
             else:
                 model_kwargs["device_map"] = "cpu"
-                model_kwargs["torch_dtype"] = torch.float32
+                if torch is not None:
+                    model_kwargs["torch_dtype"] = torch.float32
 
             if args.use_4bit or args.use_8bit:
                 try:
                     quant_config = BitsAndBytesConfig(
                         load_in_4bit=True if args.use_4bit else False,
                         load_in_8bit=True if args.use_8bit else False,
-                        bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
+                        bnb_4bit_compute_dtype=(torch.bfloat16 if (torch is not None and bf16_supported) else (torch.float16 if torch is not None else None)),
                     )
                     model_kwargs["quantization_config"] = quant_config
                 except Exception as e:
@@ -257,7 +273,7 @@ def main():
         print(ask_once(index, tok, mdl, args.ask, use_llm=use_llm))
         return
 
-    # Interactive mode
+    # Interactive loop
     print("Ready. اطرح سؤالك (اكتب 'exit' للخروج)\n")
     while True:
         try:
