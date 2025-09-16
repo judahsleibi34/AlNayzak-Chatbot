@@ -165,7 +165,7 @@ _SECTION_HEAVY = re.compile(r"(?:\d+\.){2,}\d+")  # lines like 3.1.5.7 (TOC-ish)
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _AR_LETTER_RX = re.compile(r"[ء-ي]")
 def _to_western_digits(s): return (s or "").translate(_ARABIC_DIGITS)
-def _strip_mojibake(s): return "" if not s else s.replace("\ufeff","").replace(" ","").replace("\uFFFD","")
+def _strip_mojibake(s): return "" if not s else s.replace("\ufeff","").replace("�","").replace("\uFFFD","")
 def _arabic_ratio(s):
     if not s: return 1.0
     letters = re.findall(r"\w", s, flags=re.UNICODE)
