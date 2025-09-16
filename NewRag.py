@@ -3,7 +3,12 @@
 RAG Orchestrator (Arabic) — grounded-only answers, page-aware fallback, bullets, pagination,
 and persistent artifacts for sanity tests.
 
-Usage:
+- Answers are ONLY based on retrieved PDF text (no hallucinations).
+- If the extractive snippet is weak, fall back to full text of the pages in Sources.
+- Output starts with a short intro sentence, then bullet points; long answers are paginated.
+- Saves artifacts (report/results/summary) per run.
+
+Usage (your one-liner):
 python NewRag.py \
   --chunks Data_pdf_clean_chunks.jsonl \
   --sanity \
@@ -35,8 +40,54 @@ try:
 except Exception:
     torch = None
 
-# Your retriever
+# Your retriever module
 import retrival_model as RET
+
+# ---------------- Utilities for dict-or-object chunks ----------------
+def _get_attr_or_key(obj, key, default=None):
+    """Return obj[key] if dict-like, else getattr(obj, key, default).
+       Also tries common nesting spots like .meta / .metadata if present."""
+    # dict-like
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    # object attribute
+    val = getattr(obj, key, None)
+    if val is not None:
+        return val
+    # nested common containers
+    for nest in ("meta", "metadata", "__dict__"):
+        container = getattr(obj, nest, None)
+        if isinstance(container, dict) and key in container:
+            return container.get(key)
+    return default
+
+def _first_non_empty(*vals):
+    for v in vals:
+        if v is None:
+            continue
+        s = str(v)
+        if s.strip():
+            return s
+    return ""
+
+def _first_page_like(obj):
+    """Try multiple possible page fields and coerce to int if possible."""
+    candidates = (
+        _get_attr_or_key(obj, "page"),
+        _get_attr_or_key(obj, "page_number"),
+        _get_attr_or_key(obj, "page_num"),
+        _get_attr_or_key(obj, "page_idx"),
+        _get_attr_or_key(obj, "pageno"),
+        _get_attr_or_key(obj, "page_start"),
+    )
+    for c in candidates:
+        if c is None or str(c).strip() == "":
+            continue
+        try:
+            return int(str(c).strip())
+        except Exception:
+            pass
+    return None
 
 # ---------------- Global page index (built in main) ----------------
 CHUNKS_BY_PAGE = {}  # {int page: "full concatenated text for that page"}
@@ -44,16 +95,32 @@ CHUNKS_BY_PAGE = {}  # {int page: "full concatenated text for that page"}
 def _build_page_text_index(chunks):
     pages = defaultdict(list)
     for ch in chunks:
-        # Robust keys
-        txt = ch.get("text") or ch.get("content") or ch.get("chunk") or ch.get("body") or ""
-        pg = ch.get("page")
+        # robust text extraction (support dicts and objects)
+        txt = _first_non_empty(
+            _get_attr_or_key(ch, "text"),
+            _get_attr_or_key(ch, "content"),
+            _get_attr_or_key(ch, "chunk"),
+            _get_attr_or_key(ch, "body"),
+            "",
+        )
+        if isinstance(txt, bytes):
+            try:
+                txt = txt.decode("utf-8", "ignore")
+            except Exception:
+                txt = ""
+        pg = _first_page_like(ch)
         if pg is None:
-            pg = ch.get("page_number") or ch.get("page_idx") or ch.get("pageno")
-        try:
-            if pg is not None:
-                pages[int(pg)].append(str(txt))
-        except Exception:
-            continue
+            # sometimes chunks carry page in a nested "source" string (e.g., "Data_pdf.pdf - page 16")
+            src = _get_attr_or_key(ch, "source") or _get_attr_or_key(ch, "doc_source") or ""
+            try:
+                pg_guess = re.search(r"(?:[Pp]age|صفحة)\s+(\d+)", str(src))
+                if pg_guess:
+                    pg = int(pg_guess.group(1))
+            except Exception:
+                pg = None
+        if pg is not None and txt:
+            pages[int(pg)].append(str(txt))
+    # join per page
     return {p: "\n".join(v) for p, v in pages.items()}
 
 # ---------------- Logging ----------------
@@ -131,7 +198,7 @@ _TIME_PATTERNS = [
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 def _to_western_digits(s: str) -> str:
-    return s.translate(_ARABIC_DIGITS)
+    return (s or "").translate(_ARABIC_DIGITS)
 
 def _extract_numbers_set(s: str):
     if not s:
@@ -237,17 +304,23 @@ def _format_with_intro_and_bullets(body_text: str, intro: str = "استنادً�
     return content
 
 def _parse_pages_from_sources(sources_text: str):
-    # matches "page 16" / "Page 16"
-    try:
-        return sorted(set(int(x) for x in re.findall(r"[Pp]age\s+(\d+)", sources_text or "")))
-    except Exception:
+    """Extract page numbers from Sources lines like 'Data_pdf.pdf - page 16'
+       and Arabic 'الصفحة/صفحة 16'. Handles Arabic digits too."""
+    if not sources_text:
         return []
+    s = _to_western_digits(sources_text)
+    pages = set()
+    for m in re.findall(r"(?:\b[Pp]age\b|(?:ال)?صفحة)\s+(\d+)", s):
+        try:
+            pages.add(int(m))
+        except Exception:
+            pass
+    return sorted(pages)
 
 def _page_ctx_from_sources(sources_text: str, max_chars: int = 3500):
     pages = _parse_pages_from_sources(sources_text)
     if not pages:
         return ""
-    # Concatenate page texts (ground truth context)
     buf = []
     total = 0
     for p in pages:
@@ -313,8 +386,8 @@ def ask_once(index: RET.HybridIndex,
             text = "\n\n".join(labeled)
         return f"⏱ {dt:.2f}s | 🤖 {text}\n{sources}" if sources else f"⏱ {dt:.2f}s | 🤖 {text}"
 
-    # If retrieval empty, try page_ctx before giving up
-    if (not body_raw or "لا توجد معلومات" in body_raw) and page_ctx:
+    # If retrieval empty/weak, try page_ctx before giving up
+    if (not body_raw or "لا توجد معلومات" in body_raw or "لم أعثر" in body_raw) and page_ctx:
         body_raw = page_ctx
 
     # If still nothing → grounded insufficiency
@@ -545,7 +618,7 @@ def main():
         return
     chunks, chunks_hash = RET.load_chunks(path=args.chunks)
 
-    # Build global page index for page-aware fallback
+    # Build global page index for page-aware fallback (works for dicts or Chunk objects)
     global CHUNKS_BY_PAGE
     CHUNKS_BY_PAGE = _build_page_text_index(chunks)
 
