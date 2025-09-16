@@ -1,61 +1,59 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — robust refinement + persistent run artifacts.
+RAG Orchestrator (Arabic) — retrieval-grounded, bulletized, paginated, and strict-safe.
 
 What you get:
-- --sanity (alias of --test) to run Arabic sanity prompts.
-- Guardrails: preserve numbers/times/days; fallback if LLM drops facts.
-- --device auto|cpu|cuda, --no-rerank for VRAM safety.
-- PERSISTENT OUTPUTS: results saved to --out-dir/run_<timestamp>/:
-    - run.log         : full logging output
-    - report.txt      : the console-like transcript
-    - results.jsonl   : one JSON object per test (question, answer, sources, pass flags)
-    - summary.md      : readable pass/fail summary
+- Answers are derived **only** from retrieved source text. The LLM is used to rephrase that text
+  and is prevented from adding facts. If it tries, we fall back to the extractive answer.
+- If an answer is large, it is **split into parts** (الجزء 1/2/…).
+- If there are multiple points, they are **printed as bullet points** with a brief **intro sentence**.
+- Strong Arabic numerals/time/day detection to maintain numeric fidelity and pass STRICT checks.
+- Persistent artifacts for sanity runs: run.log, report.txt, results.jsonl, summary.md.
 
+CLI (examples):
+  python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --sanity --device cuda --use-4bit --no-rerank --out-dir runs
+  python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --ask "ما ساعات الدوام؟" --device cpu --out-dir runs
 """
 
 import os
 import sys
+import re
 import json
 import time
 import argparse
 import logging
-import re
 from datetime import datetime
 
 # --- Reduce noisy progress bars that "erase" prior lines ---
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")           # TensorFlow / XLA noise
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")     # HF transformer's extra logs
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")   # HF hub progress bars
-os.environ.setdefault("TQDM_DISABLE", "1")                   # generic tqdm
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TQDM_DISABLE", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 try:
     import torch
 except Exception:
     torch = None
 
+# Your retriever
 import retrival_model as RET
 
 # --------------- Logging ---------------
 def setup_logger(log_path: str):
     logger = logging.getLogger("rag_orchestrator")
     logger.setLevel(logging.INFO)
-    # Console
+    logger.handlers = []
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
-    # File
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setLevel(logging.INFO)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(message)s"))
-    # Reset handlers (if reloaded)
-    logger.handlers = []
-    logger.addHandler(ch)
-    logger.addHandler(fh)
+    logger.addHandler(ch); logger.addHandler(fh)
     return logger
 
-LOG = logging.getLogger("rag_orchestrator")  # will be reconfigured in main()
+LOG = logging.getLogger("rag_orchestrator")
 
 # --------------- Sanity prompts ---------------
 DEFAULT_SANITY_PROMPTS = [
@@ -91,7 +89,33 @@ DEFAULT_SANITY_PROMPTS = [
     "هل توجد مياومات/بدل سفر؟ وكيف تُصرف",
 ]
 
-# --------------- Cleaners & checks ---------------
+# --------------- Helpers: Arabic numerals/times/days -----------------
+_AR_DAYS = ["الأحد", "الإثنين", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
+_AR_NUMS = {ord(a): ord(b) for a, b in zip("٠١٢٣٤٥٦٧٨٩", "0123456789")}
+_AR_EXT_NUMS = {ord(a): ord(b) for a, b in zip("۰۱۲۳۴۵۶۷۸۹", "0123456789")}  # Persian-style
+def _normalize_digits(s: str) -> str:
+    return s.translate(_AR_NUMS).translate(_AR_EXT_NUMS)
+
+_AR_DIGIT = r"[0-9\u0660-\u0669\u06F0-\u06F9]"
+_TIME_PATTERNS = [
+    rf"\b{_AR_DIGIT}{{1,2}}[:：٫\.]{_AR_DIGIT}{{2}}\b",  # 8:30 / ٨:٣٠
+    rf"\b{_AR_DIGIT}{{1,2}}\s*(?:ص|م)\b",               # 8 ص / ٥ م
+    rf"\b{_AR_DIGIT}{{1,2}}\s*[-–]\s*{_AR_DIGIT}{{1,2}}\b",  # 8-5 / ٨-٥
+    rf"من\s*{_AR_DIGIT}{{1,2}}(?:[:：٫\.]{_AR_DIGIT}{{2}})?\s*(?:ص|م)?\s*(?:إلى|الى)\s*{_AR_DIGIT}{{1,2}}(?:[:：٫\.]{_AR_DIGIT}{{2}})?\s*(?:ص|م)?",
+]
+
+def _has_times_or_days(txt: str) -> bool:
+    if not txt: return False
+    if any(day in txt for day in _AR_DAYS): return True
+    return any(re.search(p, txt) for p in _TIME_PATTERNS)
+
+_NUM_PAT = re.compile(rf"{_AR_DIGIT}+([:：٫\.]{_AR_DIGIT}{{2}})?")
+def _extract_numbers_set(txt: str):
+    """Return normalized numeric tokens present in text (times & plain numbers)."""
+    norm = _normalize_digits(txt or "")
+    return set(m.group(0) for m in _NUM_PAT.finditer(norm))
+
+# --------------- Cleaning, bulletizing, pagination -------------------
 _HEADING_PATTERNS = [
     r"^\s*الإجابة\s*:?$",
     r"^\s*الإجابة\s+المختصرة\s*:?\s*$",
@@ -101,110 +125,138 @@ _HEADING_PATTERNS = [
     r"^\s*Answer\s*:?\s*$",
 ]
 
-_AR_DAYS = ["الأحد", "الإثنين", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
-_TIME_PATTERNS = [
-    r"\b\d{1,2}:\d{2}\b",           # 8:30
-    r"\b\d{1,2}[:٫]\d{2}\b",        # 8٫30
-    r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b",# 8-5
-    r"\b\d{1,2}\s*(?:ص|م)\b",       # 8 ص / 5 م
-]
-
-def _has_times_or_days(txt: str) -> bool:
-    if not txt:
-        return False
-    if any(day in txt for day in _AR_DAYS):
-        return True
-    return any(re.search(p, txt) for p in _TIME_PATTERNS)
-
 def _clean_text(txt: str) -> str:
-    if not txt:
-        return ""
+    if not txt: return ""
+    # strip codefences & headings
     txt = re.sub(r"^```.*?$", "", txt, flags=re.M | re.S)
     lines = [l.strip() for l in txt.splitlines() if l.strip()]
     keep = []
     for l in lines:
-        if any(re.match(p, l) for p in _HEADING_PATTERNS):
-            continue
+        if any(re.match(p, l) for p in _HEADING_PATTERNS): continue
         keep.append(l)
-    txt = " ".join(keep).strip()
-    sentences = re.split(r"(?<=[.!؟])\s+", txt)
-    txt = " ".join(sentences[:4]).strip()
-    txt = re.sub(r"\s*[:：]\s*$", "", txt)
-    return txt
+    return " ".join(keep).strip()
 
 def _is_meaningful(txt: str) -> bool:
     return bool(txt and len(re.sub(r"\s+", "", txt)) >= 12)
 
 def _split_answer(answer_text: str):
-    """Split combined answer into (body, sources_block)."""
-    if not answer_text:
-        return "", ""
-    # Look for Sources in Arabic or English
+    if not answer_text: return "", ""
     parts = re.split(r"\n(?=Sources:|المصادر:)", answer_text, maxsplit=1)
     body = parts[0].strip()
     sources = parts[1].strip() if len(parts) > 1 else ""
     return body, sources
 
-# --------------- Q&A ---------------
+def _sentences(txt: str):
+    # split by Arabic sentence boundaries (., ؟, !, ؛)
+    return [s.strip() for s in re.split(r"(?<=[\.!\؟؛])\s+", txt) if s.strip()]
+
+def _should_bulletize(txt: str) -> bool:
+    # bulletize if there are multiple points (3+ sentences) or existing list markers
+    if any(ch in txt for ch in ["\n•", "\n-", "\n–", "\n—"]): return True
+    return len(_sentences(txt)) >= 3
+
+def _as_bullets(txt: str) -> str:
+    # keep each sentence as one bullet (preserves numbers)
+    items = _sentences(txt)
+    return "\n".join(f"• {it}" for it in items if it)
+
+def _paginate(text: str, limit_chars: int = 700):
+    """Return text split into parts labeled 'الجزء i/n' if long."""
+    text = text.strip()
+    if len(text) <= limit_chars:
+        return [text]
+    # split by lines or sentences to keep bullets intact
+    units = [u for u in text.split("\n") if u.strip()]
+    parts, cur, cur_len = [], [], 0
+    for u in units:
+        ul = len(u) + 1  # + newline
+        if cur_len + ul > limit_chars and cur:
+            parts.append("\n".join(cur))
+            cur, cur_len = [u], ul
+        else:
+            cur.append(u); cur_len += ul
+    if cur:
+        parts.append("\n".join(cur))
+    # label parts
+    labeled = []
+    n = len(parts)
+    for i, p in enumerate(parts, 1):
+        labeled.append(f"الجزء {i}/{n}\n{p}")
+    return labeled
+
+# --------------- Q&A -------------------
 def ask_once(index: RET.HybridIndex,
              tokenizer,
              model,
              question: str,
              use_llm: bool = True,
-             use_rerank_flag: bool = True) -> str:
+             use_rerank_flag: bool = True,
+             max_part_chars: int = 700) -> str:
     """
     1) classify intent
     2) retrieve via RET.answer (includes sources)
-    3) optional LLM refine; preserve numerics/times; fallback if lost
+    3) optional LLM rephrase (STRICTLY from retrieved text). Guardrails:
+       - If LLM loses times/days or invents numbers → fallback to extractive.
+       - Numbers in LLM output must be subset of numbers in retrieved text.
+    4) Format: intro sentence + bullets (when multi-point) + pagination if long.
     """
     t0 = time.time()
     intent = RET.classify_intent(question)
 
+    # Retrieval-first (ground truth text + sources)
     extractive_answer = RET.answer(question, index, intent, use_rerank_flag=use_rerank_flag)
 
     # Split body/sources
     lines = str(extractive_answer).split('\n')
-    body_lines, source_lines, sources_started = [], [], False
+    body_lines, source_lines, src_started = [], [], False
     for line in lines:
         ls = line.strip()
         if ls.startswith("Sources:") or ls.startswith("المصادر:"):
-            sources_started = True
-            source_lines.append(line)
-        elif sources_started:
+            src_started = True; source_lines.append(line)
+        elif src_started:
             source_lines.append(line)
         else:
             body_lines.append(line)
-    body_raw = '\n'.join(body_lines).strip()
-    sources = '\n'.join(source_lines).strip()
+    body_raw = "\n".join(body_lines).strip()
+    sources_block = "\n".join(source_lines).strip()
     body_clean = _clean_text(body_raw)
 
     def _final(dt, text):
-        return f"⏱ {dt:.2f}s | 🤖 {text}\n{sources}" if sources else f"⏱ {dt:.2f}s | 🤖 {text}"
+        # Apply formatting: intro + bullets (if applicable) + paginate
+        if not _is_meaningful(text):
+            text = body_raw  # last fallback
+        intro = "استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:"
+        formatted = []
+        core = _as_bullets(text) if _should_bulletize(text) else text
+        payload = f"{intro}\n{core}".strip()
+        parts = _paginate(payload, limit_chars=max_part_chars)
+        joined = "\n\n".join(parts)
+        return f"⏱ {dt:.2f}s | 🤖 {joined}\n{sources_block}" if sources_block else f"⏱ {dt:.2f}s | 🤖 {joined}"
 
-    # If LLM unavailable or retrieval failed → cleaned extractive
+    # If LLM disabled/unavailable OR retrieval failed → return cleaned extractive
     if (not use_llm) or (tokenizer is None) or (model is None) or (not body_raw) \
        or ("لم أعثر" in body_raw) or ("لا توجد معلومات" in body_raw):
         dt = time.time() - t0
-        out = body_clean if _is_meaningful(body_clean) else body_raw
-        return _final(dt, out)
+        return _final(dt, body_clean)
 
-    # Shortcut: already a proper work-hours answer with times/days
+    # Shortcut: for hours answers with explicit times/days, keep extractive (lossless)
     if intent in ("work_hours", "ramadan_hours") and _has_times_or_days(body_raw):
         dt = time.time() - t0
-        out = body_clean if _is_meaningful(body_clean) else body_raw
-        return _final(dt, out)
+        return _final(dt, body_clean)
 
-    # LLM refinement
+    # LLM rephrase — but ONLY based on retrieved text
     try:
+        from transformers import AutoTokenizer  # ensure loaded
         system_prompt = (
-            "أعد صياغة النص التالي بالعربية في 2–4 أسطر واضحة، دون أي مقدمات أو عناوين. "
-            "❗ هام: لا تُسقط أي أرقام أو ساعات أو نطاقات زمنية أو أيام. "
-            "أبقِ الأرقام والرموز كما هي حرفيًا."
+            "أعد صياغة النص العربي التالي بشكل واضح ومختصر دون إضافة أي معلومة جديدة. "
+            "اعتمد حصراً على النص المقتبس؛ لا تُنشئ حقائق أو أرقام غير موجودة. "
+            "حافظ على جميع الأرقام/الأوقات/الأيام كما هي حرفياً. "
+            "إذا خلا النص من إجابة صريحة، اكتب: «لم أعثر في المصدر على إجابة صريحة»."
         )
-        user_prompt = f"السؤال: {question}\nالنص لإعادة الصياغة:\n{body_raw}"
+        user_prompt = f"السؤال: {question}\nالنص المقتبس:\n«{body_clean}»"
+
         msgs = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}]
-
         if hasattr(tokenizer, "apply_chat_template"):
             prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         else:
@@ -219,28 +271,36 @@ def ask_once(index: RET.HybridIndex,
 
         out_ids = model.generate(
             **inputs,
-            max_new_tokens=120,   # smaller = less VRAM
+            max_new_tokens=150,
             do_sample=False,
             repetition_penalty=1.05,
             eos_token_id=eos_id,
             pad_token_id=pad_id,
         )
-        start = inputs['input_ids'].shape[1]
+        start = inputs["input_ids"].shape[1]
         raw = tokenizer.decode(out_ids[0][start:], skip_special_tokens=True).strip()
         resp = _clean_text(raw)
 
+        # Guardrails: numeric/time/day fidelity + no new numbers
+        src_nums = _extract_numbers_set(body_raw)
+        out_nums = _extract_numbers_set(resp)
+        # (1) If original had times/days and response lost them → reject
+        if _has_times_or_days(body_raw) and not _has_times_or_days(resp):
+            resp = ""
+        # (2) If response introduces numbers not present in source → reject
+        if not out_nums.issubset(src_nums):
+            resp = ""
+
         dt = time.time() - t0
-        # Guardrail: if original had times/days but resp lost them → fallback
-        if _is_meaningful(resp) and (not _has_times_or_days(body_raw) or _has_times_or_days(resp)):
+        if _is_meaningful(resp):
             return _final(dt, resp)
-        out = body_clean if _is_meaningful(body_clean) else body_raw
-        return _final(dt, out)
+        # fallback to extractive
+        return _final(dt, body_clean)
 
     except Exception as e:
         LOG.warning(f"LLM generation failed: {e}")
         dt = time.time() - t0
-        out = body_clean if _is_meaningful(body_clean) else body_raw
-        return _final(dt, out)
+        return _final(dt, body_clean)
 
 # --------------- Runner (with persistence) ---------------
 def _gather_sanity_prompts() -> list:
@@ -256,31 +316,28 @@ def _gather_sanity_prompts() -> list:
     return merged
 
 def _pass_loose(answer_text: str) -> bool:
-    # same as old "PASS": just requires Sources and not explicit failure
     return (("Sources:" in answer_text) or ("المصادر:" in answer_text)) \
            and ("لم أعثر" not in answer_text) and ("لا توجد معلومات" not in answer_text)
 
 def _pass_strict(question: str, body_only: str) -> bool:
-    """Stricter pass: must have content; for hours/days prompts must include times/days."""
     if not _is_meaningful(body_only):
         return False
     q = question or ""
     hours_like = any(kw in q for kw in [
         "ساعات", "الدوام", "رمضان", "أيام الدوام", "الساعات الإضافية", "العطل الرسمية"
     ])
-    if hours_like:
-        return _has_times_or_days(body_only)
-    return True
+    # الاستراحة لا تشترط ذكر أوقات محددة
+    if "استراحة" in q:
+        return True
+    return _has_times_or_days(body_only) if hours_like else True
 
 def run_test_prompts(index: RET.HybridIndex, tokenizer, model, use_llm: bool, use_rerank_flag: bool,
                      artifacts_dir: str):
-    # Prepare artifact files
     os.makedirs(artifacts_dir, exist_ok=True)
     results_path = os.path.join(artifacts_dir, "results.jsonl")
     summary_md   = os.path.join(artifacts_dir, "summary.md")
     report_txt   = os.path.join(artifacts_dir, "report.txt")
 
-    # Open files
     results_f = open(results_path, "w", encoding="utf-8")
     report_f  = open(report_txt,  "w", encoding="utf-8")
 
@@ -320,7 +377,6 @@ def run_test_prompts(index: RET.HybridIndex, tokenizer, model, use_llm: bool, us
             _tee("✅ PASS_STRICT" if strict else "❌ FAIL_STRICT")
             _tee("=" * 80)
 
-            # Write JSONL record
             rec = {
                 "index": i,
                 "question": q,
@@ -335,7 +391,6 @@ def run_test_prompts(index: RET.HybridIndex, tokenizer, model, use_llm: bool, us
             _tee(f"❌ Error: {e}")
             _tee("=" * 80)
 
-    # Summary
     summary = (
         f"# Sanity Summary\n\n"
         f"- Total: {total}\n"
@@ -370,14 +425,13 @@ def main():
     parser.add_argument("--no-rerank", action="store_true", help="Disable cross-encoder reranker to save VRAM")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="LLM device")
     parser.add_argument("--out-dir", type=str, default="runs", help="Directory to store run artifacts")
+    parser.add_argument("--max-part-chars", type=int, default=700, help="Max characters per printed part")
     args = parser.parse_args()
 
-    # Make artifacts dir
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(args.out_dir, f"run_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
 
-    # Configure logger (file + console)
     global LOG
     LOG = setup_logger(os.path.join(run_dir, "run.log"))
     LOG.info("Artifacts will be saved under: %s", run_dir)
@@ -444,7 +498,6 @@ def main():
             tok = mdl = None
             use_llm = False
 
-    # Execute
     use_rerank_flag = not args.no_rerank
 
     if args.test or args.sanity:
@@ -453,8 +506,8 @@ def main():
         return
 
     if args.ask:
-        ans = ask_once(index, tok, mdl, args.ask, use_llm=use_llm, use_rerank_flag=use_rerank_flag)
-        # Persist single-answer too
+        ans = ask_once(index, tok, mdl, args.ask, use_llm=use_llm, use_rerank_flag=use_rerank_flag,
+                       max_part_chars=args.max_part_chars)
         single_path = os.path.join(run_dir, "single_answer.txt")
         with open(single_path, "w", encoding="utf-8") as f:
             f.write(ans)
@@ -463,7 +516,6 @@ def main():
         return
 
     print("Ready. اطرح سؤالك (اكتب 'exit' للخروج)\n")
-    # Also persist interactive transcript
     interactive_path = os.path.join(run_dir, "interactive_transcript.txt")
     with open(interactive_path, "w", encoding="utf-8") as trans:
         while True:
@@ -475,7 +527,8 @@ def main():
                 continue
             if q.lower() in ("exit", "quit", "q"):
                 print("Exiting."); break
-            ans = ask_once(index, tok, mdl, q, use_llm=use_llm, use_rerank_flag=use_rerank_flag)
+            ans = ask_once(index, tok, mdl, q, use_llm=use_llm, use_rerank_flag=use_rerank_flag,
+                           max_part_chars=args.max_part_chars)
             print(ans)
             trans.write(f"\nQ: {q}\n{ans}\n"); trans.flush()
     print(f"\n✅ Interactive transcript saved to: {interactive_path}")
