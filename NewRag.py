@@ -1,23 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 RAG Orchestrator (Arabic) — grounded-only answers, page-aware fallback, bullets, pagination,
-and persistent artifacts for sanity tests. (HARDENED)
+and persistent artifacts for sanity tests. (HARDENED v2 — robust time matching + distilled lines)
 
-Changes vs. your original:
-- Hours/days hardening with page-aware rescue when snippet lacks times/days
-- Arabic-only guardrail on LLM outputs + non-Arabic purge fallback
-- Stronger time/day patterns (+ Arabic digits normalization)
-- Better mojibake cleanup
-- Keep "no hallucinations": still only uses retrieved/cited text
+Key additions vs your current file:
+- Broader _TIME_PATTERNS to catch unicode punctuation (： ︰ —) and dot times (8.30 / 8.00).
+- _time_or_day_lines(): distills only lines containing times/days from cited pages.
+- Page-aware rescue prefers distilled lines for hours-like questions (so STRICT sees times/days).
+- No change to interfaces/flags; reranker ON by default (don’t pass --no-rerank).
 
-Usage (one-liner):
-python NewRag.py \
-  --chunks Data_pdf_clean_chunks.jsonl \
-  --sanity \
-  --device cuda \
-  --use-4bit \
-  --no-rerank \
-  --out-dir runs
+Usage (strict-friendly; LLM off):
+python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --sanity --device cuda --use-4bit --no-llm --out-dir runs
 """
 
 import os
@@ -49,14 +42,11 @@ import retrival_model as RET
 def _get_attr_or_key(obj, key, default=None):
     """Return obj[key] if dict-like, else getattr(obj, key, default).
        Also tries common nesting spots like .meta / .metadata if present."""
-    # dict-like
     if isinstance(obj, dict):
         return obj.get(key, default)
-    # object attribute
     val = getattr(obj, key, None)
     if val is not None:
         return val
-    # nested common containers
     for nest in ("meta", "metadata", "__dict__"):
         container = getattr(obj, nest, None)
         if isinstance(container, dict) and key in container:
@@ -97,7 +87,6 @@ CHUNKS_BY_PAGE = {}  # {int page: "full concatenated text for that page"}
 def _build_page_text_index(chunks):
     pages = defaultdict(list)
     for ch in chunks:
-        # robust text extraction (support dicts and objects)
         txt = _first_non_empty(
             _get_attr_or_key(ch, "text"),
             _get_attr_or_key(ch, "content"),
@@ -112,7 +101,6 @@ def _build_page_text_index(chunks):
                 txt = ""
         pg = _first_page_like(ch)
         if pg is None:
-            # sometimes chunks carry page in a nested "source" string (e.g., "Data_pdf.pdf - page 16")
             src = _get_attr_or_key(ch, "source") or _get_attr_or_key(ch, "doc_source") or ""
             try:
                 pg_guess = re.search(r"(?:[Pp]age|صفحة|الصفحة)\s+(\d+)", str(src))
@@ -122,7 +110,6 @@ def _build_page_text_index(chunks):
                 pg = None
         if pg is not None and txt:
             pages[int(pg)].append(str(txt))
-    # join per page
     return {p: "\n".join(v) for p, v in pages.items()}
 
 # ---------------- Logging ----------------
@@ -191,17 +178,18 @@ _HEADING_PATTERNS = [
 
 _AR_DAYS = ["الأحد", "الإثنين", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
 
-# Accepts: 8:30, 8٫30, 8-5, 8 – 5, 8 إلى 5, 8 حتى 5, 8 ص/5 م
+# --- Robust time detection (unicode colons/dashes + dot times + optional minutes) ---
+_TIME_SEP = r"[:\.\u066B\uFF1A\uFE30\uFE13\u2236\u2982]"  # : . Arabic decimal(٫) fullwidth(：) vertical(︰=FE30) small colon(﹕=FE13) ratio(∶) bowtie(⦂)
+_DASH     = r"[-\u2013\u2014\u2212]"                      # - en– em— minus sign −
 _TIME_PATTERNS = [
-    r"\b\d{1,2}:\d{2}\b",                 # 8:30
-    r"\b\d{1,2}[:٫]\d{2}\b",              # 8٫30
-    r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b",      # 8-5 / 8–5
-    r"\b\d{1,2}\s*(?:إلى|حتى)\s*\d{1,2}\b",  # 8 إلى 5 / 8 حتى 5
-    r"\b\d{1,2}\s*(?:ص|م)\b",             # 8 ص / 5 م
+    rf"\b\d{{1,2}}{_TIME_SEP}\d{{2}}\b",                                        # 8:30 / 8٫30 / 8.30 / 8：30 / 8︰30
+    rf"\b\d{{1,2}}\s*{_DASH}\s*\d{{1,2}}\b",                                    # 8-5 / 8–5 / 8—5
+    r"\b\d{1,2}\s*(?:إلى|الى|حتى)\s*\d{1,2}\b",                                # 8 إلى 5 / 8 حتى 5
+    rf"\b\d{{1,2}}(?:{_TIME_SEP}\d{{2}})?\s*(?:ص|م)?\s*(?:{_DASH}|إلى|الى|حتى)\s*\d{{1,2}}(?:{_TIME_SEP}\d{{2}})?\s*(?:ص|م)?\b",
 ]
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-_AR_LETTER_RX = re.compile(r"[ء-ي]")  # coarse Arabic block
+_AR_LETTER_RX = re.compile(r"[ء-ي]")
 _NONAR_LETTER_RX = re.compile(r"[A-Za-z\u4e00-\u9fff]+")
 
 def _to_western_digits(s: str) -> str:
@@ -211,6 +199,12 @@ def _strip_mojibake(s: str) -> str:
     if not s:
         return ""
     return s.replace("\ufeff", "").replace("�", "").replace("\uFFFD", "")
+
+def _normalize_punct(s: str) -> str:
+    # normalize common unicode punctuation to simplify downstream matching/reading
+    return (s or "").replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-") \
+                    .replace("\uFF1A", ":").replace("\uFE30", ":").replace("\uFE13", ":").replace("\u2236", ":") \
+                    .replace("\u066B", "٫")
 
 def _arabic_ratio(s: str) -> float:
     if not s:
@@ -231,7 +225,6 @@ def _purge_non_arabic_lines(s: str, min_ratio: float = 0.80) -> str:
         if not ln:
             continue
         ratio = _arabic_ratio(ln)
-        # allow short tokens like "8:30"
         has_word = bool(re.search(r"[^\W\d_]", ln, flags=re.UNICODE))
         if (not has_word) or ratio >= min_ratio:
             keep.append(ln)
@@ -377,6 +370,25 @@ def _page_ctx_from_sources(sources_text: str, max_chars: int = 3500):
             total += len(txt)
     return _clean_text("\n".join(buf))
 
+def _time_or_day_lines(text: str) -> str:
+    """Return only lines that contain times or Arabic day names (plus 'رمضان')."""
+    if not text:
+        return ""
+    lines = [l.strip() for l in _normalize_punct(text).splitlines() if l.strip()]
+    keep = []
+    for ln in lines:
+        if _has_times_or_days(ln):
+            keep.append(ln)
+        elif any(d in ln for d in _AR_DAYS) or ("رمضان" in ln):
+            keep.append(ln)
+    # dedupe while preserving order
+    out = []
+    seen = set()
+    for k in keep:
+        if k not in seen:
+            out.append(k); seen.add(k)
+    return "\n".join(out)
+
 def _is_hours_like(question: str, intent: str = "") -> bool:
     q = (question or "").strip()
     hours_kws = ["ساعات", "الدوام", "رمضان", "أيام الدوام", "الساعات الإضافية", "العطل الرسمية", "استراحة", "مغادرة ساعية"]
@@ -423,29 +435,33 @@ def ask_once(index: RET.HybridIndex,
     # Build page-aware context if needed
     page_ctx = _page_ctx_from_sources(sources, max_chars=3500)
 
-    # -------------- HARDENING START --------------
-    # If retrieval empty/weak OR hour-like answer lacks times/days → try page-aware rescue.
+    # -------------- HARDENING: page-aware rescue + distilled time/day lines --------------
     hours_like = _is_hours_like(question, intent)
     if page_ctx:
-        # Normalize both before checks
         tmp_body = _clean_text(body_raw)
         if (not tmp_body) or ("لا توجد معلومات" in tmp_body) or ("لم أعثر" in tmp_body):
             body_raw = page_ctx
         elif hours_like and not _has_times_or_days(tmp_body):
-            # If the body lacks times/days but the cited pages contain them, use page context.
+            # 1) prefer full page context if it has times/days
             if _has_times_or_days(page_ctx):
                 body_raw = page_ctx
             else:
-                # As a last try, collect only segments from cited pages that contain times/days
-                pages = _parse_pages_from_sources(sources)
-                focused = []
-                for p in pages:
-                    t = CHUNKS_BY_PAGE.get(p, "")
-                    if t and _has_times_or_days(t):
-                        focused.append(t)
+                # 2) try extracting only lines with times/days from the cited pages
+                focused = _time_or_day_lines(page_ctx)
+                if not focused:
+                    # 3) scan each cited page and pick only the relevant lines
+                    pages = _parse_pages_from_sources(sources)
+                    bag = []
+                    for p in pages:
+                        t = CHUNKS_BY_PAGE.get(p, "")
+                        if not t:
+                            continue
+                        lines_td = _time_or_day_lines(t)
+                        if lines_td:
+                            bag.append(lines_td)
+                    focused = "\n".join(bag).strip()
                 if focused:
-                    body_raw = _clean_text("\n".join(focused))
-    # -------------- HARDENING END ----------------
+                    body_raw = _clean_text(focused)
 
     def _final(dt, text):
         parts = _paginate_text(text, max_chars=paginate_chars)
@@ -465,10 +481,13 @@ def ask_once(index: RET.HybridIndex,
 
     # If LLM disabled/unavailable → format extractive/page_ctx directly
     if (not use_llm) or (tokenizer is None) or (model is None):
-        # Arabic-only purge of obvious noise before formatting
         body_clean2 = _purge_non_arabic_lines(body_clean)
-        if hours_like and not _has_times_or_days(body_clean2) and _has_times_or_days(page_ctx):
-            body_clean2 = _clean_text(page_ctx)
+        if hours_like and not _has_times_or_days(body_clean2):
+            distilled = _time_or_day_lines(page_ctx)
+            if distilled:
+                body_clean2 = _clean_text(distilled)
+            elif _has_times_or_days(page_ctx):
+                body_clean2 = _clean_text(page_ctx)
         dt = time.time() - t0
         formatted = _format_with_intro_and_bullets(body_clean2 or body_clean or body_raw)
         return _final(dt, formatted)
@@ -524,38 +543,42 @@ def ask_once(index: RET.HybridIndex,
         src_nums = _extract_numbers_set(src_text_for_check)
         out_nums = _extract_numbers_set(resp)
 
-        # Hour-like strictness: must retain times/days if asked
         if hours_like and not _has_times_or_days(resp):
             resp = ""  # reject; will fallback
 
-        # No new numbers
         if not out_nums.issubset(src_nums):
             resp = ""  # introduced new numbers → reject
 
         dt = time.time() - t0
 
         if not _is_meaningful(resp):
-            # Safe fallback: bullets from grounded context (prefer page_ctx if it has times/days)
+            # Safe fallback: bullets from grounded context (prefer distilled/page_ctx if it has times/days)
             fallback_txt = src_text_for_check
-            if hours_like and _has_times_or_days(page_ctx):
-                fallback_txt = _clean_text(page_ctx)
+            if hours_like:
+                distilled = _time_or_day_lines(page_ctx)
+                if distilled:
+                    fallback_txt = _clean_text(distilled)
+                elif _has_times_or_days(page_ctx):
+                    fallback_txt = _clean_text(page_ctx)
             if _is_meaningful(fallback_txt):
                 safe = _closest_bullets(fallback_txt, max_sents=6)
                 formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{safe}"
                 return _final(dt, formatted)
             return _final(dt, "لا يقدّم النص المسترجَع تفاصيل كافية للإجابة بشكل قاطع من المصدر نفسه.")
 
-        # Final formatting
         formatted = _format_with_intro_and_bullets(resp)
         return _final(dt, formatted)
 
     except Exception as e:
         LOG.warning(f"LLM generation failed: {e}")
         dt = time.time() - t0
-        # Prefer page_ctx if it's more informative for hour-like
         fallback_txt = body_clean if _is_meaningful(body_clean) else body_raw
-        if hours_like and _has_times_or_days(page_ctx):
-            fallback_txt = _clean_text(page_ctx)
+        if hours_like:
+            distilled = _time_or_day_lines(page_ctx)
+            if distilled:
+                fallback_txt = _clean_text(distilled)
+            elif _has_times_or_days(page_ctx):
+                fallback_txt = _clean_text(page_ctx)
         formatted = _format_with_intro_and_bullets(fallback_txt)
         return _final(dt, formatted)
 
@@ -763,7 +786,7 @@ def main():
             tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
             mdl = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
         except Exception as e:
-            LOG.warning("Failed to load LLM (%s); continuing retrieval-only. Error: %s", args.model, e)
+            LOG.warning(f"Failed to load LLM ({args.model}); continuing retrieval-only. Error: {e}")
             tok = mdl = None
             use_llm = False
 
