@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 RAG Orchestrator (Arabic) — grounded-only answers, page-aware fallback, bullets, pagination,
-and persistent artifacts for sanity tests.
+and persistent artifacts for sanity tests. (HARDENED)
 
-- Answers are ONLY based on retrieved PDF text (no hallucinations).
-- If the extractive snippet is weak, fall back to full text of the pages in Sources.
-- Output starts with a short intro sentence, then bullet points; long answers are paginated.
-- Saves artifacts (report/results/summary) per run.
+Changes vs. your original:
+- Hours/days hardening with page-aware rescue when snippet lacks times/days
+- Arabic-only guardrail on LLM outputs + non-Arabic purge fallback
+- Stronger time/day patterns (+ Arabic digits normalization)
+- Better mojibake cleanup
+- Keep "no hallucinations": still only uses retrieved/cited text
 
-Usage (your one-liner):
+Usage (one-liner):
 python NewRag.py \
   --chunks Data_pdf_clean_chunks.jsonl \
   --sanity \
@@ -113,7 +115,7 @@ def _build_page_text_index(chunks):
             # sometimes chunks carry page in a nested "source" string (e.g., "Data_pdf.pdf - page 16")
             src = _get_attr_or_key(ch, "source") or _get_attr_or_key(ch, "doc_source") or ""
             try:
-                pg_guess = re.search(r"(?:[Pp]age|صفحة)\s+(\d+)", str(src))
+                pg_guess = re.search(r"(?:[Pp]age|صفحة|الصفحة)\s+(\d+)", str(src))
                 if pg_guess:
                     pg = int(pg_guess.group(1))
             except Exception:
@@ -188,17 +190,52 @@ _HEADING_PATTERNS = [
 ]
 
 _AR_DAYS = ["الأحد", "الإثنين", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
+
+# Accepts: 8:30, 8٫30, 8-5, 8 – 5, 8 إلى 5, 8 حتى 5, 8 ص/5 م
 _TIME_PATTERNS = [
-    r"\b\d{1,2}:\d{2}\b",             # 8:30
-    r"\b\d{1,2}[:٫]\d{2}\b",          # 8٫30
-    r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b",  # 8-5
-    r"\b\d{1,2}\s*(?:ص|م)\b",         # 8 ص / 5 م
+    r"\b\d{1,2}:\d{2}\b",                 # 8:30
+    r"\b\d{1,2}[:٫]\d{2}\b",              # 8٫30
+    r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b",      # 8-5 / 8–5
+    r"\b\d{1,2}\s*(?:إلى|حتى)\s*\d{1,2}\b",  # 8 إلى 5 / 8 حتى 5
+    r"\b\d{1,2}\s*(?:ص|م)\b",             # 8 ص / 5 م
 ]
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_AR_LETTER_RX = re.compile(r"[ء-ي]")  # coarse Arabic block
+_NONAR_LETTER_RX = re.compile(r"[A-Za-z\u4e00-\u9fff]+")
 
 def _to_western_digits(s: str) -> str:
     return (s or "").translate(_ARABIC_DIGITS)
+
+def _strip_mojibake(s: str) -> str:
+    if not s:
+        return ""
+    return s.replace("\ufeff", "").replace("�", "").replace("\uFFFD", "")
+
+def _arabic_ratio(s: str) -> float:
+    if not s:
+        return 1.0
+    letters = re.findall(r"\w", s, flags=re.UNICODE)
+    if not letters:
+        return 1.0
+    arabic = _AR_LETTER_RX.findall(s)
+    return (len(arabic) / max(1, len(letters)))
+
+def _purge_non_arabic_lines(s: str, min_ratio: float = 0.80) -> str:
+    """Drop lines with too many Latin/CJK letters; keep numbers/punct."""
+    if not s:
+        return s
+    keep = []
+    for line in s.splitlines():
+        ln = line.strip()
+        if not ln:
+            continue
+        ratio = _arabic_ratio(ln)
+        # allow short tokens like "8:30"
+        has_word = bool(re.search(r"[^\W\d_]", ln, flags=re.UNICODE))
+        if (not has_word) or ratio >= min_ratio:
+            keep.append(ln)
+    return "\n".join(keep)
 
 def _extract_numbers_set(s: str):
     if not s:
@@ -218,9 +255,10 @@ def _extract_numbers_set(s: str):
 def _has_times_or_days(txt: str) -> bool:
     if not txt:
         return False
-    if any(day in txt for day in _AR_DAYS):
+    t = _to_western_digits(txt)
+    if any(day in t for day in _AR_DAYS):
         return True
-    return any(re.search(p, txt) for p in _TIME_PATTERNS)
+    return any(re.search(p, t) for p in _TIME_PATTERNS)
 
 def _sentences(txt: str):
     if not txt:
@@ -245,6 +283,7 @@ def _sentences(txt: str):
 def _clean_text(txt: str) -> str:
     if not txt:
         return ""
+    txt = _strip_mojibake(txt)
     txt = re.sub(r"^```.*?$", "", txt, flags=re.M | re.S)
     lines = [l.strip() for l in txt.splitlines() if l.strip()]
     keep = []
@@ -338,6 +377,13 @@ def _page_ctx_from_sources(sources_text: str, max_chars: int = 3500):
             total += len(txt)
     return _clean_text("\n".join(buf))
 
+def _is_hours_like(question: str, intent: str = "") -> bool:
+    q = (question or "").strip()
+    hours_kws = ["ساعات", "الدوام", "رمضان", "أيام الدوام", "الساعات الإضافية", "العطل الرسمية", "استراحة", "مغادرة ساعية"]
+    if any(kw in q for kw in hours_kws):
+        return True
+    return intent in ("work_hours", "ramadan_hours", "overtime", "work_days", "breaks")
+
 # ---------------- Q&A ----------------
 def ask_once(index: RET.HybridIndex,
              tokenizer,
@@ -377,6 +423,30 @@ def ask_once(index: RET.HybridIndex,
     # Build page-aware context if needed
     page_ctx = _page_ctx_from_sources(sources, max_chars=3500)
 
+    # -------------- HARDENING START --------------
+    # If retrieval empty/weak OR hour-like answer lacks times/days → try page-aware rescue.
+    hours_like = _is_hours_like(question, intent)
+    if page_ctx:
+        # Normalize both before checks
+        tmp_body = _clean_text(body_raw)
+        if (not tmp_body) or ("لا توجد معلومات" in tmp_body) or ("لم أعثر" in tmp_body):
+            body_raw = page_ctx
+        elif hours_like and not _has_times_or_days(tmp_body):
+            # If the body lacks times/days but the cited pages contain them, use page context.
+            if _has_times_or_days(page_ctx):
+                body_raw = page_ctx
+            else:
+                # As a last try, collect only segments from cited pages that contain times/days
+                pages = _parse_pages_from_sources(sources)
+                focused = []
+                for p in pages:
+                    t = CHUNKS_BY_PAGE.get(p, "")
+                    if t and _has_times_or_days(t):
+                        focused.append(t)
+                if focused:
+                    body_raw = _clean_text("\n".join(focused))
+    # -------------- HARDENING END ----------------
+
     def _final(dt, text):
         parts = _paginate_text(text, max_chars=paginate_chars)
         if len(parts) > 1:
@@ -385,10 +455,6 @@ def ask_once(index: RET.HybridIndex,
                 labeled.append(f"الجزء {i}/{len(parts)}:\n{p}")
             text = "\n\n".join(labeled)
         return f"⏱ {dt:.2f}s | 🤖 {text}\n{sources}" if sources else f"⏱ {dt:.2f}s | 🤖 {text}"
-
-    # If retrieval empty/weak, try page_ctx before giving up
-    if (not body_raw or "لا توجد معلومات" in body_raw or "لم أعثر" in body_raw) and page_ctx:
-        body_raw = page_ctx
 
     # If still nothing → grounded insufficiency
     if not body_raw or len(body_raw.strip()) == 0:
@@ -399,24 +465,29 @@ def ask_once(index: RET.HybridIndex,
 
     # If LLM disabled/unavailable → format extractive/page_ctx directly
     if (not use_llm) or (tokenizer is None) or (model is None):
+        # Arabic-only purge of obvious noise before formatting
+        body_clean2 = _purge_non_arabic_lines(body_clean)
+        if hours_like and not _has_times_or_days(body_clean2) and _has_times_or_days(page_ctx):
+            body_clean2 = _clean_text(page_ctx)
         dt = time.time() - t0
-        formatted = _format_with_intro_and_bullets(body_clean or body_raw)
+        formatted = _format_with_intro_and_bullets(body_clean2 or body_clean or body_raw)
         return _final(dt, formatted)
 
-    # Short-circuit for clear-hours answers already containing times/days
-    if intent in ("work_hours", "ramadan_hours") and _has_times_or_days(body_raw):
+    # Short-circuit for hour-like answers already containing times/days
+    if hours_like and _has_times_or_days(body_clean):
         dt = time.time() - t0
-        formatted = _format_with_intro_and_bullets(body_clean or body_raw)
+        formatted = _format_with_intro_and_bullets(body_clean)
         return _final(dt, formatted)
 
-    # LLM refinement (strictly grounded)
+    # LLM refinement (strictly grounded; Arabic-only)
     try:
         system_prompt = (
             "أعد صياغة المقتطف العربي التالي بوضوح واختصار دون إضافة أي معلومة جديدة أو استنتاج. "
             "اعتمد حصراً على هذا النص. لا تولّد أرقاماً/أوقات/أياماً غير موجودة. "
-            "حافظ على جميع الأرقام/الأوقات/الأيام كما وردت حرفياً."
+            "حافظ على جميع الأرقام/الأوقات/الأيام كما وردت حرفياً. "
+            "اكتب الإجابة بالعربية الفصحى فقط دون استخدام أي لغة أخرى أو حروف لاتينية."
         )
-        user_prompt = f"السؤال: {question}\nالنص لإعادة الصياغة:\n{body_raw}"
+        user_prompt = f"السؤال: {question}\nالنص لإعادة الصياغة:\n{body_clean or body_raw}"
 
         msgs = [
             {"role": "system", "content": system_prompt},
@@ -446,35 +517,45 @@ def ask_once(index: RET.HybridIndex,
         start = inputs["input_ids"].shape[1]
         raw = tokenizer.decode(out_ids[0][start:], skip_special_tokens=True).strip()
         resp = _clean_text(raw)
+        resp = _purge_non_arabic_lines(resp)
 
-        # Guardrails: fidelity checks vs the true context (body_raw)
-        src_nums = _extract_numbers_set(body_raw)
+        # Guardrails: fidelity checks vs the true context (body_raw/body_clean)
+        src_text_for_check = body_clean or body_raw
+        src_nums = _extract_numbers_set(src_text_for_check)
         out_nums = _extract_numbers_set(resp)
 
-        if _has_times_or_days(body_raw) and not _has_times_or_days(resp):
-            resp = ""  # lost times/days → reject
+        # Hour-like strictness: must retain times/days if asked
+        if hours_like and not _has_times_or_days(resp):
+            resp = ""  # reject; will fallback
 
+        # No new numbers
         if not out_nums.issubset(src_nums):
             resp = ""  # introduced new numbers → reject
 
         dt = time.time() - t0
 
         if not _is_meaningful(resp):
-            # Safe fallback: bullets from grounded context
-            fallback_txt = body_clean if _is_meaningful(body_clean) else body_raw
+            # Safe fallback: bullets from grounded context (prefer page_ctx if it has times/days)
+            fallback_txt = src_text_for_check
+            if hours_like and _has_times_or_days(page_ctx):
+                fallback_txt = _clean_text(page_ctx)
             if _is_meaningful(fallback_txt):
                 safe = _closest_bullets(fallback_txt, max_sents=6)
                 formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{safe}"
                 return _final(dt, formatted)
             return _final(dt, "لا يقدّم النص المسترجَع تفاصيل كافية للإجابة بشكل قاطع من المصدر نفسه.")
 
+        # Final formatting
         formatted = _format_with_intro_and_bullets(resp)
         return _final(dt, formatted)
 
     except Exception as e:
         LOG.warning(f"LLM generation failed: {e}")
         dt = time.time() - t0
+        # Prefer page_ctx if it's more informative for hour-like
         fallback_txt = body_clean if _is_meaningful(body_clean) else body_raw
+        if hours_like and _has_times_or_days(page_ctx):
+            fallback_txt = _clean_text(page_ctx)
         formatted = _format_with_intro_and_bullets(fallback_txt)
         return _final(dt, formatted)
 
@@ -501,7 +582,7 @@ def _pass_strict(question: str, body_only: str) -> bool:
         return False
     q = question or ""
     hours_like = any(kw in q for kw in [
-        "ساعات", "الدوام", "رمضان", "أيام الدوام", "الساعات الإضافية", "العطل الرسمية"
+        "ساعات", "الدوام", "رمضان", "أيام الدوام", "الساعات الإضافية", "العطل الرسمية", "استراحة", "مغادرة ساعية"
     ])
     if hours_like:
         return _has_times_or_days(body_only)
