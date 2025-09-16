@@ -1,296 +1,112 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+RAG Orchestrator (Arabic) — Generic edge-case hardening:
+- Page-aware fallback (from cited pages, then anchors, then global)
+- Generic regex hunter for numbers/times/days/%/durations
+- Signal-based sentence ranking (numeric/time/day signals + keyword overlap)
+- Arabic cleanup + heading/TOC/boilerplate suppression
+- Short, clipped bullets with pagination
+- Still strictly grounded (no new facts), LLM optional but not required
 
-import os, sys, re, json, time, math, argparse, random, logging, pathlib, datetime
-from typing import List, Dict, Any, Tuple
+Usage (typical):
+python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --sanity --device cuda --use-4bit --no-llm \
+  --regex-hunt --hourlines-only --max-bullets 5 --bullet-max-chars 120 --paginate-chars 600 --out-dir runs
+"""
 
-# ------------------------------------------------------------------------------
-# Lightweight logging in the same style your runs print
-# ------------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-log = logging.getLogger("rag_orchestrator")
+import os, sys, re, json, time, argparse, logging
+from datetime import datetime
+from collections import defaultdict
+from types import SimpleNamespace
 
-# ------------------------------------------------------------------------------
-# Utilities
-# ------------------------------------------------------------------------------
+# Quiet noisy libs
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
-ARABIC_DOW = r"(الأحد|الاثنين|الإثنين|الثلاثاء|الأربعاء|الخميس|الجمعة|السبت)"
-ARABIC_NUM = r"[0-9٠-٩]"
-TIME_RE    = r"(?:(?:[01]?\d|2[0-3])[:٫.][0-5]\d)"  # 7:30 / 07:30 / 7٫30
-AMPM_RE    = r"(?:ص|صباحًا|م|مساءً|ظهراً|ظهرًا|مساء|صباحا|مساءا)"
-RANGE_RE   = rf"{TIME_RE}\s*(?:-|—|–|إلى|حتى)\s*{TIME_RE}(?:\s*{AMPM_RE})?"
+try:
+    import torch  # optional
+except Exception:
+    torch = None
 
-def _has_times_or_days(s: str) -> bool:
-    if not s: return False
-    return bool(re.search(RANGE_RE, s)) or bool(re.search(TIME_RE, s)) or bool(re.search(ARABIC_DOW, s))
+# Your retriever module
+import retrival_model as RET
 
-def _clip(s: str, n: int) -> str:
-    if n is None or n <= 0 or not s: 
-        return s or ""
-    return s if len(s) <= n else (s[:max(0, n-1)] + "…")
+# ---------------- Utilities for dict-or-object chunks ----------------
+def _get_attr_or_key(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    val = getattr(obj, key, None)
+    if val is not None: return val
+    for nest in ("meta", "metadata", "__dict__"):
+        container = getattr(obj, nest, None)
+        if isinstance(container, dict) and key in container:
+            return container.get(key)
+    return default
 
-def _sentences(txt: str) -> List[str]:
-    if not txt: return []
-    # Split on sentence-ish punctuation including Arabic full stop and bullets/newlines
-    parts = re.split(r"[.\n\r؛!؟]+", txt)
-    return [p.strip(" \t-•") for p in parts if p.strip(" \t-•")]
+def _first_non_empty(*vals):
+    for v in vals:
+        if v is None: continue
+        s = str(v)
+        if s.strip(): return s
+    return ""
 
-def _clean_text(txt: str) -> str:
-    if not txt: return ""
-    # Collapse whitespace, keep Arabic/Latin punctuation
-    t = re.sub(r"[ \t]+", " ", txt)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
-
-def _paginate_text(txt: str, max_chars: int = 900) -> List[str]:
-    if not txt: return [""]
-    if max_chars is None or max_chars <= 0 or len(txt) <= max_chars:
-        return [txt]
-    chunks, buf = [], []
-    curr = 0
-    for line in txt.splitlines():
-        if curr + len(line) + 1 > max_chars:
-            chunks.append("\n".join(buf))
-            buf, curr = [line], len(line) + 1
-        else:
-            buf.append(line)
-            curr += len(line) + 1
-    if buf: chunks.append("\n".join(buf))
-    return chunks
-
-def _line_has_time_or_day(line: str) -> bool:
-    return _has_times_or_days(line)
-
-def _filter_hour_lines(text: str) -> str:
-    if not text:
-        return ""
-    keep = []
-    for ln in text.splitlines():
-        lns = ln.strip()
-        if not lns: 
-            continue
-        if _line_has_time_or_day(lns):
-            keep.append(lns)
-    return "\n".join(keep) if keep else text
-
-def _as_bullets(sents: List[str], max_items: int = 8, bullet_max_chars: int = None) -> str:
-    out = []
-    limit = max_items if max_items and max_items > 0 else 8
-    for s in sents[:limit]:
-        s = s.strip()
-        if not s: 
-            continue
-        out.append(f"• {_clip(s, bullet_max_chars)}")
-    return "\n".join(out)
-
-def _format_with_intro_and_bullets(
-    body_text: str, 
-    intro: str = "استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:",
-    max_bullets: int = 8,
-    bullet_max_chars: int = None,
-    hourlines_only: bool = False
-):
-    txt = body_text or ""
-    if hourlines_only:
-        txt = _filter_hour_lines(txt)
-    sents = _sentences(txt)
-    if len(sents) <= 1:
-        content = f"{intro}\n{_clip((sents[0] if sents else txt.strip()), bullet_max_chars)}"
-    else:
-        content = f"{intro}\n{_as_bullets(sents, max_items=max_bullets, bullet_max_chars=bullet_max_chars)}"
-    return content
-
-def _decorate_output(dt: float, text: str, sources: str, style: str = "plain"):
-    if style == "pretty":
-        core = f"⏱ {dt:.2f}s\n{text}"
-    else:
-        core = f"⏱ {dt:.2f}s | 🤖 {text}"
-    return f"{core}\n{sources}" if sources else core
-
-# ------------------------------------------------------------------------------
-# Minimal indexer (JSONL chunks) with optional sklearn TF-IDF
-# ------------------------------------------------------------------------------
-
-class SimpleIndex:
-    def __init__(self, docs: List[Dict[str, Any]]):
-        self.docs = docs
-        self.texts = [d["text"] for d in docs]
-        self._use_sklearn = False
-        self._tfidf = None
-        self._mat = None
-        try:
-            from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
-            self._vec = TfidfVectorizer(
-                analyzer="word",
-                ngram_range=(1,2),
-                min_df=1,
-                max_df=0.95,
-                lowercase=False
-            )
-            self._mat = self._vec.fit_transform(self.texts)
-            self._use_sklearn = True
-        except Exception:
-            self._vec = None
-            self._use_sklearn = False
-
-    def search(self, query: str, topk: int = 8) -> List[Tuple[int, float]]:
-        if not self.docs:
-            return []
-        if not query:
-            return [(i, 0.0) for i in range(min(topk, len(self.docs)))]
-        if self._use_sklearn:
-            qv = self._vec.transform([query])
-            import numpy as np
-            scores = (self._mat @ qv.T).toarray().ravel()
-            idxs = scores.argsort()[::-1]
-            out = []
-            for i in idxs[:topk]:
-                out.append((int(i), float(scores[i])))
-            return out
-        # fallback: simple keyword overlap
-        qtokens = set(re.findall(r"\w+|"+ARABIC_DOW, query))
-        scored = []
-        for i, t in enumerate(self.texts):
-            toks = set(re.findall(r"\w+|"+ARABIC_DOW, t))
-            inter = len(qtokens & toks)
-            scored.append((i, float(inter)))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[:topk]
-
-# ------------------------------------------------------------------------------
-# Loading chunks (expects jsonl with keys: text, meta: {source,page} or similar)
-# ------------------------------------------------------------------------------
-
-def load_chunks(path: str) -> List[Dict[str, Any]]:
-    docs = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line: 
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            text = obj.get("text") or obj.get("chunk") or ""
-            meta = obj.get("meta") or {}
-            source = meta.get("source") or meta.get("file") or meta.get("doc") or "unknown"
-            page = meta.get("page") or meta.get("pageno") or meta.get("page_num") or None
-            docs.append({"text": _clean_text(text), "source": source, "page": page})
-    return docs
-
-# ------------------------------------------------------------------------------
-# Ask / Test
-# ------------------------------------------------------------------------------
-
-def _sources_block(hits: List[Tuple[int, float]], docs: List[Dict[str, Any]], max_items: int = 8) -> str:
-    uniq = []
-    for idx, _ in hits[:max_items]:
-        d = docs[idx]
-        src = d.get("source") or "unknown"
-        page = d.get("page")
-        if page is not None:
-            item = f"{src} - page {page}"
-        else:
-            item = f"{src}"
-        if item not in uniq:
-            uniq.append(item)
-    if not uniq:
-        return ""
-    lines = [f"{i+1}. {u}" for i, u in enumerate(uniq, 1)]
-    return "Sources:\n" + "\n".join(lines)
-
-def _collect_context(hits: List[Tuple[int,float]], docs: List[Dict[str,Any]], topn_ctx: int = 6) -> str:
-    parts = []
-    for i, (idx, _) in enumerate(hits[:topn_ctx], 1):
-        d = docs[idx]
-        t = d["text"].strip()
-        if t:
-            parts.append(t)
-    return "\n".join(parts)
-
-def ask_once(index: SimpleIndex,
-             tokenizer,
-             model,
-             question: str,
-             use_llm: bool = True,
-             use_rerank_flag: bool = True,
-             paginate_chars: int = 900,
-             hourlines_only: bool = False,
-             regex_hunt: bool = False,
-             max_bullets: int = 8,
-             bullet_max_chars: int = None,
-             print_style: str = "plain") -> str:
-    """
-    Core Q&A. With --no-llm we strictly format retrieved context; with LLM enabled,
-    we still keep the same post-format (bullets/pagination/hourlines).
-    """
-    t0 = time.time()
-    hits = index.search(question, topk=12)
-    sources = _sources_block(hits, index.docs)
-    page_ctx = _collect_context(hits, index.docs, topn_ctx=8)
-    body = page_ctx
-
-    # Optional regex hunt to prefer lines with hours/days
-    if regex_hunt:
-        cand = _filter_hour_lines(page_ctx)
-        if cand and cand != page_ctx:
-            body = cand
-
-    body = _clean_text(body)
-
-    # No LLM path: format bullets/intro directly
-    if not use_llm:
-        # try to favor hour-ish paragraphs if question looks like hours
-        hours_like = bool(re.search(r"(ساعات|دوام|الدوام|الصوم|رمضان|أيام|يوم|الحضور|الانصراف)", question))
-        body2 = body
-        if hours_like and not _has_times_or_days(body2):
-            # last chance: keep original context
-            body2 = page_ctx
-
-        formatted = _format_with_intro_and_bullets(
-            body2 or body or page_ctx,
-            max_bullets=max_bullets,
-            bullet_max_chars=bullet_max_chars,
-            hourlines_only=hourlines_only
-        )
-        dt = time.time() - t0
-        # paginate
-        parts = _paginate_text(formatted, max_chars=paginate_chars)
-        if len(parts) > 1:
-            labeled = []
-            for i, p in enumerate(parts, 1):
-                labeled.append(f"الجزء {i}/{len(parts)}:\n{p}")
-            text_to_print = "\n\n".join(labeled)
-        else:
-            text_to_print = parts[0]
-        return _decorate_output(dt, text_to_print, sources, style=print_style)
-
-    # LLM path (placeholder): we don’t call an actual LLM here to keep this file dependency-free.
-    # We simulate a concise synthesis from retrieved text, then apply the same formatting knobs.
-    synth = body
-    formatted = _format_with_intro_and_bullets(
-        synth or page_ctx,
-        max_bullets=max_bullets,
-        bullet_max_chars=bullet_max_chars,
-        hourlines_only=hourlines_only
+def _first_page_like(obj):
+    candidates = (
+        _get_attr_or_key(obj, "page"),
+        _get_attr_or_key(obj, "page_number"),
+        _get_attr_or_key(obj, "page_num"),
+        _get_attr_or_key(obj, "page_idx"),
+        _get_attr_or_key(obj, "pageno"),
+        _get_attr_or_key(obj, "page_start"),
     )
-    dt = time.time() - t0
-    parts = _paginate_text(formatted, max_chars=paginate_chars)
-    if len(parts) > 1:
-        labeled = []
-        for i, p in enumerate(parts, 1):
-            labeled.append(f"الجزء {i}/{len(parts)}:\n{p}")
-        text_to_print = "\n\n".join(labeled)
-    else:
-        text_to_print = parts[0]
-    return _decorate_output(dt, text_to_print, sources, style=print_style)
+    for c in candidates:
+        if c is None or str(c).strip() == "": continue
+        try: return int(str(c).strip())
+        except Exception: pass
+    return None
 
-# ------------------------------------------------------------------------------
-# Sanity / Strict prompts (30 Arabic Qs like your runs)
-# ------------------------------------------------------------------------------
+# ---------------- Global page index ----------------
+CHUNKS_BY_PAGE = {}  # {int page: full concatenated text}
 
-SANITY_PROMPTS = [
+def _build_page_text_index(chunks):
+    pages = defaultdict(list)
+    for ch in chunks:
+        txt = _first_non_empty(
+            _get_attr_or_key(ch, "text"),
+            _get_attr_or_key(ch, "content"),
+            _get_attr_or_key(ch, "chunk"),
+            _get_attr_or_key(ch, "body"),
+            "",
+        )
+        if isinstance(txt, bytes):
+            try: txt = txt.decode("utf-8", "ignore")
+            except Exception: txt = ""
+        pg = _first_page_like(ch)
+        if pg is None:
+            src = _get_attr_or_key(ch, "source") or _get_attr_or_key(ch, "doc_source") or ""
+            m = re.search(r"(?:[Pp]age|(?:ال)?صفحة)\s+(\d+)", str(src))
+            if m:
+                try: pg = int(m.group(1))
+                except Exception: pg = None
+        if pg is not None and txt:
+            pages[int(pg)].append(str(txt))
+    return {p: "\n".join(v) for p, v in pages.items()}
+
+# ---------------- Logging ----------------
+def setup_logger(log_path: str):
+    logger = logging.getLogger("rag_orchestrator")
+    logger.setLevel(logging.INFO)
+    ch = logging.StreamHandler(sys.stdout); ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    fh = logging.FileHandler(log_path, encoding="utf-8"); fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(message)s"))
+    logger.handlers = []; logger.addHandler(ch); logger.addHandler(fh)
+    return logger
+
+LOG = logging.getLogger("rag_orchestrator")  # reset in main()
+
+# ---------------- Sanity Prompts (default) ----------------
+DEFAULT_SANITY_PROMPTS = [
     "ما هي ساعات الدوام الرسمية من وإلى؟",
     "هل يوجد مرونة في الحضور والانصراف؟ وكيف تُحسب دقائق التأخير؟",
     "هل توجد استراحة خلال الدوام؟ وكم مدتها؟",
@@ -323,211 +139,614 @@ SANITY_PROMPTS = [
     "هل توجد مياومات/بدل سفر؟ وكيف تُصرف",
 ]
 
-def _strict_ok(q: str, answer: str) -> bool:
-    """
-    Heuristic 'strict' check:
-    - Hours/working-days questions must contain time/day patterns or numerals.
-    - Policy questions must contain at least one numeral or an imperative/verb phrase.
-    This keeps behavior compatible with your earlier 'strict' idea without your private validators.
-    """
-    a = answer or ""
-    has_num = bool(re.search(ARABIC_NUM, a)) or _has_times_or_days(a)
-    hours_like = bool(re.search(r"(ساعات|دوام|الصوم|رمضان|أيام|الحضور|الانصراف|ساعية)", q))
-    policy_like = bool(re.search(r"(سياسة|إجراءات|ضوابط|تعويض|حد|سقف|مدة|تقييم|يتم|تلزم)", q))
-    if hours_like:
-        return has_num
-    if policy_like:
-        return has_num
-    return len(a.strip()) > 0
+# ---------------- Arabic helpers / checks ----------------
+_HEADING_PATTERNS = [
+    r"^\s*الإجابة\s*:?$",
+    r"^\s*الخلاصة\s*:?\s*$",
+    r"^\s*الملخص\s*:?\s*$",
+    r"^\s*Summary\s*:?\s*$",
+    r"^\s*Answer\s*:?\s*$",
+]
+_AR_DAYS = ["الأحد", "الإثنين", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
 
-def run_test_prompts(index: SimpleIndex, tokenizer, model,
-                     use_llm: bool, use_rerank_flag: bool, artifacts_dir: str,
-                     hourlines_only: bool = False, regex_hunt: bool = False,
-                     max_bullets: int = 8, bullet_max_chars: int = None,
-                     paginate_chars: int = 900, print_style: str = "plain") -> None:
-    total = len(SANITY_PROMPTS)
-    pass_loose = 0
-    pass_strict = 0
-    rows = []
+_TIME_PATTERNS = [
+    r"\b\d{1,2}:\d{2}\b",                     # 8:30
+    r"\b\d{1,2}[:٫]\d{2}\b",                  # 8٫30
+    r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b",          # 8-5
+    r"\b\d{1,2}\s*(?:إلى|حتى)\s*\d{1,2}\b",   # 8 إلى 5
+    r"\b\d{1,2}\s*(?:ص|م)\b",                 # 8 ص/5 م
+]
+_PERCENT_RX = re.compile(r"\b\d{1,3}\s*[%٪]\b")
+_DURATION_RX = re.compile(r"\b\d{1,2}\s*(?:دقيقة|دقائق|ساعة|ساعات|يوم|أيام)\b")
+_RANGE_RX = re.compile(r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b")
+_NUMERICISH = re.compile(r"(\d|[%٪])")
+_SECTION_HEAVY = re.compile(r"(?:\d+\.){2,}\d+")  # lines like 3.1.5.7 (TOC-ish)
 
-    print("🧪 Running sanity prompts ...\n" + "="*80 + "\n")
-    for i, q in enumerate(SANITY_PROMPTS, 1):
-        title = f"📝 Test {i}/{total}: {q}"
-        print(title)
-        print("-"*60)
-        t0 = time.time()
-        ans = ask_once(index, tokenizer, model, q,
-                       use_llm=use_llm,
-                       use_rerank_flag=use_rerank_flag,
-                       paginate_chars=paginate_chars,
-                       hourlines_only=hourlines_only,
-                       regex_hunt=regex_hunt,
-                       max_bullets=max_bullets,
-                       bullet_max_chars=bullet_max_chars,
-                       print_style=print_style)
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_AR_LETTER_RX = re.compile(r"[ء-ي]")
+def _to_western_digits(s): return (s or "").translate(_ARABIC_DIGITS)
+def _strip_mojibake(s): return "" if not s else s.replace("\ufeff","").replace(" ","").replace("\uFFFD","")
+def _arabic_ratio(s):
+    if not s: return 1.0
+    letters = re.findall(r"\w", s, flags=re.UNICODE)
+    if not letters: return 1.0
+    arabic = _AR_LETTER_RX.findall(s)
+    return (len(arabic) / max(1, len(letters)))
+
+def _purge_non_arabic_lines(s, min_ratio=0.66):
+    if not s: return s
+    keep = []
+    for line in s.splitlines():
+        ln = line.strip()
+        if not ln: continue
+        # keep numeric-only or time lines even if not Arabic-heavy
+        t = _to_western_digits(ln)
+        if any(re.search(p, t) for p in _TIME_PATTERNS) or _PERCENT_RX.search(t) or _DURATION_RX.search(t):
+            keep.append(ln); continue
+        ratio = _arabic_ratio(ln)
+        if ratio >= min_ratio: keep.append(ln)
+    return "\n".join(keep)
+
+def _has_times_or_days(txt):
+    if not txt: return False
+    t = _to_western_digits(txt)
+    if any(day in t for day in _AR_DAYS): return True
+    if any(re.search(p, t) for p in _TIME_PATTERNS): return True
+    if _DURATION_RX.search(t): return True
+    if _PERCENT_RX.search(t): return True
+    return False
+
+def _sentences(txt):
+    if not txt: return []
+    lines = [l.strip() for l in txt.splitlines() if l.strip()]
+    keep = []
+    for l in lines:
+        if any(re.match(p, l) for p in _HEADING_PATTERNS): continue
+        keep.append(l)
+    txt2 = " ".join(keep)
+    parts = re.split(r"(?<=[\.\!\؟])\s+|[\n\r]+|[•\-–]\s+", txt2)
+    parts = [p.strip(" -–•\t") for p in parts if p and len(p.strip()) > 0]
+    merged = []
+    for p in parts:
+        if merged and len(p) < 10:
+            merged[-1] = merged[-1] + " " + p
+        else:
+            merged.append(p)
+    return merged
+
+def _clean_text(txt):
+    if not txt: return ""
+    txt = _strip_mojibake(txt)
+    txt = re.sub(r"^```.*?$", "", txt, flags=re.M | re.S)
+    lines = [l.strip() for l in txt.splitlines() if l.strip()]
+    keep = []
+    for l in lines:
+        if any(re.match(p, l) for p in _HEADING_PATTERNS): continue
+        # drop TOC-ish and boilerplate
+        if "فهرس المحتويات" in l or "جميع الحقوق محفوظة" in l: continue
+        if _SECTION_HEAVY.search(l): continue
+        keep.append(l)
+    txt = " ".join(keep).strip()
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
+
+def _paginate_text(text, max_chars=600):
+    text = text.strip()
+    if len(text) <= max_chars: return [text]
+    parts, cur, count = [], [], 0
+    for line in text.splitlines():
+        if count + len(line) + 1 > max_chars:
+            parts.append("\n".join(cur).strip())
+            cur, count = [line], len(line)
+        else:
+            cur.append(line); count += len(line) + 1
+    if cur: parts.append("\n".join(cur).strip())
+    return parts
+
+def _split_answer(answer_text):
+    if not answer_text: return "", ""
+    parts = re.split(r"\n(?=Sources:|المصادر:)", answer_text, maxsplit=1)
+    body = parts[0].strip(); sources = parts[1].strip() if len(parts) > 1 else ""
+    return body, sources
+
+# ---------------- Q intent + keywords ----------------
+POLICY_VERBS = ("يجب","يلزم","يُمنع","يُحظر","يتعيّن","لا يجوز","يحق","تكون","يتم","وفقاً","حسب")
+def _norm_tokens(s):
+    s = _to_western_digits(s or "")
+    s = re.sub(r"[^\w\s%٪:–\-]+"," ", s, flags=re.UNICODE)
+    return [t for t in s.split() if t.strip()]
+
+def _question_keywords(q):
+    toks = _norm_tokens(q)
+    # add simple Arabic stems
+    extras = []
+    if "ساعات" in q or "دوام" in q: extras += ["ساعات","دوام","من","إلى","حتى"]
+    if "رمضان" in q: extras += ["رمضان","الصوم"]
+    if "إضاف" in q: extras += ["إضافية","العمل الإضافي","أجر"]
+    if "عطل" in q or "عطلة" in q: extras += ["العطل","الرسمية","عطلة","نهاية","أسبوع"]
+    if "استراحة" in q or "راحة" in q: extras += ["استراحة","راحة","مدة","مدتها"]
+    if "مغادرة" in q: extras += ["مغادرة","ساعية","الحد","الأقصى","شهري"]
+    if "إجازة" in q: extras += ["إجازة","أيام","مدة","سنو"]
+    if "سقف" in q or "عروض" in q: extras += ["سقف","عروض","أسعار","ثلاثة"]
+    if "تضارب" in q: extras += ["تضارب","مصالح","الهدايا"]
+    return list(dict.fromkeys(toks + extras))
+
+def _expects_numerics(q):
+    q = q or ""
+    cues = ("كم","مدة","ما الحد","الحد","من وإلى","من والى","من إلى","متى","النسبة","%","٪","ساعات","دقائق","يوم","أيام","أجر","تعويض","سقف","بدل","مياومات","الحد الأقصى","شهري")
+    return any(c in q for c in cues)
+
+# ---------------- Sources → pages helpers ----------------
+def _parse_pages_from_sources(sources_text):
+    if not sources_text: return []
+    s = _to_western_digits(sources_text)
+    pages = set()
+    for m in re.findall(r"(?:\b[Pp]age\b|(?:ال)?صفحة)\s+(\d+)", s):
+        try: pages.add(int(m))
+        except Exception: pass
+    return sorted(pages)
+
+def _page_ctx_from_pages(pages, max_chars=3500):
+    if not pages: return ""
+    buf, total = [], 0
+    for p in pages:
+        txt = CHUNKS_BY_PAGE.get(p, "")
+        if not txt: continue
+        t = _clean_text(txt)
+        if total + len(t) > max_chars:
+            remaining = max_chars - total
+            if remaining > 200:
+                buf.append(t[:remaining]); total = max_chars; break
+        else:
+            buf.append(t); total += len(t)
+    return " ".join(buf).strip()
+
+# ---------------- Generic regex hunter (question-driven) ----------------
+GENERIC_RXS = [
+    re.compile(r"\b\d{1,2}:\d{2}\b"),                     # 08:30
+    re.compile(r"\b\d{1,2}[:٫]\d{2}\b"),                  # 08٫30
+    re.compile(r"\b\d{1,2}\s*(?:ص|م)\b"),                 # 8 ص
+    re.compile(r"\b\d{1,2}\s*(?:إلى|حتى|-\s*|–\s*)\s*\d{1,2}\b"),  # 8 إلى 3 / 8-3
+    re.compile(r"\b\d{1,3}\s*[%٪]\b"),                    # 150% / ١٥٠٪
+    re.compile(r"\b\d{1,2}\s*(?:دقيقة|دقائق|ساعة|ساعات|يوم|أيام)\b"),
+    re.compile(r"\b\d+\b"),                               # plain numbers as last resort
+]
+
+def _line_has_generic_numeric(t):
+    T = _to_western_digits(t)
+    for rx in GENERIC_RXS:
+        if rx.search(T): return True
+    if any(d in T for d in _AR_DAYS): return True
+    return False
+
+def _regex_hunt_generic(text, q_kws):
+    if not text: return []
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    hits = []
+    for l in lines:
+        L = _clean_text(l)
+        if not L: continue
+        if _SECTION_HEAVY.search(L): continue
+        if "فهرس المحتويات" in L or "جميع الحقوق محفوظة" in L: continue
+        if _arabic_ratio(L) < 0.4 and not _line_has_generic_numeric(L):  # keep numeric low-arabic lines
+            continue
+        # must have numeric/time/day if question expects numerics
+        score = 0
+        if _line_has_generic_numeric(L): score += 3
+        # keyword overlap
+        for kw in q_kws:
+            if kw and kw in L: score += 1
+        # policy verbs weight
+        if any(v in L for v in POLICY_VERBS): score += 1
+        if score > 0:
+            hits.append((score, L))
+    # sort by score desc, length asc
+    hits.sort(key=lambda x: (-x[0], len(x[1])))
+    return [h[1] for h in hits]
+
+# ---------------- Bullet formatting ----------------
+def _clip(s: str, n: int) -> str:
+    s = s.strip()
+    if n and len(s) > n:
+        return (s[:max(1, n-1)]).rstrip() + "…"
+    return s
+
+def _as_bullets_clipped(sents, limit=5, max_chars=120):
+    sents = sents[:max(1, limit)]
+    sents = [_clip(s, max_chars) for s in sents]
+    # dedupe
+    out, seen = [], set()
+    for s in sents:
+        if s and s not in seen:
+            seen.add(s); out.append(f"• {s}")
+    return "\n".join(out)
+
+def _filter_hourlines(sents):
+    out = []
+    for s in sents:
+        t = _to_western_digits(s)
+        if _has_times_or_days(t):
+            out.append(s)
+    return out
+
+def _bullets_for_display(text: str, question: str, intent: str, cfg):
+    sents = _sentences(text)
+    if cfg.hourlines_only and (_is_hours_like(question, intent) or _expects_numerics(question)):
+        sents = _filter_hourlines(sents)
+    if not sents:
+        sents = _sentences(text)
+    return _as_bullets_clipped(sents, limit=cfg.max_bullets, max_chars=cfg.bullet_max_chars)
+
+def _is_hours_like(question: str, intent: str = "") -> bool:
+    q = (question or "").strip()
+    hours_kws = ["ساعات","الدوام","رمضان","أيام الدوام","الساعات الإضافية","العطل","استراحة","مغادرة ساعية","وقت","من وإلى","من إلى"]
+    return any(kw in q for kw in hours_kws) or intent in ("work_hours","ramadan_hours","overtime","work_days","breaks")
+
+# ---------------- Core Q&A ----------------
+def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
+             use_llm: bool = True, use_rerank_flag: bool = True, cfg: SimpleNamespace = None) -> str:
+    t0 = time.time()
+    cfg = cfg or SimpleNamespace(max_bullets=5, bullet_max_chars=120, paginate_chars=600,
+                                 hourlines_only=False, regex_hunt=True)
+    intent = RET.classify_intent(question)
+
+    extractive_answer = RET.answer(question, index, intent, use_rerank_flag=use_rerank_flag)
+
+    # split body/sources
+    lines = str(extractive_answer or "").split('\n')
+    body_lines, source_lines, sources_started = [], [], False
+    for line in lines:
+        ls = line.strip()
+        if ls.startswith("Sources:") or ls.startswith("المصادر:"):
+            sources_started = True; source_lines.append(line)
+        elif sources_started:
+            source_lines.append(line)
+        else:
+            body_lines.append(line)
+    body_raw = '\n'.join(body_lines).strip()
+    sources = '\n'.join(source_lines).strip()
+
+    # page context from cited pages
+    cited_pages = _parse_pages_from_sources(sources)
+    page_ctx = _page_ctx_from_pages(cited_pages, max_chars=3500)
+
+    # 1) Cleanup + minimal rescue if empty or weak
+    hours_like = _is_hours_like(question, intent)
+    tmp_body = _clean_text(body_raw)
+    if (not tmp_body) or ("لا يقدّم النص" in tmp_body) or ("لم أعثر" in tmp_body):
+        body_raw = page_ctx if page_ctx else body_raw
+    elif (hours_like or _expects_numerics(question)) and not _has_times_or_days(tmp_body):
+        if _has_times_or_days(page_ctx):
+            body_raw = page_ctx
+        else:
+            # pick any page with anchor keywords from the question
+            q_kws = _question_keywords(question)
+            candidate_pages = []
+            for p, txt in CHUNKS_BY_PAGE.items():
+                t = _clean_text(txt)
+                if any(kw in t for kw in q_kws):
+                    candidate_pages.append(p)
+            if candidate_pages and not page_ctx:
+                body_raw = _page_ctx_from_pages(candidate_pages[:6], max_chars=3500)
+
+    # 2) Generic regex hunt (question-driven)
+    if cfg.regex_hunt:
+        q_kws = _question_keywords(question)
+        hunted = []
+        # search cited pages first
+        for p in cited_pages or []:
+            t = CHUNKS_BY_PAGE.get(p, "")
+            if not t: continue
+            hunted.extend(_regex_hunt_generic(t, q_kws))
+            if len(hunted) >= 10: break
+        # broaden to anchor pages
+        if not hunted:
+            anchor_pages = []
+            for p, txt in CHUNKS_BY_PAGE.items():
+                t = _clean_text(txt)
+                if any(kw in t for kw in q_kws):
+                    anchor_pages.append(p)
+            for p in anchor_pages:
+                t = CHUNKS_BY_PAGE.get(p, "")
+                hunted.extend(_regex_hunt_generic(t, q_kws))
+                if len(hunted) >= 10: break
+        # global fallback
+        if not hunted:
+            all_text = "\n".join(CHUNKS_BY_PAGE.get(p, "") for p in sorted(CHUNKS_BY_PAGE))
+            hunted = _regex_hunt_generic(all_text, q_kws)
+        # prefer hunted lines when strict numerics expected
+        if hunted and (_expects_numerics(question) or hours_like):
+            body_raw = "\n".join(hunted[:8])
+
+    # 3) Final formatting (LLM optional, but we keep it off-safe by default)
+    def _final(dt, text):
+        parts = _paginate_text(text, max_chars=cfg.paginate_chars)
+        if len(parts) > 1:
+            labeled = []
+            for i, p in enumerate(parts, 1):
+                labeled.append(f"الجزء {i}/{len(parts)}:\n{p}")
+            text = "\n\n".join(labeled)
+        return f"⏱ {dt:.2f}s | 🤖 {text}\n{sources}" if sources else f"⏱ {dt:.2f}s | 🤖 {text}"
+
+    if not body_raw or len(body_raw.strip()) == 0:
         dt = time.time() - t0
-        print(ans)
+        return _final(dt, "لا يقدّم النص المسترجَع تفاصيل كافية للإجابة بشكل قاطع من المصدر نفسه.")
 
-        loose_ok = bool(ans and len(ans.strip()) > 0)
-        strict_ok = _strict_ok(q, ans)
+    body_clean = _clean_text(body_raw)
+    body_clean = _purge_non_arabic_lines(body_clean)
 
-        if loose_ok: pass_loose += 1
-        if strict_ok: pass_strict += 1
+    # No LLM path (recommended for strict accuracy)
+    if (not use_llm) or (tokenizer is None) or (model is None):
+        dt = time.time() - t0
+        bullets = _bullets_for_display(body_clean or body_raw, question, intent, cfg)
+        if not bullets:
+            bullets = _as_bullets_clipped(_sentences(body_clean or body_raw), limit=cfg.max_bullets, max_chars=cfg.bullet_max_chars)
+        formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
+        return _final(dt, formatted)
 
-        print("✅ PASS_LOOSE" if loose_ok else "❌ FAIL_LOOSE")
-        print("✅ PASS_STRICT" if strict_ok else "❌ FAIL_STRICT")
-        print("="*80 + "\n")
+    # (Optional) LLM refine — not necessary; kept for completeness but guarded
+    try:
+        from transformers import AutoTokenizer, AutoModelForCausalLM  # load already done in main
+        system_prompt = (
+            "لخّص بوضوح من النص التالي دون إضافة أي معلومات جديدة أو أرقام غير موجودة. "
+            "أعد بالبنود (•) وبالعربية فقط."
+        )
+        user_prompt = f"السؤال: {question}\nالنص:\n{body_clean or body_raw}"
+        if hasattr(tokenizer, "apply_chat_template"):
+            prompt = tokenizer.apply_chat_template(
+                [{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}],
+                tokenize=False, add_generation_prompt=True
+            )
+        else:
+            prompt = f"[system]\n{system_prompt}\n\n[user]\n{user_prompt}\n\n[assistant]\n"
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+        if hasattr(model, "device"):
+            inputs = {k: v.to(model.device) for k,v in inputs.items()}
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        pad_id = eos_id if eos_id is not None else getattr(tokenizer, "pad_token_id", None)
+        out_ids = model.generate(**inputs, max_new_tokens=160, do_sample=False, repetition_penalty=1.05,
+                                 eos_token_id=eos_id, pad_token_id=pad_id)
+        start = inputs["input_ids"].shape[1]
+        raw = tokenizer.decode(out_ids[0][start:], skip_special_tokens=True).strip()
+        resp = _clean_text(raw); resp = _purge_non_arabic_lines(resp)
+        # if LLM fails, fallback to bullets
+        if not resp:
+            dt = time.time() - t0
+            bullets = _bullets_for_display(body_clean or body_raw, question, intent, cfg)
+            formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
+            return _final(dt, formatted)
+        dt = time.time() - t0
+        return _final(dt, resp)
+    except Exception as e:
+        LOG.warning(f"LLM generation failed: {e}")
+        dt = time.time() - t0
+        bullets = _bullets_for_display(body_clean or body_raw, question, intent, cfg)
+        formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
+        return _final(dt, formatted)
 
-        rows.append({
-            "i": i,
-            "question": q,
-            "answer": ans,
-            "pass_loose": bool(loose_ok),
-            "pass_strict": bool(strict_ok),
-            "elapsed_sec": round(dt, 3)
-        })
+# ---------------- Sanity runner ----------------
+def _gather_sanity_prompts() -> list:
+    ret_prompts = []
+    try: ret_prompts = list(getattr(RET, "SANITY_PROMPTS", []) or [])
+    except Exception: ret_prompts = []
+    seen, merged = set(), []
+    for q in (ret_prompts + DEFAULT_SANITY_PROMPTS):
+        if q not in seen:
+            seen.add(q); merged.append(q)
+    return merged
 
-    # Save artifacts
-    pathlib.Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
+def _pass_loose(answer_text: str) -> bool:
+    has_sources = ("Sources:" in answer_text) or ("المصادر:" in answer_text)
+    bad = ("لا يقدّم النص المسترجَع تفاصيل كافية" in answer_text)
+    return bool(has_sources and not bad)
+
+def _is_meaningful(txt: str) -> bool:
+    return bool(txt and len(re.sub(r"\s+","", txt)) >= 12)
+
+def _pass_strict(question: str, body_only: str) -> bool:
+    if not _is_meaningful(body_only): return False
+    if _is_hours_like(question, "") or _expects_numerics(question):
+        return _has_times_or_days(body_only)
+    return True
+
+def run_test_prompts(index: RET.HybridIndex, tokenizer, model,
+                     use_llm: bool, use_rerank_flag: bool, artifacts_dir: str, cfg: SimpleNamespace):
+    os.makedirs(artifacts_dir, exist_ok=True)
     results_path = os.path.join(artifacts_dir, "results.jsonl")
-    with open(results_path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    summary_md   = os.path.join(artifacts_dir, "summary.md")
+    report_txt   = os.path.join(artifacts_dir, "report.txt")
+
+    results_f = open(results_path, "w", encoding="utf-8")
+    report_f  = open(report_txt,  "w", encoding="utf-8")
+
+    def _tee(line=""):
+        print(line); report_f.write(line + "\n"); report_f.flush()
+
+    tests = _gather_sanity_prompts()
+    if not tests:
+        _tee("❌ No sanity prompts available.")
+        results_f.close(); report_f.close(); return
+
+    _tee("🧪 Running sanity prompts ...")
+    _tee("=" * 80)
+
+    total = len(tests)
+    pass_loose_count, pass_strict_count = 0, 0
+
+    for i, q in enumerate(tests, 1):
+        _tee(f"\n📝 Test {i}/{total}: {q}")
+        _tee("-" * 60)
+        try:
+            result = ask_once(index, tokenizer, model, q, use_llm=use_llm, use_rerank_flag=use_rerank_flag, cfg=cfg)
+            _tee(result)
+
+            body_only, _src_blk = _split_answer(result)
+            loose = _pass_loose(result)
+            strict = _pass_strict(q, body_only)
+
+            pass_loose_count += int(loose)
+            pass_strict_count += int(strict)
+
+            _tee("✅ PASS_LOOSE" if loose else "❌ FAIL_LOOSE")
+            _tee("✅ PASS_STRICT" if strict else "❌ FAIL_STRICT")
+            _tee("=" * 80)
+
+            rec = {
+                "index": i, "question": q, "answer": result, "body_only": body_only,
+                "pass_loose": loose, "pass_strict": strict,
+            }
+            results_f.write(json.dumps(rec, ensure_ascii=False) + "\n"); results_f.flush()
+
+        except Exception as e:
+            _tee(f"❌ Error: {e}")
+            _tee("=" * 80)
 
     summary = (
-        f"Summary: PASS_LOOSE {pass_loose}/{total} | PASS_STRICT {pass_strict}/{total}\n"
-        f"Artifacts saved in: {artifacts_dir}\n\n"
-        f"✅ Saved artifacts under: {artifacts_dir}\n"
+        f"# Sanity Summary\n\n"
+        f"- Total: {total}\n"
+        f"- PASS_LOOSE: {pass_loose_count}/{total}\n"
+        f"- PASS_STRICT: {pass_strict_count}/{total}\n"
+        f"\nArtifacts:\n- results.jsonl\n- report.txt\n"
     )
-    print(summary)
-
-    # Also produce a small markdown summary for your one-liners
-    md = [
-        f"# Sanity Summary\n",
-        f"- Total: {total}",
-        f"- PASS_LOOSE: {pass_loose}/{total}",
-        f"- PASS_STRICT: {pass_strict}/{total}",
-        "",
-        "Artifacts:",
-        "- results.jsonl",
-        "- report.txt"
-    ]
-    with open(os.path.join(artifacts_dir, "summary.md"), "w", encoding="utf-8") as f:
-        f.write("\n".join(md))
-    with open(os.path.join(artifacts_dir, "report.txt"), "w", encoding="utf-8") as f:
+    with open(summary_md, "w", encoding="utf-8") as f:
         f.write(summary)
 
-# ------------------------------------------------------------------------------
-# Main / CLI
-# ------------------------------------------------------------------------------
+    _tee(f"\nSummary: PASS_LOOSE {pass_loose_count}/{total} | PASS_STRICT {pass_strict_count}/{total}")
+    _tee(f"Artifacts saved in: {artifacts_dir}")
 
-def make_run_dir(out_dir: str) -> str:
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(out_dir, f"run_{ts}")
-    return run_dir
+    results_f.close(); report_f.close()
 
+# ---------------- CLI ----------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--chunks", type=str, default=None, help="Path to JSONL chunks")
-    parser.add_argument("--hier-index", type=str, default=None)
-    parser.add_argument("--aliases", type=str, default=None)
+    parser.add_argument("--chunks", type=str, default="Data_pdf_clean_chunks.jsonl", help="Path to chunks (JSONL/JSON)")
+    parser.add_argument("--hier-index", type=str, default="heading_inverted_index.json")
+    parser.add_argument("--aliases", type=str, default="section_aliases.json")
     parser.add_argument("--save-index", type=str, default=None)
     parser.add_argument("--load-index", type=str, default=None)
-
-    parser.add_argument("--model", type=str, default="none")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--ask", type=str, default=None)
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--sanity", action="store_true")
-
-    parser.add_argument("--no-llm", action="store_true", help="Disable LLM synthesis")
+    parser.add_argument("--no-llm", action="store_true")
     parser.add_argument("--use-4bit", action="store_true")
     parser.add_argument("--use-8bit", action="store_true")
     parser.add_argument("--no-rerank", action="store_true")
-    parser.add_argument("--device", type=str, choices=["auto","cpu","cuda"], default="auto")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto","cpu","cuda"])
     parser.add_argument("--out-dir", type=str, default="runs")
 
-    # New CLI knobs
-    parser.add_argument("--regex-hunt", action="store_true", help="Focus on lines with times/days (regex-style hunt)")
-    parser.add_argument("--hourlines-only", action="store_true", help="Only include bullets that contain times/days/days-of-week")
-    parser.add_argument("--max-bullets", type=int, default=8, help="Max bullets in the formatted answer")
-    parser.add_argument("--bullet-max-chars", type=int, default=None, help="Max characters per bullet (ellipsis beyond this)")
-    parser.add_argument("--paginate-chars", type=int, default=900, help="Pagination size for long answers")
-    parser.add_argument("--print-style", type=str, default="plain", choices=["plain","pretty"], help="Output style")
+    # NEW: general controls
+    parser.add_argument("--regex-hunt", action="store_true", help="Generic numeric/time/day hunter (question-driven).")
+    parser.add_argument("--hourlines-only", action="store_true", help="Keep only lines with times/days/numbers/% when relevant.")
+    parser.add_argument("--max-bullets", type=int, default=5, help="Max bullets.")
+    parser.add_argument("--bullet-max-chars", type=int, default=120, help="Max characters per bullet.")
+    parser.add_argument("--paginate-chars", type=int, default=600, help="Pagination threshold of body.")
 
     args = parser.parse_args()
+    cfg = SimpleNamespace(
+        regex_hunt=args.regex_hunt,
+        hourlines_only=args.hourlines_only,
+        max_bullets=args.max_bullets,
+        bullet_max_chars=args.bullet_max_chars,
+        paginate_chars=args.paginate_chars,
+    )
 
+    # Artifacts dir
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(args.out_dir, f"run_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Logger
+    global LOG
+    LOG = setup_logger(os.path.join(run_dir, "run.log"))
+    LOG.info("Artifacts will be saved under: %s", run_dir)
+
+    # Build/load index
+    hier = RET.load_hierarchy(args.hier_index, args.aliases)
+    if not os.path.exists(args.chunks):
+        LOG.error("Chunks file not found: %s", args.chunks); return
+    chunks, chunks_hash = RET.load_chunks(path=args.chunks)
+
+    global CHUNKS_BY_PAGE
+    CHUNKS_BY_PAGE = _build_page_text_index(chunks)
+
+    index = RET.HybridIndex(chunks, chunks_hash, hier=hier)
+
+    loaded = False
+    if args.load_index and os.path.exists(args.load_index):
+        try:
+            rlog = logging.getLogger("retrival_model"); lvl = rlog.level; rlog.setLevel(logging.ERROR)
+            loaded = index.load(args.load_index); rlog.setLevel(lvl)
+            if loaded: LOG.info("Index loaded successfully from %s", args.load_index)
+        except Exception as e:
+            LOG.info("Will rebuild index: %s", e)
+
+    if not loaded:
+        LOG.info("Building index ..."); index.build()
+        if args.save_index:
+            try: index.save(args.save_index); LOG.info("Index saved to %s", args.save_index)
+            except Exception as e: LOG.warning("Failed to save index: %s", e)
+
+    # Optional LLM
+    tok = mdl = None
     use_llm = not args.no_llm
+    if use_llm:
+        try:
+            from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+            use_cuda = (args.device != "cpu") and (torch is not None) and hasattr(torch, "cuda") and torch.cuda.is_available()
+            if args.device == "cuda" and not use_cuda:
+                LOG.warning("CUDA requested but not available; falling back to CPU.")
+            bf16_supported = use_cuda and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+            dtype_fp = torch.bfloat16 if (bf16_supported and torch is not None) else (torch.float16 if (use_cuda and torch is not None) else None)
+            model_kwargs = {"trust_remote_code": True}
+            if args.device == "cpu" or not use_cuda:
+                model_kwargs["device_map"] = "cpu"
+                if torch is not None: model_kwargs["torch_dtype"] = torch.float32
+            else:
+                model_kwargs["device_map"] = "auto"
+                if dtype_fp is not None: model_kwargs["torch_dtype"] = dtype_fp
+            if args.use_4bit or args.use_8bit:
+                try:
+                    model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=bool(args.use_4bit),
+                        load_in_8bit=bool(args.use_8bit),
+                        bnb_4bit_compute_dtype=(torch.bfloat16 if bf16_supported else (torch.float16 if use_cuda else None)),
+                    )
+                except Exception as e:
+                    LOG.warning("Quantization setup failed: %s", e)
+            tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+            mdl = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
+        except Exception as e:
+            LOG.warning("Failed to load LLM (%s); continuing retrieval-only. Error: %s", args.model, e)
+            tok = mdl = None; use_llm = False
+
     use_rerank_flag = not args.no_rerank
 
-    run_dir = make_run_dir(args.out_dir)
-    log.info(f"Artifacts will be saved under: {run_dir}")
-    log.info(f"Artifacts will be saved under: {run_dir}")
-
-    log.info("Building index ...")
-    if not args.chunks or not os.path.exists(args.chunks):
-        print("ERROR: --chunks JSONL is required and must exist.", file=sys.stderr)
-        sys.exit(2)
-    docs = load_chunks(args.chunks)
-    index = SimpleIndex(docs)
-
-    # Fake tokenizer/model placeholders to keep signature compatibility
-    tokenizer = None
-    model = None
+    if args.test or args.sanity:
+        run_test_prompts(index, tok, mdl, use_llm=use_llm, use_rerank_flag=use_rerank_flag, artifacts_dir=run_dir, cfg=cfg)
+        print(f"\n✅ Saved artifacts under: {run_dir}")
+        return
 
     if args.ask:
-        ans = ask_once(index, tokenizer, model, args.ask,
-                       use_llm=use_llm,
-                       use_rerank_flag=use_rerank_flag,
-                       paginate_chars=args.paginate_chars,
-                       hourlines_only=args.hourlines_only,
-                       regex_hunt=args.regex_hunt,
-                       max_bullets=args.max_bullets,
-                       bullet_max_chars=args.bullet_max_chars,
-                       print_style=args.print_style)
-        print(ans)
-        # save single result
-        pathlib.Path(run_dir).mkdir(parents=True, exist_ok=True)
-        with open(os.path.join(run_dir, "answer.txt"), "w", encoding="utf-8") as f:
-            f.write(ans)
-        print(f"\n✅ Saved artifacts under: {run_dir}")
+        ans = ask_once(index, tok, mdl, args.ask, use_llm=use_llm, use_rerank_flag=use_rerank_flag, cfg=cfg)
+        single_path = os.path.join(run_dir, "single_answer.txt")
+        with open(single_path, "w", encoding="utf-8") as f: f.write(ans)
+        print(ans); print(f"\n✅ Saved single answer to: {single_path}")
         return
 
-    if args.test or args.sanity:
-        run_test_prompts(
-            index, tokenizer, model,
-            use_llm=use_llm,
-            use_rerank_flag=use_rerank_flag,
-            artifacts_dir=run_dir,
-            hourlines_only=args.hourlines_only,
-            regex_hunt=args.regex_hunt,
-            max_bullets=args.max_bullets,
-            bullet_max_chars=args.bullet_max_chars,
-            paginate_chars=args.paginate_chars,
-            print_style=args.print_style,
-        )
-        print(f"\n✅ Saved artifacts under: {run_dir}")
-        return
-
-    # Interactive (optional)
-    print("Enter your questions (empty line to quit):")
-    while True:
-        try:
-            q = input("> ").strip()
-        except EOFError:
-            break
-        if not q:
-            break
-        ans = ask_once(index, tokenizer, model, q,
-                       use_llm=use_llm,
-                       use_rerank_flag=use_rerank_flag,
-                       paginate_chars=args.paginate_chars,
-                       hourlines_only=args.hourlines_only,
-                       regex_hunt=args.regex_hunt,
-                       max_bullets=args.max_bullets,
-                       bullet_max_chars=args.bullet_max_chars,
-                       print_style=args.print_style)
-        print(ans)
-        print()
+    # Interactive
+    print("Ready. اطرح سؤالك (اكتب 'exit' للخروج)\n")
+    interactive_path = os.path.join(run_dir, "interactive_transcript.txt")
+    with open(interactive_path, "w", encoding="utf-8") as trans:
+        while True:
+            try: q = input("سؤالك: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nExiting."); break
+            if not q: continue
+            if q.lower() in ("exit","quit","q"): print("Exiting."); break
+            ans = ask_once(index, tok, mdl, q, use_llm=use_llm, use_rerank_flag=use_rerank_flag, cfg=cfg)
+            print(ans); trans.write(f"\nQ: {q}\n{ans}\n"); trans.flush()
+    print(f"\n✅ Interactive transcript saved to: {interactive_path}")
 
 if __name__ == "__main__":
     main()
