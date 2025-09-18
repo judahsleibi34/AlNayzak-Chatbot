@@ -371,7 +371,9 @@ def _regex_hunt_generic(text, q_kws):
             "تعويض", "يحتسب", "يعتمد", "يتطلب", "يلزم", "يجب", "لا يجوز", "يحق", "وفق", "حسب",
             "دوام", "ساعات", "اجازه", "اجازات", "عطله", "العطل", "مغادره", "استراحه",
             "بدل", "بدل مواصلات", "مياومات", "بدل سفر", "رواتب", "صرف", "موعد", "الحضور", "الجداول الزمنيه",
-            "عروض اسعار", "ثلاثه عروض", "تضارب المصالح",
+            "عروض اسعار", "عرض سعر", "عروض", "مناقصة", "توريد", "تضارب المصالح",
+            # currencies / money cues
+            "شيكل", "شواقل", "دينار", "دولار", "₪"
         ]
         domain_kws = set(DOMAIN_KWS_AR + (q_kws or []))
         if _line_has_generic_numeric(L) and any(kw in T for kw in domain_kws):
@@ -445,17 +447,57 @@ INTENT_ALIASES_AR = {
 }
 
 def _find_anchor_pages_by_alias_ar(hier, alias_keywords):
+    """Robustly iterate headings from various hierarchy shapes (dict/object/list)."""
     pages = []
     if not hier or not alias_keywords:
         return pages
+
+    def _iter_headings(h):
+        # dict-like
+        if isinstance(h, dict):
+            for key in ("headings", "nodes", "sections", "items"):
+                v = h.get(key)
+                if isinstance(v, list):
+                    return v
+        # object-like
+        for key in ("headings", "nodes", "sections", "items"):
+            v = getattr(h, key, None)
+            if isinstance(v, list):
+                return v
+        # maybe nested container
+        for key in ("data", "root"):
+            v = getattr(h, key, None)
+            if isinstance(v, list):
+                return v
+        # list already
+        if isinstance(h, list):
+            return h
+        return []
+
+    def _hget(obj, key, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        val = getattr(obj, key, None)
+        if val is not None:
+            return val
+        meta = getattr(obj, "meta", None) or getattr(obj, "__dict__", None)
+        if isinstance(meta, dict):
+            return meta.get(key, default)
+        return default
+
     normalized_aliases = [_normalize_text_ar(a) for a in alias_keywords]
-    for h in hier.get("headings", []):
-        title = _normalize_text_ar(str(h.get("title","")))
+    for h in _iter_headings(hier):
+        title = _normalize_text_ar(str(_hget(h, "title", "") or _hget(h, "name", "") or _hget(h, "heading", "")))
         if any(a in title for a in normalized_aliases):
-            if "page_start" in h:
-                pages.append(int(h["page_start"]))
-            if "page_end" in h and h["page_end"] != h.get("page_start"):
-                pages.append(int(h["page_end"]))
+            ps = _hget(h, "page_start", _hget(h, "pageno", _hget(h, "page", None)))
+            pe = _hget(h, "page_end", None)
+            try:
+                if ps is not None:
+                    pages.append(int(ps))
+                if pe is not None and pe != ps:
+                    pages.append(int(pe))
+            except Exception:
+                pass
     return sorted(set(pages))[:10]
 
 # ---------------- Core Q&A ----------------
@@ -528,7 +570,11 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
             if _is_hours_like(question, intent):
                 alias_list = INTENT_ALIASES_AR["work_hours"]
 
-    anchor_pages = _find_anchor_pages_by_alias_ar(index.hier, alias_list)
+    try:
+        anchor_pages = _find_anchor_pages_by_alias_ar(index.hier, alias_list)
+    except Exception as e:
+        LOG.warning("anchor_pages failed: %s", e)
+        anchor_pages = []
     if anchor_pages:
         anchored_ctx = _page_ctx_from_pages(anchor_pages, max_chars=3500)
         if anchored_ctx:
