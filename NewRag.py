@@ -1,16 +1,17 @@
+
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — Generic edge-case hardening:
-- Page-aware fallback (from cited pages, then anchors, then global)
-- Generic regex hunter for numbers/times/days/%/durations
-- Signal-based sentence ranking (numeric/time/day signals + keyword overlap)
-- Arabic cleanup + heading/TOC/boilerplate suppression
-- Short, clipped bullets with pagination
-- Still strictly grounded (no new facts), LLM optional but not required
+RAG Orchestrator (Arabic) — no-bias priors & strictness booster
+- Data-driven section priors derived at runtime from the *current* PDF headings (no section numbers)
+- Soft prior boosting (never filters) + page/window ordering using priors first
+- Negation-aware scoring for approval-type intents
+- Numeric/time/day strictness recovery loop
+- Backwards-compatible with existing retrival_model (RET) contract
 
-Usage (typical):
-python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --sanity --device cuda --use-4bit --no-llm \
-  --regex-hunt --hourlines-only --max-bullets 5 --bullet-max-chars 120 --paginate-chars 600 --out-dir runs
+This is a drop-in replacement for NewRag.py (renamed to NewRag_no_bias.py).
+
+Usage example:
+python NewRag_no_bias.py --chunks Data_pdf_clean_chunks.jsonl --sanity --no-llm --regex-hunt --hourlines-only --out-dir runs
 """
 
 import os, sys, re, json, time, argparse, logging
@@ -30,6 +31,8 @@ except Exception:
 
 # Your retriever module
 import retrival_model as RET
+from prior_deriver import derive_section_priors
+from intent_patterns import norm
 
 # ---------------- Utilities for dict-or-object chunks ----------------
 def _get_attr_or_key(obj, key, default=None):
@@ -251,29 +254,33 @@ def _split_answer(answer_text):
 
 # ---------------- Q intent + keywords ----------------
 POLICY_VERBS = ("يجب","يلزم","يُمنع","يُحظر","يتعيّن","لا يجوز","يحق","تكون","يتم","وفقاً","حسب")
+NEG = ["لا","غير","عدم","دون","إلا","لا يتم","لا يجوز"]
+REQ = ["موافقه","اذن","كتابي","خطي","مسبق","اعتماد"]
+
 def _norm_tokens(s):
     s = _to_western_digits(s or "")
     s = re.sub(r"[^\w\s%٪:–\-]+"," ", s, flags=re.UNICODE)
     return [t for t in s.split() if t.strip()]
 
 def _question_keywords(q):
-    toks = _norm_tokens(q)
-    # add simple Arabic stems
+    qn = norm(q or "")
+    toks = _norm_tokens(qn)
+    # add simple stems/anchors
     extras = []
-    if "ساعات" in q or "دوام" in q: extras += ["ساعات","دوام","من","إلى","حتى"]
-    if "رمضان" in q: extras += ["رمضان","الصوم"]
-    if "إضاف" in q: extras += ["إضافية","العمل الإضافي","أجر"]
-    if "عطل" in q or "عطلة" in q: extras += ["العطل","الرسمية","عطلة","نهاية","أسبوع"]
-    if "استراحة" in q or "راحة" in q: extras += ["استراحة","راحة","مدة","مدتها"]
-    if "مغادرة" in q: extras += ["مغادرة","ساعية","الحد","الأقصى","شهري"]
-    if "إجازة" in q: extras += ["إجازة","أيام","مدة","سنو"]
-    if "سقف" in q or "عروض" in q: extras += ["سقف","عروض","أسعار","ثلاثة"]
-    if "تضارب" in q: extras += ["تضارب","مصالح","الهدايا"]
+    if "ساعات" in qn or "دوام" in qn: extras += ["ساعات","دوام","من","إلى","حتى"]
+    if "رمضان" in qn: extras += ["رمضان","الصوم"]
+    if "اضاف" in qn: extras += ["اضافيه","العمل الاضافي","اجر"]
+    if "عطل" in qn or "عطله" in qn: extras += ["العطل","الرسمية","عطله","نهاية","أسبوع"]
+    if "استراح" in qn or "راحه" in qn: extras += ["استراحه","راحه","مده","مدتها"]
+    if "مغادر" in qn: extras += ["مغادره","ساعيه","الحد","الاقصى","شهري"]
+    if "اجازه" in qn: extras += ["اجازه","ايام","مده","سنو"]
+    if "سقف" in qn or "عروض" in qn: extras += ["سقف","عروض","اسعار","ثلاثه"]
+    if "تضارب" in qn: extras += ["تضارب","مصالح","الهدايا"]
     return list(dict.fromkeys(toks + extras))
 
 def _expects_numerics(q):
-    q = q or ""
-    cues = ("كم","مدة","ما الحد","الحد","من وإلى","من والى","من إلى","متى","النسبة","%","٪","ساعات","دقائق","يوم","أيام","أجر","تعويض","سقف","بدل","مياومات","الحد الأقصى","شهري")
+    q = norm(q or "")
+    cues = ("كم","مده","ما الحد","الحد","من وإلى","من والى","من الى","متى","النسبة","%","٪","ساعات","دقائق","يوم","أيام","اجر","تعويض","سقف","بدل","مياومات","الحد الاقصى","شهري")
     return any(c in q for c in cues)
 
 # ---------------- Sources → pages helpers ----------------
@@ -309,8 +316,10 @@ GENERIC_RXS = [
     re.compile(r"\b\d{1,2}\s*(?:إلى|حتى|-\s*|–\s*)\s*\d{1,2}\b"),  # 8 إلى 3 / 8-3
     re.compile(r"\b\d{1,3}\s*[%٪]\b"),                    # 150% / ١٥٠٪
     re.compile(r"\b\d{1,2}\s*(?:دقيقة|دقائق|ساعة|ساعات|يوم|أيام)\b"),
-    re.compile(r"\b\d+\b"),                               # plain numbers as last resort
+    re.compile(r"\b\d+\b"),                               # plain numbers
 ]
+
+ACCOUNTING_BAN = {"اهلاك","الاستهلاك","أصل","الاصول","الميزانيه","الاهلاك","القيمه الدفتريه"}
 
 def _line_has_generic_numeric(t):
     T = _to_western_digits(t)
@@ -319,7 +328,7 @@ def _line_has_generic_numeric(t):
     if any(d in T for d in _AR_DAYS): return True
     return False
 
-def _regex_hunt_generic(text, q_kws):
+def _regex_hunt_generic(text, q_kws, intent=None):
     if not text: return []
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     hits = []
@@ -328,19 +337,25 @@ def _regex_hunt_generic(text, q_kws):
         if not L: continue
         if _SECTION_HEAVY.search(L): continue
         if "فهرس المحتويات" in L or "جميع الحقوق محفوظة" in L: continue
-        if _arabic_ratio(L) < 0.4 and not _line_has_generic_numeric(L):  # keep numeric low-arabic lines
+        if _arabic_ratio(L) < 0.4 and not _line_has_generic_numeric(L):
             continue
-        # must have numeric/time/day if question expects numerics
+        # ban accounting lexemes for non-finance intents
+        if intent in ("work_hours","ramadan_hours","overtime","annual_leave","sick_leave","hourly_exit"):
+            if any(b in L for b in ACCOUNTING_BAN): 
+                continue
         score = 0
         if _line_has_generic_numeric(L): score += 3
-        # keyword overlap
         for kw in q_kws:
-            if kw and kw in L: score += 1
-        # policy verbs weight
+            if kw and kw in norm(L): score += 1
         if any(v in L for v in POLICY_VERBS): score += 1
+        # polarity preference for approval-type intents
+        if intent in ("overtime","salary_advance","remote_work","hourly_exit"):
+            has_req = any(k in norm(L) for k in REQ)
+            has_neg = any(k in norm(L) for k in NEG)
+            if has_req and not has_neg: score += 3
+            if has_req and has_neg: score -= 3
         if score > 0:
             hits.append((score, L))
-    # sort by score desc, length asc
     hits.sort(key=lambda x: (-x[0], len(x[1])))
     return [h[1] for h in hits]
 
@@ -354,7 +369,6 @@ def _clip(s: str, n: int) -> str:
 def _as_bullets_clipped(sents, limit=5, max_chars=120):
     sents = sents[:max(1, limit)]
     sents = [_clip(s, max_chars) for s in sents]
-    # dedupe
     out, seen = [], set()
     for s in sents:
         if s and s not in seen:
@@ -378,18 +392,23 @@ def _bullets_for_display(text: str, question: str, intent: str, cfg):
     return _as_bullets_clipped(sents, limit=cfg.max_bullets, max_chars=cfg.bullet_max_chars)
 
 def _is_hours_like(question: str, intent: str = "") -> bool:
-    q = (question or "").strip()
-    hours_kws = ["ساعات","الدوام","رمضان","أيام الدوام","الساعات الإضافية","العطل","استراحة","مغادرة ساعية","وقت","من وإلى","من إلى"]
+    q = norm((question or "").strip())
+    hours_kws = ["ساعات","الدوام","رمضان","ايام الدوام","الساعات الاضافيه","العطل","استراحه","مغادره ساعيه","وقت","من الى","من وإلى"]
     return any(kw in q for kw in hours_kws) or intent in ("work_hours","ramadan_hours","overtime","work_days","breaks")
 
 # ---------------- Core Q&A ----------------
 def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
-             use_llm: bool = True, use_rerank_flag: bool = True, cfg: SimpleNamespace = None) -> str:
+             use_llm: bool = True, use_rerank_flag: bool = True, cfg: SimpleNamespace = None, hier=None) -> str:
     t0 = time.time()
     cfg = cfg or SimpleNamespace(max_bullets=5, bullet_max_chars=120, paginate_chars=600,
                                  hourlines_only=False, regex_hunt=True)
     intent = RET.classify_intent(question)
 
+    # --------- derive priors from current document (NO section numbers) ---------
+    priors = derive_section_priors(intent, hier or [])  # {"pages": set[int], "headings": [...]}
+    prior_pages = list(priors.get("pages", []))
+
+    # Use existing extractive path first (keeps compatibility)
     extractive_answer = RET.answer(question, index, intent, use_rerank_flag=use_rerank_flag)
 
     # split body/sources
@@ -406,74 +425,80 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
     body_raw = '\n'.join(body_lines).strip()
     sources = '\n'.join(source_lines).strip()
 
-    # page context from cited pages
+    # pages from citations + priors (priors first)
     cited_pages = _parse_pages_from_sources(sources)
-    page_ctx = _page_ctx_from_pages(cited_pages, max_chars=3500)
+    ordered_pages = (prior_pages or []) + [p for p in cited_pages if p not in prior_pages]
+
+    # Build page context preferring prior pages
+    page_ctx = _page_ctx_from_pages(ordered_pages, max_chars=3500)
 
     # 1) Cleanup + minimal rescue if empty or weak
     hours_like = _is_hours_like(question, intent)
     tmp_body = _clean_text(body_raw)
     if (not tmp_body) or ("لا يقدّم النص" in tmp_body) or ("لم أعثر" in tmp_body):
-        body_raw = page_ctx if page_ctx else body_raw
+        if page_ctx:
+            body_raw = page_ctx
     elif (hours_like or _expects_numerics(question)) and not _has_times_or_days(tmp_body):
         if _has_times_or_days(page_ctx):
             body_raw = page_ctx
-        else:
-            # pick any page with anchor keywords from the question
-            q_kws = _question_keywords(question)
-            candidate_pages = []
-            for p, txt in CHUNKS_BY_PAGE.items():
-                t = _clean_text(txt)
-                if any(kw in t for kw in q_kws):
-                    candidate_pages.append(p)
-            if candidate_pages and not page_ctx:
-                body_raw = _page_ctx_from_pages(candidate_pages[:6], max_chars=3500)
 
-    # 2) Generic regex hunt (question-driven)
+    # 2) Generic regex hunt (question-driven) — prefer prior pages
     if cfg.regex_hunt:
         q_kws = _question_keywords(question)
         hunted = []
-        # search cited pages first
-        for p in cited_pages or []:
-            t = CHUNKS_BY_PAGE.get(p, "")
-            if not t: continue
-            hunted.extend(_regex_hunt_generic(t, q_kws))
-            if len(hunted) >= 10: break
-        # broaden to anchor pages
-        if not hunted:
-            anchor_pages = []
-            for p, txt in CHUNKS_BY_PAGE.items():
-                t = _clean_text(txt)
-                if any(kw in t for kw in q_kws):
-                    anchor_pages.append(p)
-            for p in anchor_pages:
+        # search prior pages first
+        if prior_pages:
+            for p in prior_pages:
                 t = CHUNKS_BY_PAGE.get(p, "")
-                hunted.extend(_regex_hunt_generic(t, q_kws))
+                if not t: continue
+                hunted.extend(_regex_hunt_generic(t, q_kws, intent=intent))
                 if len(hunted) >= 10: break
-        # global fallback
+        # then cited pages
+        if not hunted and cited_pages:
+            for p in cited_pages:
+                t = CHUNKS_BY_PAGE.get(p, "")
+                if not t: continue
+                hunted.extend(_regex_hunt_generic(t, q_kws, intent=intent))
+                if len(hunted) >= 10: break
+        # global fallback ordered by priors first
         if not hunted:
-            all_text = "\n".join(CHUNKS_BY_PAGE.get(p, "") for p in sorted(CHUNKS_BY_PAGE))
-            hunted = _regex_hunt_generic(all_text, q_kws)
+            all_pages = (prior_pages or []) + [p for p in sorted(CHUNKS_BY_PAGE) if p not in prior_pages]
+            for p in all_pages:
+                t = CHUNKS_BY_PAGE.get(p, "")
+                hunted.extend(_regex_hunt_generic(t, q_kws, intent=intent))
+                if len(hunted) >= 10: break
         # prefer hunted lines when strict numerics expected
         if hunted and (_expects_numerics(question) or hours_like):
             body_raw = "\n".join(hunted[:8])
 
     # 3) Final formatting (LLM optional, but we keep it off-safe by default)
-    def _final(dt, text):
+    def _final(dt, text, srcs):
         parts = _paginate_text(text, max_chars=cfg.paginate_chars)
         if len(parts) > 1:
             labeled = []
             for i, p in enumerate(parts, 1):
                 labeled.append(f"الجزء {i}/{len(parts)}:\n{p}")
             text = "\n\n".join(labeled)
-        return f"⏱ {dt:.2f}s | 🤖 {text}\n{sources}" if sources else f"⏱ {dt:.2f}s | 🤖 {text}"
+        return f"⏱ {dt:.2f}s | 🤖 {text}\n{srcs}" if srcs else f"⏱ {dt:.2f}s | 🤖 {text}"
 
     if not body_raw or len(body_raw.strip()) == 0:
         dt = time.time() - t0
-        return _final(dt, "لا يقدّم النص المسترجَع تفاصيل كافية للإجابة بشكل قاطع من المصدر نفسه.")
+        return _final(dt, "لا يقدّم النص المسترجَع تفاصيل كافية للإجابة بشكل قاطع من المصدر نفسه.", sources)
 
     body_clean = _clean_text(body_raw)
     body_clean = _purge_non_arabic_lines(body_clean)
+
+    # Enforce strictness recovery: if numerics expected but missing, try again from prior pages
+    if (_expects_numerics(question) or hours_like) and not _has_times_or_days(body_clean):
+        q_kws = _question_keywords(question)
+        hunted2 = []
+        for p in (prior_pages or []):
+            t = CHUNKS_BY_PAGE.get(p, "")
+            hunted2.extend(_regex_hunt_generic(t, q_kws, intent=intent))
+            if len(hunted2) >= 10: break
+        if hunted2:
+            body_clean = _clean_text("\n".join(hunted2[:8]))
+            body_clean = _purge_non_arabic_lines(body_clean)
 
     # No LLM path (recommended for strict accuracy)
     if (not use_llm) or (tokenizer is None) or (model is None):
@@ -482,9 +507,9 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
         if not bullets:
             bullets = _as_bullets_clipped(_sentences(body_clean or body_raw), limit=cfg.max_bullets, max_chars=cfg.bullet_max_chars)
         formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
-        return _final(dt, formatted)
+        return _final(dt, formatted, sources)
 
-    # (Optional) LLM refine — not necessary; kept for completeness but guarded
+    # (Optional) LLM refine — kept but guarded
     try:
         from transformers import AutoTokenizer, AutoModelForCausalLM  # load already done in main
         system_prompt = (
@@ -509,20 +534,19 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
         start = inputs["input_ids"].shape[1]
         raw = tokenizer.decode(out_ids[0][start:], skip_special_tokens=True).strip()
         resp = _clean_text(raw); resp = _purge_non_arabic_lines(resp)
-        # if LLM fails, fallback to bullets
         if not resp:
             dt = time.time() - t0
             bullets = _bullets_for_display(body_clean or body_raw, question, intent, cfg)
             formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
-            return _final(dt, formatted)
+            return _final(dt, formatted, sources)
         dt = time.time() - t0
-        return _final(dt, resp)
+        return _final(dt, resp, sources)
     except Exception as e:
         LOG.warning(f"LLM generation failed: {e}")
         dt = time.time() - t0
         bullets = _bullets_for_display(body_clean or body_raw, question, intent, cfg)
         formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
-        return _final(dt, formatted)
+        return _final(dt, formatted, sources)
 
 # ---------------- Sanity runner ----------------
 def _gather_sanity_prompts() -> list:
@@ -550,7 +574,8 @@ def _pass_strict(question: str, body_only: str) -> bool:
     return True
 
 def run_test_prompts(index: RET.HybridIndex, tokenizer, model,
-                     use_llm: bool, use_rerank_flag: bool, artifacts_dir: str, cfg: SimpleNamespace):
+                     use_llm: bool, use_rerank_flag: bool, artifacts_dir: str, cfg: SimpleNamespace, hier=None):
+    import io
     os.makedirs(artifacts_dir, exist_ok=True)
     results_path = os.path.join(artifacts_dir, "results.jsonl")
     summary_md   = os.path.join(artifacts_dir, "summary.md")
@@ -577,7 +602,7 @@ def run_test_prompts(index: RET.HybridIndex, tokenizer, model,
         _tee(f"\n📝 Test {i}/{total}: {q}")
         _tee("-" * 60)
         try:
-            result = ask_once(index, tokenizer, model, q, use_llm=use_llm, use_rerank_flag=use_rerank_flag, cfg=cfg)
+            result = ask_once(index, tokenizer, model, q, use_llm=use_llm, use_rerank_flag=use_rerank_flag, cfg=cfg, hier=hier)
             _tee(result)
 
             body_only, _src_blk = _split_answer(result)
@@ -613,8 +638,6 @@ def run_test_prompts(index: RET.HybridIndex, tokenizer, model,
 
     _tee(f"\nSummary: PASS_LOOSE {pass_loose_count}/{total} | PASS_STRICT {pass_strict_count}/{total}")
     _tee(f"Artifacts saved in: {artifacts_dir}")
-
-    results_f.close(); report_f.close()
 
 # ---------------- CLI ----------------
 def main():
@@ -723,12 +746,12 @@ def main():
     use_rerank_flag = not args.no_rerank
 
     if args.test or args.sanity:
-        run_test_prompts(index, tok, mdl, use_llm=use_llm, use_rerank_flag=use_rerank_flag, artifacts_dir=run_dir, cfg=cfg)
+        run_test_prompts(index, tok, mdl, use_llm=use_llm, use_rerank_flag=use_rerank_flag, artifacts_dir=run_dir, cfg=cfg, hier=hier)
         print(f"\n✅ Saved artifacts under: {run_dir}")
         return
 
     if args.ask:
-        ans = ask_once(index, tok, mdl, args.ask, use_llm=use_llm, use_rerank_flag=use_rerank_flag, cfg=cfg)
+        ans = ask_once(index, tok, mdl, args.ask, use_llm=use_llm, use_rerank_flag=use_rerank_flag, cfg=cfg, hier=hier)
         single_path = os.path.join(run_dir, "single_answer.txt")
         with open(single_path, "w", encoding="utf-8") as f: f.write(ans)
         print(ans); print(f"\n✅ Saved single answer to: {single_path}")
@@ -744,7 +767,7 @@ def main():
                 print("\nExiting."); break
             if not q: continue
             if q.lower() in ("exit","quit","q"): print("Exiting."); break
-            ans = ask_once(index, tok, mdl, q, use_llm=use_llm, use_rerank_flag=use_rerank_flag, cfg=cfg)
+            ans = ask_once(index, tok, mdl, q, use_llm=use_llm, use_rerank_flag=use_rerank_flag, cfg=cfg, hier=hier)
             print(ans); trans.write(f"\nQ: {q}\n{ans}\n"); trans.flush()
     print(f"\n✅ Interactive transcript saved to: {interactive_path}")
 
