@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic-only, generalized)
+RAG Orchestrator (Arabic-only, generalized, hierarchy-safe)
 - Arabic normalization, diacritics removal, and digit unification
 - Page-aware fallback (from cited pages, then anchors, then global)
 - Generic regex hunter for numbers/times/days/%/durations (Arabic-centric)
@@ -8,9 +8,10 @@ RAG Orchestrator (Arabic-only, generalized)
 - Arabic cleanup + heading/TOC/boilerplate suppression
 - Short, clipped bullets with pagination
 - Strict guard: numeric/time questions must include numeric/time tokens; otherwise say "not specified" from text
+- **Robust hierarchy handling**: works with dicts, custom objects (e.g., HierData), lists; plus text-based fallback
 
 Usage (typical):
-python NewRag_arabic_only_patched.py --chunks Data_pdf_clean_chunks.jsonl --sanity --device cuda --use-4bit --no-llm \
+python NewRag_full_fixed.py --chunks Data_pdf_clean_chunks.jsonl --sanity --device cuda --use-4bit --no-llm \
   --regex-hunt --hourlines-only --max-bullets 5 --bullet-max-chars 120 --paginate-chars 600 --out-dir runs
 """
 
@@ -43,6 +44,19 @@ def _get_attr_or_key(obj, key, default=None):
         if isinstance(container, dict) and key in container:
             return container.get(key)
     return default
+
+def _prop(obj, key, default=None):
+    """Safe property read for dicts/objects (e.g., HierData)."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    val = getattr(obj, key, None)
+    if val is not None:
+        return val
+    meta = getattr(obj, "meta", None) or getattr(obj, "__dict__", None)
+    if isinstance(meta, dict):
+        return meta.get(key, default)
+    return default
+
 
 def _first_non_empty(*vals):
     for v in vals:
@@ -186,15 +200,17 @@ _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 def _to_western_digits(s): return (s or "").translate(_ARABIC_DIGITS)
 
+# FIXED: safe multi-line version (no bad quotes)
 def _strip_mojibake(s):
     if not s:
         return ""
     return (
-        s.replace("﻿", "")   # BOM
-         .replace("�", "")   # replacement char
+        s.replace("\ufeff", "")   # BOM
+         .replace("\uFFFD", "")   # replacement char
          .replace("�", "")        # literal replacement char
-         .replace(" ", " ")    # non-breaking space
+         .replace("\xa0", " ")    # non-breaking space
     )
+
 
 def _arabic_ratio(s):
     if not s: return 1.0
@@ -365,15 +381,14 @@ def _regex_hunt_generic(text, q_kws):
         # 1) numeric/time/day detectors
         if _line_has_generic_numeric(L):
             score += 3
-        # 2) Arabic domain cues
+        # 2) Arabic domain cues (expanded for procurement/money cues)
         DOMAIN_KWS_AR = [
             "موافقه", "موافقه مسبقه", "موافقه خطيه", "اذن", "اذن خطي",
             "تعويض", "يحتسب", "يعتمد", "يتطلب", "يلزم", "يجب", "لا يجوز", "يحق", "وفق", "حسب",
             "دوام", "ساعات", "اجازه", "اجازات", "عطله", "العطل", "مغادره", "استراحه",
             "بدل", "بدل مواصلات", "مياومات", "بدل سفر", "رواتب", "صرف", "موعد", "الحضور", "الجداول الزمنيه",
             "عروض اسعار", "عرض سعر", "عروض", "مناقصة", "توريد", "تضارب المصالح",
-            # currencies / money cues
-            "شيكل", "شواقل", "دينار", "دولار", "₪"
+            "شيكل", "شواقل", "دينار", "دولار", "₪", "NIS", "ILS", "USD"
         ]
         domain_kws = set(DOMAIN_KWS_AR + (q_kws or []))
         if _line_has_generic_numeric(L) and any(kw in T for kw in domain_kws):
@@ -446,51 +461,54 @@ INTENT_ALIASES_AR = {
     "per_diem": ["مياومات","بدل سفر"],
 }
 
+
 def _find_anchor_pages_by_alias_ar(hier, alias_keywords):
-    """Robustly iterate headings from various hierarchy shapes (dict/object/list)."""
+    """Return page numbers by matching Arabic alias keywords against heading titles.
+       Works with dicts, custom objects (e.g., HierData), lists, etc."""
     pages = []
     if not hier or not alias_keywords:
         return pages
 
     def _iter_headings(h):
-        # dict-like
+        # Already a list of headings
+        if isinstance(h, list):
+            return h
+        # Dict-like containers
         if isinstance(h, dict):
             for key in ("headings", "nodes", "sections", "items"):
                 v = h.get(key)
                 if isinstance(v, list):
                     return v
-        # object-like
-        for key in ("headings", "nodes", "sections", "items"):
+            for key in ("data", "root"):
+                v = h.get(key)
+                if isinstance(v, list):
+                    return v
+            return []
+        # Object-like containers (e.g., HierData)
+        for key in ("headings", "nodes", "sections", "items", "children"):
             v = getattr(h, key, None)
             if isinstance(v, list):
                 return v
-        # maybe nested container
         for key in ("data", "root"):
             v = getattr(h, key, None)
             if isinstance(v, list):
                 return v
-        # list already
-        if isinstance(h, list):
-            return h
+        # Iterable fallback
+        try:
+            if hasattr(h, "__iter__") and not isinstance(h, (str, bytes, dict)):
+                return list(h)
+        except Exception:
+            pass
         return []
 
-    def _hget(obj, key, default=None):
-        if isinstance(obj, dict):
-            return obj.get(key, default)
-        val = getattr(obj, key, None)
-        if val is not None:
-            return val
-        meta = getattr(obj, "meta", None) or getattr(obj, "__dict__", None)
-        if isinstance(meta, dict):
-            return meta.get(key, default)
-        return default
-
     normalized_aliases = [_normalize_text_ar(a) for a in alias_keywords]
-    for h in _iter_headings(hier):
-        title = _normalize_text_ar(str(_hget(h, "title", "") or _hget(h, "name", "") or _hget(h, "heading", "")))
+    for hd in _iter_headings(hier):
+        title = _normalize_text_ar(str(
+            _prop(hd, "title", "") or _prop(hd, "name", "") or _prop(hd, "heading", "")
+        ))
         if any(a in title for a in normalized_aliases):
-            ps = _hget(h, "page_start", _hget(h, "pageno", _hget(h, "page", None)))
-            pe = _hget(h, "page_end", None)
+            ps = _prop(hd, "page_start", _prop(hd, "pageno", _prop(hd, "page", None)))
+            pe = _prop(hd, "page_end", None)
             try:
                 if ps is not None:
                     pages.append(int(ps))
@@ -500,7 +518,23 @@ def _find_anchor_pages_by_alias_ar(hier, alias_keywords):
                 pass
     return sorted(set(pages))[:10]
 
+
+def _find_anchor_pages_by_text_alias(alias_keywords):
+    """Score pages by presence of alias keywords in page text (Arabic-normalized)."""
+    if not alias_keywords:
+        return []
+    norm_aliases = [_normalize_text_ar(a) for a in alias_keywords]
+    scored = []
+    for p, txt in CHUNKS_BY_PAGE.items():
+        T = _normalize_text_ar(_clean_text(txt))
+        score = sum(1 for a in norm_aliases if a and a in T)
+        if score:
+            scored.append((score, p))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [p for _, p in scored[:8]]
+
 # ---------------- Core Q&A ----------------
+
 def _is_hours_like(question: str, intent: str = "") -> bool:
     q = _normalize_text_ar(question or "")
     base_signals = [
@@ -514,6 +548,7 @@ def _is_hours_like(question: str, intent: str = "") -> bool:
     return any(tok in q for tok in base_signals) or intent in (
         "work_hours","ramadan_hours","overtime","work_days","breaks"
     )
+
 
 def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
              use_llm: bool = True, use_rerank_flag: bool = True, cfg: SimpleNamespace = None) -> str:
@@ -570,11 +605,18 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
             if _is_hours_like(question, intent):
                 alias_list = INTENT_ALIASES_AR["work_hours"]
 
-    try:
-        anchor_pages = _find_anchor_pages_by_alias_ar(index.hier, alias_list)
-    except Exception as e:
-        LOG.warning("anchor_pages failed: %s", e)
-        anchor_pages = []
+    anchor_pages = []
+    if alias_list:
+        # 1) Try hierarchy-driven anchoring (safe for dicts/objects/lists)
+        try:
+            anchor_pages = _find_anchor_pages_by_alias_ar(index.hier, alias_list)
+        except Exception as e:
+            LOG.warning("anchor_pages (hier) failed: %s", e)
+            anchor_pages = []
+        # 2) Fallback to text-based anchoring if needed
+        if not anchor_pages:
+            anchor_pages = _find_anchor_pages_by_text_alias(alias_list)
+
     if anchor_pages:
         anchored_ctx = _page_ctx_from_pages(anchor_pages, max_chars=3500)
         if anchored_ctx:
@@ -619,14 +661,14 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
             for p in anchor_pages2:
                 t = CHUNKS_BY_PAGE.get(p, "")
                 hunted.extend(_regex_hunt_generic(t, q_kws))
-                if len(hunted) >= 10: break
+                if len(hunted) >= 12: break
         # global fallback
         if not hunted:
             all_text = "\n".join(CHUNKS_BY_PAGE.get(p, "") for p in sorted(CHUNKS_BY_PAGE))
             hunted = _regex_hunt_generic(all_text, q_kws)
         # prefer hunted lines when strict numerics expected
         if hunted and (hours_like or _expects_numerics(question)):
-            body_raw = "\n".join(hunted[:8])
+            body_raw = "\n".join(hunted[:12])
 
     # 3) Final formatting (LLM optional, but we keep it off-safe by default)
     def _final(dt, text):
@@ -652,7 +694,7 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
     body_clean = _purge_non_arabic_lines(body_clean)
 
     # STRICT safety net: if numeric/time expected but none found
-    if (not body_clean) or (hours_like or _expects_numerics(question)) and not _has_times_or_days(body_clean):
+    if (not body_clean) or ((hours_like or _expects_numerics(question)) and not _has_times_or_days(body_clean)):
         if not _has_times_or_days(body_clean):
             dt = time.time() - t0
             msg = "لا يذكر النص رقماً/وقتاً محدداً لهذا السؤال ضمن الصفحات المستند إليها."
@@ -707,6 +749,7 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
         return _final(dt, formatted)
 
 # ---------------- Sanity runner ----------------
+
 def _gather_sanity_prompts() -> list:
     ret_prompts = []
     try: ret_prompts = list(getattr(RET, "SANITY_PROMPTS", []) or [])
@@ -717,19 +760,23 @@ def _gather_sanity_prompts() -> list:
             seen.add(q); merged.append(q)
     return merged
 
+
 def _pass_loose(answer_text: str) -> bool:
     has_sources = ("Sources:" in answer_text) or ("المصادر:" in answer_text)
     bad = ("لا يقدّم النص المسترجَع تفاصيل كافية" in answer_text)
     return bool(has_sources and not bad)
 
+
 def _is_meaningful(txt: str) -> bool:
     return bool(txt and len(re.sub(r"\s+","", txt)) >= 12)
+
 
 def _pass_strict(question: str, body_only: str) -> bool:
     if not _is_meaningful(body_only): return False
     if _is_hours_like(question, "") or _expects_numerics(question):
         return _has_times_or_days(body_only)
     return True
+
 
 def run_test_prompts(index: RET.HybridIndex, tokenizer, model,
                      use_llm: bool, use_rerank_flag: bool, artifacts_dir: str, cfg: SimpleNamespace):
@@ -799,6 +846,7 @@ def run_test_prompts(index: RET.HybridIndex, tokenizer, model,
     results_f.close(); report_f.close()
 
 # ---------------- CLI ----------------
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--chunks", type=str, default="Data_pdf_clean_chunks.jsonl", help="Path to chunks (JSONL/JSON)")
@@ -817,7 +865,7 @@ def main():
     parser.add_argument("--device", type=str, default="auto", choices=["auto","cpu","cuda"])
     parser.add_argument("--out-dir", type=str, default="runs")
 
-    # NEW: general controls
+    # Controls
     parser.add_argument("--regex-hunt", action="store_true", help="Generic numeric/time/day hunter (question-driven).")
     parser.add_argument("--hourlines-only", action="store_true", help="Keep only lines with times/days/numbers/% when relevant.")
     parser.add_argument("--max-bullets", type=int, default=5, help="Max bullets.")
