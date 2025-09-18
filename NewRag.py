@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 RAG Orchestrator (Arabic) — no-bias priors & strictness booster (single-file, no external helper imports)
-- Inlines tiny helpers that used to live in prior_deriver.py and intent_patterns.py
-- Data-driven section "priors" derived from *current* headings (no section numbers, no hardcoding)
-- Priors are soft boosts (never filter content out) and only change ordering
+- Data-driven section "priors" derived ONLY from *current* headings (no hardcoded section numbers)
+- Priors are soft boosts (ordering) — never filter content out
+- Robust to arbitrary hierarchy objects (e.g., HierData) via deep introspection
 - Negation-aware scoring for approval-like intents
 - Numeric/time/day strictness recovery for hours/limits/% questions
 - Backwards-compatible with retrival_model (RET) interface
 
-USAGE (strict sanity, extractive, deterministic):
+USAGE (strict sanity, extractive):
 python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --hier-index heading_inverted_index.json --aliases section_aliases.json --sanity --no-llm --regex-hunt --hourlines-only --out-dir runs
 
 USAGE (interactive chatbot):
@@ -21,10 +21,10 @@ from collections import defaultdict
 from types import SimpleNamespace
 
 # --------------------------------------------------------------------------------------
-# Inline minimal helpers that previously lived in separate files
+# Inline minimal helpers (replacing prior_deriver.py + intent_patterns.py)
 # --------------------------------------------------------------------------------------
 
-# Normalizer for Arabic text (lowercase, strip diacritics, unify alef/ya/ta marbuta, remove punctuation)
+# Arabic normalizer
 _AR_DIAC = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]")
 def norm(s: str) -> str:
     if s is None: return ""
@@ -37,11 +37,7 @@ def norm(s: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-# Soft, data-driven "priors" derived from headings from the CURRENT hierarchy.
-# hier is what RET.load_hierarchy returns; support a few shapes robustly:
-# - list of dicts with keys like {'heading': '...', 'pages': [12,13]}
-# - dict mapping normalized heading -> {'pages': set/list}
-# - list of tuples (heading, pages)
+# Intent → loose stems that we try to find inside headings (normalized)
 _INTENT_TO_HEADING_STEMS = {
     "work_hours": ["ساعات العمل", "الدوام", "ايام الدوام", "الحضور", "الانصراف", "اوقات العمل"],
     "ramadan_hours": ["ساعات العمل","الدوام","رمضان","ايام الصوم","اوقات العمل"],
@@ -69,65 +65,220 @@ _INTENT_TO_HEADING_STEMS = {
     "per_diem": ["مياومات","بدل سفر","السفر","بدل المياومات"],
 }
 
-def _iter_headings(hier):
-    # Yield (heading_text, pages_set) robustly
-    if not hier: return
-    if isinstance(hier, dict):
-        for k, v in hier.items():
-            hd = k
-            pages = set()
-            if isinstance(v, dict):
-                pg = v.get("pages") or v.get("page_set") or []
-                if isinstance(pg, (list,set,tuple)): pages = set(pg)
-                elif isinstance(pg, int): pages = {pg}
-            yield str(hd), pages
-        return
-    # list-like
-    for item in hier:
-        hd = None; pages = set()
-        if isinstance(item, dict):
-            hd = item.get("heading") or item.get("title") or item.get("name") or item.get("h")
-            pg = item.get("pages") or item.get("page_set") or item.get("p") or []
-            if isinstance(pg, (list,set,tuple)): pages = set(pg)
-            elif isinstance(pg, int): pages = {pg}
-        elif isinstance(item, (list,tuple)) and item:
-            hd = item[0]
-            if len(item) > 1:
-                pg = item[1]
-                if isinstance(pg, (list,set,tuple)): pages = set(pg)
-                elif isinstance(pg, int): pages = {pg}
+def _coerce_pages(obj):
+    """Return a set of page ints for many shapes: list/set/tuple/int/str (comma or space separated)."""
+    if obj is None: return set()
+    if isinstance(obj, (list, set, tuple)):
+        out = set()
+        for v in obj:
+            try:
+                out.add(int(str(v).strip()))
+            except Exception:
+                pass
+        return out
+    # ints
+    try:
+        return {int(str(obj).strip())}
+    except Exception:
+        pass
+    # strings like "12, 13 14"
+    try:
+        toks = re.split(r"[,\s]+", str(obj))
+        out = set()
+        for t in toks:
+            if not t: continue
+            out.add(int(t))
+        return out
+    except Exception:
+        return set()
+
+def _extract_heading_and_pages(obj):
+    """
+    Given any small record/obj that *might* carry heading/pages fields, return (heading, pages_set) or (None, set()).
+    Looks at common keys/attrs.
+    """
+    keys_heading = ("heading", "title", "name", "h", "label", "text")
+    keys_pages   = ("pages", "page_set", "p", "page_numbers", "page_idxs", "page_index", "page")
+
+    # dict-like
+    if isinstance(obj, dict):
+        hd = None
+        for kh in keys_heading:
+            if kh in obj and obj[kh]:
+                hd = str(obj[kh]); break
+        pgv = None
+        for kp in keys_pages:
+            if kp in obj and obj[kp] is not None:
+                pgv = obj[kp]; break
         if hd:
-            yield str(hd), pages
+            return hd, _coerce_pages(pgv)
+        # dict of {heading: pages}
+        if len(obj) == 1:
+            try:
+                k = next(iter(obj.keys()))
+                v = obj[k]
+                return str(k), _coerce_pages(v)
+            except Exception:
+                pass
+        return None, set()
+
+    # object with attributes
+    hd = None; pgv = None
+    for kh in keys_heading:
+        if hasattr(obj, kh):
+            val = getattr(obj, kh)
+            if val:
+                hd = str(val); break
+    for kp in keys_pages:
+        if hasattr(obj, kp):
+            pgv = getattr(obj, kp)
+            if pgv is not None:
+                break
+    if hd:
+        return hd, _coerce_pages(pgv)
+    return None, set()
+
+def _iter_headings(hier):
+    """
+    Yield (heading_text, pages_set) from MANY possible hierarchy shapes.
+    Supports:
+    - dict: {heading: {"pages":[...]}} or {heading:[...]} or {heading:"12,13"}
+    - list/tuple of dicts/tuples/objects
+    - object: with .to_dict() / .as_dict() / .to_json(), or attributes like .headings/.nodes/.sections/.items
+    - object: with iterable interface (__iter__) yielding items that themselves carry heading/pages
+    This NEVER raises on unknown types; at worst yields nothing.
+    """
+    if not hier:
+        return
+
+    # If already a mapping
+    if isinstance(hier, dict):
+        # try mapping of heading->(mapping or pages)
+        for k, v in hier.items():
+            if isinstance(v, dict):
+                _, pset = _extract_heading_and_pages(v)
+                if pset:
+                    yield str(k), pset
+                    continue
+            # try direct pages list/int/str
+            pset = _coerce_pages(v)
+            if pset:
+                yield str(k), pset
+            else:
+                # maybe value is nested small dict with heading inside
+                hd, pset2 = _extract_heading_and_pages(v)
+                if hd and pset2:
+                    yield hd, pset2
+        return
+
+    # Try well-known converters on objects
+    for conv_name in ("to_dict", "as_dict"):
+        if hasattr(hier, conv_name) and callable(getattr(hier, conv_name)):
+            try:
+                mp = getattr(hier, conv_name)()
+                if isinstance(mp, dict):
+                    for k, v in mp.items():
+                        # same handling as dict branch
+                        if isinstance(v, dict):
+                            _, pset = _extract_heading_and_pages(v)
+                            if pset:
+                                yield str(k), pset
+                                continue
+                        pset = _coerce_pages(v)
+                        if pset:
+                            yield str(k), pset
+                        else:
+                            hd, pset2 = _extract_heading_and_pages(v)
+                            if hd and pset2:
+                                yield hd, pset2
+                    return
+            except Exception:
+                pass
+
+    # Common containers on custom objects
+    for attr in ("headings", "nodes", "sections", "items", "entries", "children"):
+        if hasattr(hier, attr):
+            try:
+                seq = getattr(hier, attr)
+                # some are callables
+                if callable(seq):
+                    seq = seq()
+                for it in seq or []:
+                    # tuple like (heading, pages) or (heading, payload)
+                    if isinstance(it, (tuple, list)) and it:
+                        hd = str(it[0])
+                        pages = set()
+                        if len(it) > 1:
+                            pages = _coerce_pages(it[1])
+                            if not pages and isinstance(it[1], dict):
+                                _, pages = _extract_heading_and_pages(it[1])
+                        yield hd, pages
+                        continue
+                    # try dict/object shapes
+                    hd, pages = _extract_heading_and_pages(it)
+                    if hd:
+                        yield hd, pages
+            except Exception:
+                pass
+
+    # If the object itself is iterable
+    try:
+        for it in hier:
+            # support tuples/lists
+            if isinstance(it, (tuple, list)) and it:
+                hd = str(it[0])
+                pages = set()
+                if len(it) > 1:
+                    pages = _coerce_pages(it[1])
+                    if not pages and isinstance(it[1], dict):
+                        _, pages = _extract_heading_and_pages(it[1])
+                yield hd, pages
+                continue
+            # support dict/object records
+            hd, pages = _extract_heading_and_pages(it)
+            if hd:
+                yield hd, pages
+    except TypeError:
+        # not iterable; last-chance: introspect attributes looking like single record
+        hd, pages = _extract_heading_and_pages(hier)
+        if hd:
+            yield hd, pages
 
 def derive_section_priors(intent: str, hier) -> dict:
     """
     Return {"pages": set[int], "headings": [matched_headings]} based ONLY on current hierarchy headings.
-    No hardcoded section numbers; matching is via normalized stem inclusion.
+    No hardcoded section numbers; matching is via normalized stem inclusion and/or token overlap.
+    Robust to any hier type (dict/list/tuples/custom object).
     """
     intent = intent or ""
     norm_int = norm(intent)
     stems = _INTENT_TO_HEADING_STEMS.get(intent, [])
-    # Also if classifier returned a generic/unknown label, loosely guess from question-like token in intent string
+
+    # If classifier label is unknown, guess from tokens in intent string
     if not stems and norm_int:
-        if "دوام" in norm_int or "ساعات" in norm_int: stems = _INTENT_TO_HEADING_STEMS["work_hours"]
-        elif "رمضان" in norm_int: stems = _INTENT_TO_HEADING_STEMS["ramadan_hours"]
-        elif "عروض" in norm_int or "سقف" in norm_int: stems = _INTENT_TO_HEADING_STEMS["procurement_thresholds"]
+        if "دوام" in norm_int or "ساعات" in norm_int:
+            stems = _INTENT_TO_HEADING_STEMS["work_hours"]
+        elif "رمضان" in norm_int:
+            stems = _INTENT_TO_HEADING_STEMS["ramadan_hours"]
+        elif "عروض" in norm_int or "سقف" in norm_int:
+            stems = _INTENT_TO_HEADING_STEMS["procurement_thresholds"]
 
     pages, matched = set(), []
+    toks = set(norm_int.split()) if norm_int else set()
+
     for heading, pset in _iter_headings(hier):
-        nh = norm(heading)
+        nh = norm(heading or "")
         ok = False
         for stem in stems:
             if stem and stem in nh:
                 ok = True; break
-        # also allow intent-token overlap as a last resort
-        if not ok and norm_int:
-            toks = set(norm_int.split())
+        if not ok and toks:
             if any(t and t in nh for t in toks):
                 ok = True
         if ok:
             matched.append(heading)
-            pages |= set(pset)
+            pages |= set(pset or set())
+
     return {"pages": pages, "headings": matched}
 
 # --------------------------------------------------------------------------------------
@@ -511,8 +662,8 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
     intent = RET.classify_intent(question)
 
     # --------- derive priors from current document (NO section numbers) ---------
-    priors = derive_section_priors(intent, hier or [])  # {"pages": set[int], "headings": [...]}
-    prior_pages = list(priors.get("pages", []))
+    priors = derive_section_priors(intent, hier) if hier is not None else {"pages": set(), "headings": []}
+    prior_pages = list(priors.get("pages", []) or [])
 
     # Use existing extractive path first (keeps compatibility)
     extractive_answer = RET.answer(question, index, intent, use_rerank_flag=use_rerank_flag)
@@ -615,7 +766,7 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
         formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
         return _final(dt, formatted, sources)
 
-    # (Optional) LLM refine — kept but guarded
+    # (Optional) LLM refine — guarded
     try:
         from transformers import AutoTokenizer, AutoModelForCausalLM  # load already done in main
         system_prompt = (
