@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — Generic edge-case hardening:
+RAG Orchestrator (Arabic-only, generalized)
+- Arabic normalization, diacritics removal, and digit unification
 - Page-aware fallback (from cited pages, then anchors, then global)
-- Generic regex hunter for numbers/times/days/%/durations
-- Signal-based sentence ranking (numeric/time/day signals + keyword overlap)
+- Generic regex hunter for numbers/times/days/%/durations (Arabic-centric)
+- Signal-based sentence ranking (numeric/time/day signals + Arabic policy cues)
 - Arabic cleanup + heading/TOC/boilerplate suppression
 - Short, clipped bullets with pagination
-- Still strictly grounded (no new facts), LLM optional but not required
+- Strict guard: numeric/time questions must include numeric/time tokens; otherwise say "not specified" from text
 
 Usage (typical):
-python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --sanity --device cuda --use-4bit --no-llm \
+python NewRag_arabic_only_patched.py --chunks Data_pdf_clean_chunks.jsonl --sanity --device cuda --use-4bit --no-llm \
   --regex-hunt --hourlines-only --max-bullets 5 --bullet-max-chars 120 --paginate-chars 600 --out-dir runs
 """
 
@@ -139,6 +140,24 @@ DEFAULT_SANITY_PROMPTS = [
     "هل توجد مياومات/بدل سفر؟ وكيف تُصرف",
 ]
 
+# ---------------- Arabic-only normalization helpers ----------------
+_ARABIC_DIACRITICS = dict.fromkeys(map(ord, "ًٌٍَُِّْـ"), None)  # tashkeel + tatweel
+
+def _norm_arabic_letters(s: str) -> str:
+    """Unify Arabic variants and remove diacritics for robust matching."""
+    if not s: return ""
+    s = s.translate(_ARABIC_DIACRITICS)
+    s = s.replace("أ","ا").replace("إ","ا").replace("آ","ا")
+    s = s.replace("ى","ي").replace("ة","ه")
+    s = s.replace("ؤ","و").replace("ئ","ي")
+    return s
+
+def _normalize_text_ar(s: str) -> str:
+    s = _to_western_digits(s or "").strip()
+    s = _norm_arabic_letters(s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
 # ---------------- Arabic helpers / checks ----------------
 _HEADING_PATTERNS = [
     r"^\s*الإجابة\s*:?$",
@@ -147,7 +166,8 @@ _HEADING_PATTERNS = [
     r"^\s*Summary\s*:?\s*$",
     r"^\s*Answer\s*:?\s*$",
 ]
-_AR_DAYS = ["الأحد", "الإثنين", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
+_AR_DAYS = ["الأحد","الإثنين","الاثنين","الثلاثاء","الأربعاء","الخميس","الجمعة","السبت",
+            "الاحد","الاربعاء"]
 
 _TIME_PATTERNS = [
     r"\b\d{1,2}:\d{2}\b",                     # 8:30
@@ -163,14 +183,16 @@ _NUMERICISH = re.compile(r"(\d|[%٪])")
 _SECTION_HEAVY = re.compile(r"(?:\d+\.){2,}\d+")  # lines like 3.1.5.7 (TOC-ish)
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-_AR_LETTER_RX = re.compile(r"[ء-ي]")
+
 def _to_western_digits(s): return (s or "").translate(_ARABIC_DIGITS)
-def _strip_mojibake(s): return "" if not s else s.replace("\ufeff","").replace("�","").replace("\uFFFD","")
+
+def _strip_mojibake(s): return "" if not s else s.replace("\ufeff",""").replace("�","").replace("\uFFFD","")
+
 def _arabic_ratio(s):
     if not s: return 1.0
     letters = re.findall(r"\w", s, flags=re.UNICODE)
     if not letters: return 1.0
-    arabic = _AR_LETTER_RX.findall(s)
+    arabic = re.findall(r"[ء-ي]", s)
     return (len(arabic) / max(1, len(letters)))
 
 def _purge_non_arabic_lines(s, min_ratio=0.66):
@@ -251,6 +273,7 @@ def _split_answer(answer_text):
 
 # ---------------- Q intent + keywords ----------------
 POLICY_VERBS = ("يجب","يلزم","يُمنع","يُحظر","يتعيّن","لا يجوز","يحق","تكون","يتم","وفقاً","حسب")
+
 def _norm_tokens(s):
     s = _to_western_digits(s or "")
     s = re.sub(r"[^\w\s%٪:–\-]+"," ", s, flags=re.UNICODE)
@@ -260,13 +283,13 @@ def _question_keywords(q):
     toks = _norm_tokens(q)
     # add simple Arabic stems
     extras = []
-    if "ساعات" in q or "دوام" in q: extras += ["ساعات","دوام","من","إلى","حتى"]
-    if "رمضان" in q: extras += ["رمضان","الصوم"]
-    if "إضاف" in q: extras += ["إضافية","العمل الإضافي","أجر"]
+    if "ساعات" in q or "دوام" in q: extras += ["ساعات","دوام","من","إلى","حتى","اوقات"]
+    if "رمضان" in q or "الصوم" in q: extras += ["رمضان","الصوم"]
+    if "إضاف" in q or "اضافي" in q: extras += ["إضافية","العمل الاضافي","الساعات الاضافيه","اجر"]
     if "عطل" in q or "عطلة" in q: extras += ["العطل","الرسمية","عطلة","نهاية","أسبوع"]
     if "استراحة" in q or "راحة" in q: extras += ["استراحة","راحة","مدة","مدتها"]
-    if "مغادرة" in q: extras += ["مغادرة","ساعية","الحد","الأقصى","شهري"]
-    if "إجازة" in q: extras += ["إجازة","أيام","مدة","سنو"]
+    if "مغادرة" in q or "اذن" in q: extras += ["مغادرة","ساعية","الحد","الأقصى","شهري","اذن"]
+    if "إجازة" in q or "اجازه" in q: extras += ["إجازة","أيام","مدة","سنو"]
     if "سقف" in q or "عروض" in q: extras += ["سقف","عروض","أسعار","ثلاثة"]
     if "تضارب" in q: extras += ["تضارب","مصالح","الهدايا"]
     return list(dict.fromkeys(toks + extras))
@@ -328,16 +351,34 @@ def _regex_hunt_generic(text, q_kws):
         if not L: continue
         if _SECTION_HEAVY.search(L): continue
         if "فهرس المحتويات" in L or "جميع الحقوق محفوظة" in L: continue
-        if _arabic_ratio(L) < 0.4 and not _line_has_generic_numeric(L):  # keep numeric low-arabic lines
-            continue
-        # must have numeric/time/day if question expects numerics
+        # --- Scoring (ARABIC-ONLY, GENERALIZED) ---
         score = 0
-        if _line_has_generic_numeric(L): score += 3
-        # keyword overlap
-        for kw in q_kws:
-            if kw and kw in L: score += 1
-        # policy verbs weight
-        if any(v in L for v in POLICY_VERBS): score += 1
+        T = _normalize_text_ar(L)
+        # 1) numeric/time/day detectors
+        if _line_has_generic_numeric(L):
+            score += 3
+        # 2) Arabic domain cues
+        DOMAIN_KWS_AR = [
+            "موافقه", "موافقه مسبقه", "موافقه خطيه", "اذن", "اذن خطي",
+            "تعويض", "يحتسب", "يعتمد", "يتطلب", "يلزم", "يجب", "لا يجوز", "يحق", "وفق", "حسب",
+            "دوام", "ساعات", "اجازه", "اجازات", "عطله", "العطل", "مغادره", "استراحه",
+            "بدل", "بدل مواصلات", "مياومات", "بدل سفر", "رواتب", "صرف", "موعد", "الحضور", "الجداول الزمنيه",
+            "عروض اسعار", "ثلاثه عروض", "تضارب المصالح",
+        ]
+        domain_kws = set(DOMAIN_KWS_AR + (q_kws or []))
+        if _line_has_generic_numeric(L) and any(kw in T for kw in domain_kws):
+            score += 2
+        # 3) penalize orphan numbers
+        if re.search(r"\b\d+\b", T) and not any(k in T for k in domain_kws):
+            score -= 2
+        # 4) rule/policy bonus
+        POLICY_STEMS_AR = ["يجب","يلزم","لا يجوز","يحق","وفق","حسب","على","يكون","تكون"]
+        if any(stem in T for stem in POLICY_STEMS_AR):
+            score += 1
+        # 5) concise statement bonus
+        ln = len(T)
+        if 20 <= ln <= 160:
+            score += 1
         if score > 0:
             hits.append((score, L))
     # sort by score desc, length asc
@@ -377,12 +418,53 @@ def _bullets_for_display(text: str, question: str, intent: str, cfg):
         sents = _sentences(text)
     return _as_bullets_clipped(sents, limit=cfg.max_bullets, max_chars=cfg.bullet_max_chars)
 
-def _is_hours_like(question: str, intent: str = "") -> bool:
-    q = (question or "").strip()
-    hours_kws = ["ساعات","الدوام","رمضان","أيام الدوام","الساعات الإضافية","العطل","استراحة","مغادرة ساعية","وقت","من وإلى","من إلى"]
-    return any(kw in q for kw in hours_kws) or intent in ("work_hours","ramadan_hours","overtime","work_days","breaks")
+# ---------------- Intent & anchoring (Arabic-only) ----------------
+INTENT_ALIASES_AR = {
+    "work_hours": ["ساعات العمل","اوقات الدوام","الدوام الرسمي","نظام الدوام"],
+    "ramadan_hours": ["رمضان","ساعات رمضان","دوام رمضان","الصوم"],
+    "overtime": ["العمل الاضافي","الساعات الاضافيه","اضافي"],
+    "holidays_work": ["العطل","العطل الرسميه","العمل في العطل"],
+    "timesheets": ["الجداول الزمنيه","التقارير","الحضور","الانصراف"],
+    "payroll": ["الرواتب","صرف الرواتب","الاجر"],
+    "transport": ["بدل المواصلات","المواصلات","نقل"],
+    "hourly_leave": ["مغادره ساعيه","اذن مغادره"],
+    "annual_leave": ["الاجازه السنويه","سنويه"],
+    "sick_leave": ["الاجازه المرضيه","مرضيه"],
+    "carryover": ["ترحيل الاجازات","غير المستخدمه","رصيد الاجازات"],
+    "maternity": ["اجازه الامومه","امومه"],
+    "procurement_conflict": ["تضارب المصالح","اخلاقيات الشراء"],
+    "per_diem": ["مياومات","بدل سفر"],
+}
+
+def _find_anchor_pages_by_alias_ar(hier, alias_keywords):
+    pages = []
+    if not hier or not alias_keywords:
+        return pages
+    normalized_aliases = [_normalize_text_ar(a) for a in alias_keywords]
+    for h in hier.get("headings", []):
+        title = _normalize_text_ar(str(h.get("title","")))
+        if any(a in title for a in normalized_aliases):
+            if "page_start" in h:
+                pages.append(int(h["page_start"]))
+            if "page_end" in h and h["page_end"] != h.get("page_start"):
+                pages.append(int(h["page_end"]))
+    return sorted(set(pages))[:10]
 
 # ---------------- Core Q&A ----------------
+def _is_hours_like(question: str, intent: str = "") -> bool:
+    q = _normalize_text_ar(question or "")
+    base_signals = [
+        "ساعات","دوام","اوقات","رمضان","الصوم","ايام","اضافي","الساعات الاضافيه",
+        "استراحه","مغادره","اذن","وقت","بدل","مياومات","سفر","رواتب","صرف","موعد",
+        "العطل","العمل في العطل","تعويض","اجر","جداول زمنيه","الحضور"
+    ]
+    has_numeric_hint = bool(re.search(r"\d", _to_western_digits(q))) or ("%" in q or "٪" in q)
+    if has_numeric_hint:
+        return True
+    return any(tok in q for tok in base_signals) or intent in (
+        "work_hours","ramadan_hours","overtime","work_days","breaks"
+    )
+
 def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
              use_llm: bool = True, use_rerank_flag: bool = True, cfg: SimpleNamespace = None) -> str:
     t0 = time.time()
@@ -409,6 +491,40 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
     # page context from cited pages
     cited_pages = _parse_pages_from_sources(sources)
     page_ctx = _page_ctx_from_pages(cited_pages, max_chars=3500)
+
+    # Arabic-only dynamic anchoring
+    alias_list = INTENT_ALIASES_AR.get(intent, [])
+    if not alias_list:
+        q_norm = _normalize_text_ar(question)
+        if any(k in q_norm for k in ["رمضان","الصوم"]):
+            alias_list = INTENT_ALIASES_AR["ramadan_hours"]
+        elif any(k in q_norm for k in ["اضافي","الاضافي","الساعات الاضافيه"]):
+            alias_list = INTENT_ALIASES_AR["overtime"]
+        elif any(k in q_norm for k in ["اجازه سنويه","الاجازه السنويه","سنويه"]):
+            alias_list = INTENT_ALIASES_AR["annual_leave"]
+        elif any(k in q_norm for k in ["مرضيه","الاجازه المرضيه"]):
+            alias_list = INTENT_ALIASES_AR["sick_leave"]
+        elif any(k in q_norm for k in ["مغادره","اذن مغادره"]):
+            alias_list = INTENT_ALIASES_AR["hourly_leave"]
+        elif any(k in q_norm for k in ["رواتب","صرف الرواتب","اجر"]):
+            alias_list = INTENT_ALIASES_AR["payroll"]
+        elif any(k in q_norm for k in ["مواصلات","بدل المواصلات"]):
+            alias_list = INTENT_ALIASES_AR["transport"]
+        elif any(k in q_norm for k in ["مياومات","بدل سفر"]):
+            alias_list = INTENT_ALIASES_AR["per_diem"]
+        elif any(k in q_norm for k in ["تضارب","تضارب المصالح"]):
+            alias_list = INTENT_ALIASES_AR["procurement_conflict"]
+        elif any(k in q_norm for k in ["عطل","العطل"]):
+            alias_list = INTENT_ALIASES_AR["holidays_work"]
+        else:
+            if _is_hours_like(question, intent):
+                alias_list = INTENT_ALIASES_AR["work_hours"]
+
+    anchor_pages = _find_anchor_pages_by_alias_ar(index.hier, alias_list)
+    if anchor_pages:
+        anchored_ctx = _page_ctx_from_pages(anchor_pages, max_chars=3500)
+        if anchored_ctx:
+            page_ctx = anchored_ctx
 
     # 1) Cleanup + minimal rescue if empty or weak
     hours_like = _is_hours_like(question, intent)
@@ -441,12 +557,12 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
             if len(hunted) >= 10: break
         # broaden to anchor pages
         if not hunted:
-            anchor_pages = []
+            anchor_pages2 = []
             for p, txt in CHUNKS_BY_PAGE.items():
                 t = _clean_text(txt)
                 if any(kw in t for kw in q_kws):
-                    anchor_pages.append(p)
-            for p in anchor_pages:
+                    anchor_pages2.append(p)
+            for p in anchor_pages2:
                 t = CHUNKS_BY_PAGE.get(p, "")
                 hunted.extend(_regex_hunt_generic(t, q_kws))
                 if len(hunted) >= 10: break
@@ -455,11 +571,21 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
             all_text = "\n".join(CHUNKS_BY_PAGE.get(p, "") for p in sorted(CHUNKS_BY_PAGE))
             hunted = _regex_hunt_generic(all_text, q_kws)
         # prefer hunted lines when strict numerics expected
-        if hunted and (_expects_numerics(question) or hours_like):
+        if hunted and (hours_like or _expects_numerics(question)):
             body_raw = "\n".join(hunted[:8])
 
     # 3) Final formatting (LLM optional, but we keep it off-safe by default)
     def _final(dt, text):
+        # Dedup + shrink sources block
+        nonlocal sources
+        if sources:
+            lines = [l.strip() for l in sources.splitlines() if l.strip()]
+            seen = set(); clean = []
+            for l in lines:
+                k = re.sub(r"(page|صفحة)\s+\d+","page", l, flags=re.I)
+                if k in seen: continue
+                seen.add(k); clean.append(l)
+            sources = "\n".join(clean[:5])
         parts = _paginate_text(text, max_chars=cfg.paginate_chars)
         if len(parts) > 1:
             labeled = []
@@ -468,12 +594,15 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
             text = "\n\n".join(labeled)
         return f"⏱ {dt:.2f}s | 🤖 {text}\n{sources}" if sources else f"⏱ {dt:.2f}s | 🤖 {text}"
 
-    if not body_raw or len(body_raw.strip()) == 0:
-        dt = time.time() - t0
-        return _final(dt, "لا يقدّم النص المسترجَع تفاصيل كافية للإجابة بشكل قاطع من المصدر نفسه.")
-
     body_clean = _clean_text(body_raw)
     body_clean = _purge_non_arabic_lines(body_clean)
+
+    # STRICT safety net: if numeric/time expected but none found
+    if (not body_clean) or (hours_like or _expects_numerics(question)) and not _has_times_or_days(body_clean):
+        if not _has_times_or_days(body_clean):
+            dt = time.time() - t0
+            msg = "لا يذكر النص رقماً/وقتاً محدداً لهذا السؤال ضمن الصفحات المستند إليها."
+            return _final(dt, msg)
 
     # No LLM path (recommended for strict accuracy)
     if (not use_llm) or (tokenizer is None) or (model is None):
@@ -509,7 +638,6 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
         start = inputs["input_ids"].shape[1]
         raw = tokenizer.decode(out_ids[0][start:], skip_special_tokens=True).strip()
         resp = _clean_text(raw); resp = _purge_non_arabic_lines(resp)
-        # if LLM fails, fallback to bullets
         if not resp:
             dt = time.time() - t0
             bullets = _bullets_for_display(body_clean or body_raw, question, intent, cfg)
@@ -697,7 +825,7 @@ def main():
             if args.device == "cuda" and not use_cuda:
                 LOG.warning("CUDA requested but not available; falling back to CPU.")
             bf16_supported = use_cuda and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
-            dtype_fp = torch.bfloat16 if (bf16_supported and torch is not None) else (torch.float16 if (use_cuda and torch is not None) else None)
+            dtype_fp = torch.bfloat16 if (bf16_supported and torch is not None) else (torch.float16 if use_cuda and torch is not None else None)
             model_kwargs = {"trust_remote_code": True}
             if args.device == "cpu" or not use_cuda:
                 model_kwargs["device_map"] = "cpu"
