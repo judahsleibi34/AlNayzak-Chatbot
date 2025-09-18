@@ -186,7 +186,15 @@ _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 def _to_western_digits(s): return (s or "").translate(_ARABIC_DIGITS)
 
-def _strip_mojibake(s): return "" if not s else s.replace("\ufeff",""").replace("�","").replace("\uFFFD","")
+def _strip_mojibake(s):
+    if not s:
+        return ""
+    return (
+        s.replace("\ufeff", "")   # BOM
+         .replace("\uFFFD", "")   # replacement char
+         .replace("�", "")        # literal replacement char (just in case)
+         .replace("\xa0", " ")    # non-breaking space → space
+    )
 
 def _arabic_ratio(s):
     if not s: return 1.0
