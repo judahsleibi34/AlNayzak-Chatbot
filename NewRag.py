@@ -22,7 +22,7 @@ if HERE not in sys.path:
 from prior_deriver import derive_section_priors
 from intent_patterns import INTENT_PATTERNS  # if you import it too
 
-import os, sys, re, json, time, argparse, logging
+import json, time, argparse, logging
 from datetime import datetime
 from collections import defaultdict
 from types import SimpleNamespace
