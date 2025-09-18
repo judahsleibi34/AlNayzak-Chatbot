@@ -685,7 +685,7 @@ def ask_once(index: RET.HybridIndex,
         return _final(dt, formatted, paginate_chars, sources)
 
 # helper for final formatting with pagination
-ndef _final(dt, text, paginate_chars, sources):
+def _final(dt, text, paginate_chars, sources):
     parts = _paginate_text(text, max_chars=paginate_chars)
     if len(parts) > 1:
         labeled = []
