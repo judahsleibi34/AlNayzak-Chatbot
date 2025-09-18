@@ -190,10 +190,10 @@ def _strip_mojibake(s):
     if not s:
         return ""
     return (
-        s.replace("\ufeff", "")   # BOM
-         .replace("\uFFFD", "")   # replacement char
-         .replace("�", "")        # literal replacement char (just in case)
-         .replace("\xa0", " ")    # non-breaking space → space
+        s.replace("﻿", "")   # BOM
+         .replace("�", "")   # replacement char
+         .replace("�", "")        # literal replacement char
+         .replace(" ", " ")    # non-breaking space
     )
 
 def _arabic_ratio(s):
