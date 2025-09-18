@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 RAG Orchestrator (Arabic) — no-bias priors & strictness booster
@@ -8,24 +7,51 @@ RAG Orchestrator (Arabic) — no-bias priors & strictness booster
 - Numeric/time/day strictness recovery loop
 - Backwards-compatible with existing retrival_model (RET) contract
 
-This is a drop-in replacement for NewRag.py (renamed to NewRag_no_bias.py).
+Usage examples:
 
-Usage example:
-python NewRag_no_bias.py --chunks Data_pdf_clean_chunks.jsonl --sanity --no-llm --regex-hunt --hourlines-only --out-dir runs
+# Strict sanity run (deterministic, extractive)
+python NewRag.py \
+  --chunks Data_pdf_clean_chunks.jsonl \
+  --hier-index heading_inverted_index.json \
+  --aliases section_aliases.json \
+  --sanity --no-llm --regex-hunt --hourlines-only --out-dir runs
+
+# Interactive chatbot
+python NewRag.py \
+  --chunks Data_pdf_clean_chunks.jsonl \
+  --hier-index heading_inverted_index.json \
+  --aliases section_aliases.json \
+  --no-llm --regex-hunt --hourlines-only --out-dir runs
 """
 
-import os, sys
+import os, sys, re, json, time, argparse, logging
+from datetime import datetime
+from collections import defaultdict
+from types import SimpleNamespace
+
+# ===================== Robust local imports (bullet-proof in Colab) =====================
+import importlib.util
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from prior_deriver import derive_section_priors
-from intent_patterns import INTENT_PATTERNS  # if you import it too
+def _import_local(mod_name: str, file_name: str):
+    path = os.path.join(HERE, file_name)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Required module file not found: {path}")
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+    sys.modules[mod_name] = mod
+    return mod
 
-import json, time, argparse, logging
-from datetime import datetime
-from collections import defaultdict
-from types import SimpleNamespace
+_prior_deriver = _import_local("prior_deriver", "prior_deriver.py")
+_intent_patterns = _import_local("intent_patterns", "intent_patterns.py")
+
+derive_section_priors = _prior_deriver.derive_section_priors
+norm = _intent_patterns.norm
+# ========================================================================================
 
 # Quiet noisy libs
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -37,10 +63,8 @@ try:
 except Exception:
     torch = None
 
-# Your retriever module
+# Your retriever module (already in repo)
 import retrival_model as RET
-from prior_deriver import derive_section_priors
-from intent_patterns import norm
 
 # ---------------- Utilities for dict-or-object chunks ----------------
 def _get_attr_or_key(obj, key, default=None):
@@ -349,7 +373,7 @@ def _regex_hunt_generic(text, q_kws, intent=None):
             continue
         # ban accounting lexemes for non-finance intents
         if intent in ("work_hours","ramadan_hours","overtime","annual_leave","sick_leave","hourly_exit"):
-            if any(b in L for b in ACCOUNTING_BAN): 
+            if any(b in L for b in ACCOUNTING_BAN):
                 continue
         score = 0
         if _line_has_generic_numeric(L): score += 3
@@ -583,7 +607,6 @@ def _pass_strict(question: str, body_only: str) -> bool:
 
 def run_test_prompts(index: RET.HybridIndex, tokenizer, model,
                      use_llm: bool, use_rerank_flag: bool, artifacts_dir: str, cfg: SimpleNamespace, hier=None):
-    import io
     os.makedirs(artifacts_dir, exist_ok=True)
     results_path = os.path.join(artifacts_dir, "results.jsonl")
     summary_md   = os.path.join(artifacts_dir, "summary.md")
@@ -666,7 +689,7 @@ def main():
     parser.add_argument("--device", type=str, default="auto", choices=["auto","cpu","cuda"])
     parser.add_argument("--out-dir", type=str, default="runs")
 
-    # NEW: general controls
+    # General controls
     parser.add_argument("--regex-hunt", action="store_true", help="Generic numeric/time/day hunter (question-driven).")
     parser.add_argument("--hourlines-only", action="store_true", help="Keep only lines with times/days/numbers/% when relevant.")
     parser.add_argument("--max-bullets", type=int, default=5, help="Max bullets.")
@@ -748,7 +771,7 @@ def main():
             tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
             mdl = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
         except Exception as e:
-            LOG.warning("Failed to load LLM (%s); continuing retrieval-only. Error: %s", args.model, e)
+            LOG.warning(f"Failed to load LLM ({args.model}); continuing retrieval-only. Error: {e}")
             tok = mdl = None; use_llm = False
 
     use_rerank_flag = not args.no_rerank
