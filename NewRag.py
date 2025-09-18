@@ -14,6 +14,14 @@ Usage example:
 python NewRag_no_bias.py --chunks Data_pdf_clean_chunks.jsonl --sanity --no-llm --regex-hunt --hourlines-only --out-dir runs
 """
 
+import os, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from prior_deriver import derive_section_priors
+from intent_patterns import INTENT_PATTERNS  # if you import it too
+
 import os, sys, re, json, time, argparse, logging
 from datetime import datetime
 from collections import defaultdict
