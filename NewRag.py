@@ -2,24 +2,17 @@
 """
 RAG Orchestrator (Arabic) — no-bias priors & strictness booster (single-file)
 - Inlines tiny helpers that used to live in prior_deriver.py and intent_patterns.py
-- Derives section "priors" ONLY from the CURRENT headings (no hardcoded numbers)
-- Priors are soft boosts (ordering only; never filters content out)
-- Numeric/time/day strictness recovery for hours/limits/% questions
+- Data-driven section "priors" derived from *current* headings (no section numbers, no hardcoding)
+- Priors are soft boosts (never filter content out) and only change ordering
 - Negation-aware scoring for approval-like intents
-- Strong boilerplate/TOC/values cleanup
-- Extra-robust hierarchy walker (handles dict, list, tuples, and custom objects)
+- Numeric/time/day strictness recovery for hours/limits/% questions
+- Backwards-compatible with retrival_model (RET) interface
 
 USAGE (strict sanity, extractive, deterministic):
-python NewRag.py --chunks Data_pdf_clean_chunks.jsonl \
-  --hier-index heading_inverted_index.json --aliases section_aliases.json \
-  --sanity --no-llm --regex-hunt --hourlines-only \
-  --max-bullets 3 --bullet-max-chars 160 --paginate-chars 700
+python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --hier-index heading_inverted_index.json --aliases section_aliases.json --sanity --no-llm --regex-hunt --hourlines-only --out-dir runs
 
 USAGE (interactive chatbot):
-python NewRag.py --chunks Data_pdf_clean_chunks.jsonl \
-  --hier-index heading_inverted_index.json --aliases section_aliases.json \
-  --no-llm --regex-hunt --hourlines-only \
-  --max-bullets 3 --bullet-max-chars 160 --paginate-chars 700
+python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --hier-index heading_inverted_index.json --aliases section_aliases.json --no-llm --regex-hunt --hourlines-only --out-dir runs
 """
 
 import os, sys, re, json, time, argparse, logging
@@ -44,7 +37,11 @@ def norm(s: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-# Intent → heading stems (soft, language stems only — no section numbers)
+# Soft, data-driven "priors" derived from headings from the CURRENT hierarchy.
+# hier is what RET.load_hierarchy returns; support a few shapes robustly:
+# - list of dicts with keys like {'heading': '...', 'pages': [12,13]}
+# - dict mapping normalized heading -> {'pages': set/list}
+# - list of tuples (heading, pages)
 _INTENT_TO_HEADING_STEMS = {
     "work_hours": ["ساعات العمل", "الدوام", "ايام الدوام", "الحضور", "الانصراف", "اوقات العمل"],
     "ramadan_hours": ["ساعات العمل","الدوام","رمضان","ايام الصوم","اوقات العمل"],
@@ -73,98 +70,47 @@ _INTENT_TO_HEADING_STEMS = {
 }
 
 def _iter_headings(hier):
-    """
-    Yield (heading_text, pages_set) for a wide variety of hierarchy shapes:
-    - dict: {heading: {"pages":[...]}} OR {heading: [pages]} OR {heading: set(...)}.
-    - list/tuple of dicts/tuples: [{"heading":..., "pages":[...]}, (heading,[...]), ...]
-    - custom objects with fields like .items(), .nodes, .children, or .as_list()
-    - a single object with .heading and .pages
-    """
-    if not hier:
-        return
-
-    # If it's already (heading, pages) iterable
-    try:
-        # Some custom objects implement __iter__ but are not sequences
-        test_iter = iter(hier)
-        # Protect against strings/unicode
-        if isinstance(hier, (str, bytes)):
-            raise TypeError
-        for item in test_iter:
-            hd = None; pages = set()
-            if isinstance(item, dict):
-                hd = item.get("heading") or item.get("title") or item.get("name") or item.get("h")
-                pg = item.get("pages") or item.get("page_set") or item.get("p") or []
-                if isinstance(pg, (list,set,tuple)): pages = set(pg)
-                elif isinstance(pg, int): pages = {pg}
-            elif isinstance(item, (list, tuple)) and item:
-                hd = item[0]
-                if len(item) > 1:
-                    pg = item[1]
-                    if isinstance(pg, (list,set,tuple)): pages = set(pg)
-                    elif isinstance(pg, int): pages = {pg}
-            elif hasattr(item, "__dict__"):
-                hd = getattr(item, "heading", None) or getattr(item, "title", None) or getattr(item, "name", None)
-                pg = getattr(item, "pages", None) or getattr(item, "page_set", None)
-                if isinstance(pg, (list,set,tuple)): pages = set(pg)
-                elif isinstance(pg, int): pages = {pg}
-            if hd:
-                yield str(hd), pages
-        return
-    except TypeError:
-        pass
-
-    # dict-like
+    # Yield (heading_text, pages_set) robustly
+    if not hier: return
     if isinstance(hier, dict):
         for k, v in hier.items():
             hd = k
             pages = set()
             if isinstance(v, dict):
-                pg = v.get("pages") or v.get("page_set") or v.get("p") or v.get("pg") or []
+                pg = v.get("pages") or v.get("page_set") or []
                 if isinstance(pg, (list,set,tuple)): pages = set(pg)
                 elif isinstance(pg, int): pages = {pg}
-            elif isinstance(v, (list,set,tuple)):
-                pages = set(v)
-            elif isinstance(v, int):
-                pages = {v}
             yield str(hd), pages
         return
-
-    # single object with children
-    for attr in ("items", "as_list", "nodes", "children"):
-        if hasattr(hier, attr):
-            try:
-                seq = getattr(hier, attr)()
-                for pair in _iter_headings(seq):
-                    yield pair
-                return
-            except Exception:
-                pass
-
-    # single object with heading/pages
-    if hasattr(hier, "heading") or hasattr(hier, "title") or hasattr(hier, "name"):
-        hd = getattr(hier, "heading", None) or getattr(hier, "title", None) or getattr(hier, "name", None)
-        pg = getattr(hier, "pages", None) or getattr(hier, "page_set", None)
-        pages = set(pg) if isinstance(pg, (list,set,tuple)) else ({pg} if isinstance(pg, int) else set())
+    # list-like
+    for item in hier:
+        hd = None; pages = set()
+        if isinstance(item, dict):
+            hd = item.get("heading") or item.get("title") or item.get("name") or item.get("h")
+            pg = item.get("pages") or item.get("page_set") or item.get("p") or []
+            if isinstance(pg, (list,set,tuple)): pages = set(pg)
+            elif isinstance(pg, int): pages = {pg}
+        elif isinstance(item, (list,tuple)) and item:
+            hd = item[0]
+            if len(item) > 1:
+                pg = item[1]
+                if isinstance(pg, (list,set,tuple)): pages = set(pg)
+                elif isinstance(pg, int): pages = {pg}
         if hd:
             yield str(hd), pages
 
 def derive_section_priors(intent: str, hier) -> dict:
     """
-    Return {"pages": set[int], "headings": [matched_headings]} based ONLY on current headings.
-    No hardcoded section numbers; matching is via normalized stem inclusion or token overlap.
+    Return {"pages": set[int], "headings": [matched_headings]} based ONLY on current hierarchy headings.
+    No hardcoded section numbers; matching is via normalized stem inclusion.
     """
     intent = intent or ""
     norm_int = norm(intent)
     stems = _INTENT_TO_HEADING_STEMS.get(intent, [])
     if not stems and norm_int:
-        # Light heuristics when classifier label is generic
-        if "دوام" in norm_int or "ساعات" in norm_int:
-            stems = _INTENT_TO_HEADING_STEMS["work_hours"]
-        elif "رمضان" in norm_int:
-            stems = _INTENT_TO_HEADING_STEMS["ramadan_hours"]
-        elif "عروض" in norm_int or "سقف" in norm_int:
-            stems = _INTENT_TO_HEADING_STEMS["procurement_thresholds"]
+        if "دوام" in norm_int or "ساعات" in norm_int: stems = _INTENT_TO_HEADING_STEMS["work_hours"]
+        elif "رمضان" in norm_int: stems = _INTENT_TO_HEADING_STEMS["ramadan_hours"]
+        elif "عروض" in norm_int or "سقف" in norm_int: stems = _INTENT_TO_HEADING_STEMS["procurement_thresholds"]
 
     pages, matched = set(), []
     for heading, pset in _iter_headings(hier):
@@ -367,9 +313,8 @@ def _sentences(txt):
     lines = [l.strip() for l in txt.splitlines() if l.strip()]
     keep = []
     for l in lines:
-        if any(re.match(p, l) for p in _HEADING_PATTERNS):
-            continue
-        keep.append(l.strip())
+        if any(re.match(p, l) for p in _HEADING_PATTERNS): continue
+        keep.append(l)
     txt2 = " ".join(keep)
     parts = re.split(r"(?<=[\.\!\؟])\s+|[\n\r]+|[•\-–]\s+", txt2)
     parts = [p.strip(" -–•\t") for p in parts if p and len(p.strip()) > 0]
@@ -388,16 +333,10 @@ def _clean_text(txt):
     lines = [l.strip() for l in txt.splitlines() if l.strip()]
     keep = []
     for l in lines:
-        if any(re.match(p, l) for p in _HEADING_PATTERNS):
-            continue
-        # drop TOC-ish and boilerplate/slogans/vision-values
-        L = l.strip()
-        if ("فهرس المحتويات" in L or "جميع الحقوق محفوظة" in L or
-            "القيم" in L or "الرؤية" in L or "الرسالة" in L or
-            "قيمنا" in L or "رؤيتنا" in L or "مهمتنا" in L or
-            _SECTION_HEAVY.search(L)):
-            continue
-        keep.append(L)
+        if any(re.match(p, l) for p in _HEADING_PATTERNS): continue
+        if "فهرس المحتويات" in l or "جميع الحقوق محفوظة" in l: continue
+        if _SECTION_HEAVY.search(l): continue
+        keep.append(l)
     txt = " ".join(keep).strip()
     txt = re.sub(r"\s+", " ", txt).strip()
     return txt
@@ -438,7 +377,7 @@ def _question_keywords(q):
     if "ساعات" in qn or "دوام" in qn: extras += ["ساعات","دوام","من","إلى","حتى"]
     if "رمضان" in qn: extras += ["رمضان","الصوم"]
     if "اضاف" in qn: extras += ["اضافيه","العمل الاضافي","اجر"]
-    if "عطل" in qn او "عطله" in qn: extras += ["العطل","الرسمية","عطله","نهاية","أسبوع"]
+    if "عطل" in qn or "عطله" in qn: extras += ["العطل","الرسمية","عطله","نهاية","أسبوع"]
     if "استراح" in qn or "راحه" in qn: extras += ["استراحه","راحه","مده","مدتها"]
     if "مغادر" in qn: extras += ["مغادره","ساعيه","الحد","الاقصى","شهري"]
     if "اجازه" in qn: extras += ["اجازه","ايام","مده","سنو"]
@@ -506,28 +445,19 @@ def _regex_hunt_generic(text, q_kws, intent=None):
         if "فهرس المحتويات" in L or "جميع الحقوق محفوظة" in L: continue
         if _arabic_ratio(L) < 0.4 and not _line_has_generic_numeric(L):
             continue
-        # ban accounting lexemes for non-finance intents
         if intent in ("work_hours","ramadan_hours","overtime","annual_leave","sick_leave","hourly_exit"):
             if any(b in L for b in ACCOUNTING_BAN):
                 continue
-
-        # -------- enhanced scoring --------
         score = 0
-        if _line_has_generic_numeric(L):
-            score += 5
-        NL = norm(L)
+        if _line_has_generic_numeric(L): score += 3
         for kw in q_kws:
-            if kw and kw in NL:
-                score += 1
-        if any(v in L for v in POLICY_VERBS):
-            score += 1
+            if kw and kw in norm(L): score += 1
+        if any(v in L for v in POLICY_VERBS): score += 1
         if intent in ("overtime","salary_advance","remote_work","hourly_exit"):
-            has_req = any(k in NL for k in REQ)
-            has_neg = any(k in NL for k in NEG)
+            has_req = any(k in norm(L) for k in REQ)
+            has_neg = any(k in norm(L) for k in NEG)
             if has_req and not has_neg: score += 3
-            if has_req and has_neg:     score -= 3
-        if len(L) < 12:
-            score -= 1
+            if has_req and has_neg: score -= 3
         if score > 0:
             hits.append((score, L))
     hits.sort(key=lambda x: (-x[0], len(x[1])))
@@ -574,13 +504,13 @@ def _is_hours_like(question: str, intent: str = "") -> bool:
 def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
              use_llm: bool = True, use_rerank_flag: bool = True, cfg: SimpleNamespace = None, hier=None) -> str:
     t0 = time.time()
-    cfg = cfg or SimpleNamespace(max_bullets=5, bullet_max_chars=120, paginate_chars=600,
+    cfg = cfg or SimpleNamespace(max_bullets=5, bullet_max_chars=120, paginate_chars=800,
                                  hourlines_only=False, regex_hunt=True)
     intent = RET.classify_intent(question)
 
     # --------- derive priors from current document (NO section numbers) ---------
-    priors = derive_section_priors(intent, hier) if hier is not None else {"pages": set(), "headings": []}
-    prior_pages = list(priors.get("pages", []) or [])
+    priors = derive_section_priors(intent, hier or [])  # {"pages": set[int], "headings": [...]}
+    prior_pages = list(priors.get("pages", []))
 
     # Use existing extractive path first (keeps compatibility)
     extractive_answer = RET.answer(question, index, intent, use_rerank_flag=use_rerank_flag)
@@ -626,34 +556,43 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
                 t = CHUNKS_BY_PAGE.get(p, "")
                 if not t: continue
                 hunted.extend(_regex_hunt_generic(t, q_kws, intent=intent))
-                if len(hunted) >= 14: break
+                if len(hunted) >= 10: break
         # then cited pages
         if not hunted and cited_pages:
             for p in cited_pages:
                 t = CHUNKS_BY_PAGE.get(p, "")
                 if not t: continue
                 hunted.extend(_regex_hunt_generic(t, q_kws, intent=intent))
-                if len(hunted) >= 14: break
+                if len(hunted) >= 10: break
         # global fallback ordered by priors first
         if not hunted:
             all_pages = (prior_pages or []) + [p for p in sorted(CHUNKS_BY_PAGE) if p not in prior_pages]
             for p in all_pages:
                 t = CHUNKS_BY_PAGE.get(p, "")
                 hunted.extend(_regex_hunt_generic(t, q_kws, intent=intent))
-                if len(hunted) >= 14: break
+                if len(hunted) >= 10: break
         # prefer hunted lines when strict numerics expected
         if hunted and (_expects_numerics(question) or hours_like):
-            body_raw = "\n".join(hunted[:12])
+            body_raw = "\n".join(hunted[:8])
 
     # 3) Final formatting (LLM optional, but we keep it off-safe by default)
     def _final(dt, text, srcs):
-        parts = _paginate_text(text, max_chars=cfg.paginate_chars)
+        # Robust paginate_chars: default 800, but always at least 700
+        pg = getattr(cfg, "paginate_chars", 800)
+        try:
+            pg = int(pg)
+        except Exception:
+            pg = 800
+        pg = max(700, pg)
+        parts = _paginate_text(text, max_chars=pg)
         if len(parts) > 1:
             labeled = []
             for i, p in enumerate(parts, 1):
                 labeled.append(f"الجزء {i}/{len(parts)}:\n{p}")
-            text = "\n\n".join(labeled)
-        return f"⏱ {dt:.2f}s | 🤖 {text}\n{srcs}" if srcs else f"⏱ {dt:.2f}s | 🤖 {text}"
+            text_out = "\n\n".join(labeled)
+        else:
+            text_out = parts[0] if parts else text
+        return f"⏱ {dt:.2f}s | 🤖 {text_out}\n{srcs}" if srcs else f"⏱ {dt:.2f}s | 🤖 {text_out}"
 
     if not body_raw or len(body_raw.strip()) == 0:
         dt = time.time() - t0
@@ -669,29 +608,15 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
         for p in (prior_pages or []):
             t = CHUNKS_BY_PAGE.get(p, "")
             hunted2.extend(_regex_hunt_generic(t, q_kws, intent=intent))
-            if len(hunted2) >= 14: break
+            if len(hunted2) >= 10: break
         if hunted2:
-            body_clean = _clean_text("\n".join(hunted2[:12]))
+            body_clean = _clean_text("\n".join(hunted2[:8]))
             body_clean = _purge_non_arabic_lines(body_clean)
 
     # No LLM path (recommended for strict accuracy)
     if (not use_llm) or (tokenizer is None) or (model is None):
         dt = time.time() - t0
         bullets = _bullets_for_display(body_clean or body_raw, question, intent, cfg)
-
-        # ensure numbers-first display for numeric/time questions (auto, even if flags absent)
-        if (_expects_numerics(question) or hours_like):
-            cfg2 = SimpleNamespace(
-                regex_hunt=True,
-                hourlines_only=True,                # force filter
-                max_bullets=min(3, cfg.max_bullets),
-                bullet_max_chars=max(140, cfg.bullet_max_chars),
-                paginate_chars=max(700, cfg.paginate_chars),
-            )
-            bullets_num = _bullets_for_display(body_clean or body_raw, question, intent, cfg2)
-            if bullets_num:
-                bullets = bullets_num
-
         if not bullets:
             bullets = _as_bullets_clipped(_sentences(body_clean or body_raw), limit=cfg.max_bullets, max_chars=cfg.bullet_max_chars)
         formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
@@ -725,15 +650,6 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
         if not resp:
             dt = time.time() - t0
             bullets = _bullets_for_display(body_clean or body_raw, question, intent, cfg)
-            # numbers-first fallback again
-            if (_expects_numerics(question) or hours_like):
-                cfg2 = SimpleNamespace(regex_hunt=True, hourlines_only=True,
-                                       max_bullets=min(3, cfg.max_bullets),
-                                       bullet_max_chars=max(140, cfg.bullet_max_chars),
-                                       paginate_chars=max(700, cfg.paginate_chars))
-                bullets_num = _bullets_for_display(body_clean or body_raw, question, intent, cfg2)
-                if bullets_num:
-                    bullets = bullets_num
             formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
             return _final(dt, formatted, sources)
         dt = time.time() - t0
@@ -742,14 +658,6 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
         LOG.warning(f"LLM generation failed: {e}")
         dt = time.time() - t0
         bullets = _bullets_for_display(body_clean or body_raw, question, intent, cfg)
-        if (_expects_numerics(question) or hours_like):
-            cfg2 = SimpleNamespace(regex_hunt=True, hourlines_only=True,
-                                   max_bullets=min(3, cfg.max_bullets),
-                                   bullet_max_chars=max(140, cfg.bullet_max_chars),
-                                   paginate_chars=max(700, cfg.paginate_chars))
-            bullets_num = _bullets_for_display(body_clean or body_raw, question, intent, cfg2)
-            if bullets_num:
-                bullets = bullets_num
         formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
         return _final(dt, formatted, sources)
 
@@ -867,7 +775,7 @@ def main():
     parser.add_argument("--hourlines-only", action="store_true", help="Keep only lines with times/days/numbers/% when relevant.")
     parser.add_argument("--max-bullets", type=int, default=5, help="Max bullets.")
     parser.add_argument("--bullet-max-chars", type=int, default=120, help="Max characters per bullet.")
-    parser.add_argument("--paginate-chars", type=int, default=600, help="Pagination threshold of body.")
+    parser.add_argument("--paginate-chars", type=int, default=800, help="Pagination threshold of body (min 700 will be enforced).")
 
     args = parser.parse_args()
     cfg = SimpleNamespace(
