@@ -1,27 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — no-bias priors & strictness booster
-- Data-driven section priors derived at runtime from the *current* PDF headings (no section numbers)
-- Soft prior boosting (never filters) + page/window ordering using priors first
-- Negation-aware scoring for approval-type intents
-- Numeric/time/day strictness recovery loop
-- Backwards-compatible with existing retrival_model (RET) contract
+RAG Orchestrator (Arabic) — no-bias priors & strictness booster (single-file, no external helper imports)
+- Inlines tiny helpers that used to live in prior_deriver.py and intent_patterns.py
+- Data-driven section "priors" derived from *current* headings (no section numbers, no hardcoding)
+- Priors are soft boosts (never filter content out) and only change ordering
+- Negation-aware scoring for approval-like intents
+- Numeric/time/day strictness recovery for hours/limits/% questions
+- Backwards-compatible with retrival_model (RET) interface
 
-Usage examples:
+USAGE (strict sanity, extractive, deterministic):
+python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --hier-index heading_inverted_index.json --aliases section_aliases.json --sanity --no-llm --regex-hunt --hourlines-only --out-dir runs
 
-# Strict sanity run (deterministic, extractive)
-python NewRag.py \
-  --chunks Data_pdf_clean_chunks.jsonl \
-  --hier-index heading_inverted_index.json \
-  --aliases section_aliases.json \
-  --sanity --no-llm --regex-hunt --hourlines-only --out-dir runs
-
-# Interactive chatbot
-python NewRag.py \
-  --chunks Data_pdf_clean_chunks.jsonl \
-  --hier-index heading_inverted_index.json \
-  --aliases section_aliases.json \
-  --no-llm --regex-hunt --hourlines-only --out-dir runs
+USAGE (interactive chatbot):
+python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --hier-index heading_inverted_index.json --aliases section_aliases.json --no-llm --regex-hunt --hourlines-only --out-dir runs
 """
 
 import os, sys, re, json, time, argparse, logging
@@ -29,29 +20,119 @@ from datetime import datetime
 from collections import defaultdict
 from types import SimpleNamespace
 
-# ===================== Robust local imports (bullet-proof in Colab) =====================
-import importlib.util
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+# --------------------------------------------------------------------------------------
+# Inline minimal helpers that previously lived in separate files
+# --------------------------------------------------------------------------------------
 
-def _import_local(mod_name: str, file_name: str):
-    path = os.path.join(HERE, file_name)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Required module file not found: {path}")
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    mod = importlib.util.module_from_spec(spec)
-    assert spec and spec.loader
-    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
-    sys.modules[mod_name] = mod
-    return mod
+# Normalizer for Arabic text (lowercase, strip diacritics, unify alef/ya/ta marbuta, remove punctuation)
+_AR_DIAC = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]")
+def norm(s: str) -> str:
+    if s is None: return ""
+    t = s.strip().lower()
+    t = _AR_DIAC.sub("", t)
+    t = t.replace("أ","ا").replace("إ","ا").replace("آ","ا")
+    t = t.replace("ى","ي").replace("ئ","ي").replace("ؤ","و")
+    t = t.replace("ة","ه")
+    t = re.sub(r"[^\w\s%٪:–\-]", " ", t, flags=re.UNICODE)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
-_prior_deriver = _import_local("prior_deriver", "prior_deriver.py")
-_intent_patterns = _import_local("intent_patterns", "intent_patterns.py")
+# Soft, data-driven "priors" derived from headings from the CURRENT hierarchy.
+# hier is what RET.load_hierarchy returns; support a few shapes robustly:
+# - list of dicts with keys like {'heading': '...', 'pages': [12,13]}
+# - dict mapping normalized heading -> {'pages': set/list}
+# - list of tuples (heading, pages)
+_INTENT_TO_HEADING_STEMS = {
+    "work_hours": ["ساعات العمل", "الدوام", "ايام الدوام", "الحضور", "الانصراف", "اوقات العمل"],
+    "ramadan_hours": ["ساعات العمل","الدوام","رمضان","ايام الصوم","اوقات العمل"],
+    "work_days": ["ايام العمل","ايام الدوام","نهاية الاسبوع","السبت"],
+    "breaks": ["استراحه","راحه","فترات الاستراحه"],
+    "overtime": ["العمل الاضافي","الساعات الاضافيه","اضافي","بدل الساعات الاضافيه"],
+    "public_holiday_comp": ["العطل الرسميه","الاعياد","تعويض العطل"],
+    "annual_leave": ["اجازه سنويه","سنويه","رصيد الاجازات"],
+    "sick_leave": ["اجازه مرضيه","مرضيه","تقرير طبي"],
+    "maternity_leave": ["اجازه امومه","الامومه"],
+    "bereavement_leave": ["اجازه حداد","الحداد"],
+    "payroll": ["الرواتب","الراتب","صرف الرواتب","شؤون ماليه"],
+    "transport_allowance": ["بدل المواصلات","مواصلات","السفر الداخلي"],
+    "salary_advance": ["سلفه","سلف الرواتب","السلف"],
+    "petty_cash": ["النثريات","المصروفات النثريه","مصاريف"],
+    "procurement_thresholds": ["المشتريات","عروض الاسعار","سقف الشراء"],
+    "conflict_of_interest": ["تضارب مصالح","الهدايا","الضيافه","مدونه السلوك"],
+    "asset_custody": ["العهد","العهدة","التسليم","الاستلام"],
+    "remote_work": ["العمل عن بعد","العمل من المنزل","سياسه العمل عن بعد"],
+    "hourly_exit": ["مغادره ساعيه","اذن مغادره","اذن ساعه"],
+    "performance_review": ["تقييم الاداء","الاداء السنوي"],
+    "discipline": ["الانذار","العقوبات","التدرج التاديبي","لائحه العقوبات"],
+    "confidentiality": ["السرية","حماية المعلومات","البيانات"],
+    "conduct_harassment": ["السلوك المهني","التحرش","مدونه السلوك"],
+    "per_diem": ["مياومات","بدل سفر","السفر","بدل المياومات"],
+}
 
-derive_section_priors = _prior_deriver.derive_section_priors
-norm = _intent_patterns.norm
-# ========================================================================================
+def _iter_headings(hier):
+    # Yield (heading_text, pages_set) robustly
+    if not hier: return
+    if isinstance(hier, dict):
+        for k, v in hier.items():
+            hd = k
+            pages = set()
+            if isinstance(v, dict):
+                pg = v.get("pages") or v.get("page_set") or []
+                if isinstance(pg, (list,set,tuple)): pages = set(pg)
+                elif isinstance(pg, int): pages = {pg}
+            yield str(hd), pages
+        return
+    # list-like
+    for item in hier:
+        hd = None; pages = set()
+        if isinstance(item, dict):
+            hd = item.get("heading") or item.get("title") or item.get("name") or item.get("h")
+            pg = item.get("pages") or item.get("page_set") or item.get("p") or []
+            if isinstance(pg, (list,set,tuple)): pages = set(pg)
+            elif isinstance(pg, int): pages = {pg}
+        elif isinstance(item, (list,tuple)) and item:
+            hd = item[0]
+            if len(item) > 1:
+                pg = item[1]
+                if isinstance(pg, (list,set,tuple)): pages = set(pg)
+                elif isinstance(pg, int): pages = {pg}
+        if hd:
+            yield str(hd), pages
+
+def derive_section_priors(intent: str, hier) -> dict:
+    """
+    Return {"pages": set[int], "headings": [matched_headings]} based ONLY on current hierarchy headings.
+    No hardcoded section numbers; matching is via normalized stem inclusion.
+    """
+    intent = intent or ""
+    norm_int = norm(intent)
+    stems = _INTENT_TO_HEADING_STEMS.get(intent, [])
+    # Also if classifier returned a generic/unknown label, loosely guess from question-like token in intent string
+    if not stems and norm_int:
+        if "دوام" in norm_int or "ساعات" in norm_int: stems = _INTENT_TO_HEADING_STEMS["work_hours"]
+        elif "رمضان" in norm_int: stems = _INTENT_TO_HEADING_STEMS["ramadan_hours"]
+        elif "عروض" in norm_int or "سقف" in norm_int: stems = _INTENT_TO_HEADING_STEMS["procurement_thresholds"]
+
+    pages, matched = set(), []
+    for heading, pset in _iter_headings(hier):
+        nh = norm(heading)
+        ok = False
+        for stem in stems:
+            if stem and stem in nh:
+                ok = True; break
+        # also allow intent-token overlap as a last resort
+        if not ok and norm_int:
+            toks = set(norm_int.split())
+            if any(t and t in nh for t in toks):
+                ok = True
+        if ok:
+            matched.append(heading)
+            pages |= set(pset)
+    return {"pages": pages, "headings": matched}
+
+# --------------------------------------------------------------------------------------
+# End inlined helpers
+# --------------------------------------------------------------------------------------
 
 # Quiet noisy libs
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -63,7 +144,7 @@ try:
 except Exception:
     torch = None
 
-# Your retriever module (already in repo)
+# Your retriever module (existing in your repo)
 import retrival_model as RET
 
 # ---------------- Utilities for dict-or-object chunks ----------------
@@ -193,9 +274,7 @@ _TIME_PATTERNS = [
 ]
 _PERCENT_RX = re.compile(r"\b\d{1,3}\s*[%٪]\b")
 _DURATION_RX = re.compile(r"\b\d{1,2}\s*(?:دقيقة|دقائق|ساعة|ساعات|يوم|أيام)\b")
-_RANGE_RX = re.compile(r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b")
-_NUMERICISH = re.compile(r"(\d|[%٪])")
-_SECTION_HEAVY = re.compile(r"(?:\d+\.){2,}\d+")  # lines like 3.1.5.7 (TOC-ish)
+_SECTION_HEAVY = re.compile(r"(?:\d+\.){2,}\d+")  # like 3.1.5.7 (TOC-ish)
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _AR_LETTER_RX = re.compile(r"[ء-ي]")
@@ -214,7 +293,7 @@ def _purge_non_arabic_lines(s, min_ratio=0.66):
     for line in s.splitlines():
         ln = line.strip()
         if not ln: continue
-        # keep numeric-only or time lines even if not Arabic-heavy
+        # keep numeric/time lines even if not Arabic-heavy
         t = _to_western_digits(ln)
         if any(re.search(p, t) for p in _TIME_PATTERNS) or _PERCENT_RX.search(t) or _DURATION_RX.search(t):
             keep.append(ln); continue
@@ -257,7 +336,6 @@ def _clean_text(txt):
     keep = []
     for l in lines:
         if any(re.match(p, l) for p in _HEADING_PATTERNS): continue
-        # drop TOC-ish and boilerplate
         if "فهرس المحتويات" in l or "جميع الحقوق محفوظة" in l: continue
         if _SECTION_HEAVY.search(l): continue
         keep.append(l)
@@ -297,7 +375,6 @@ def _norm_tokens(s):
 def _question_keywords(q):
     qn = norm(q or "")
     toks = _norm_tokens(qn)
-    # add simple stems/anchors
     extras = []
     if "ساعات" in qn or "دوام" in qn: extras += ["ساعات","دوام","من","إلى","حتى"]
     if "رمضان" in qn: extras += ["رمضان","الصوم"]
@@ -342,15 +419,14 @@ def _page_ctx_from_pages(pages, max_chars=3500):
 
 # ---------------- Generic regex hunter (question-driven) ----------------
 GENERIC_RXS = [
-    re.compile(r"\b\d{1,2}:\d{2}\b"),                     # 08:30
-    re.compile(r"\b\d{1,2}[:٫]\d{2}\b"),                  # 08٫30
-    re.compile(r"\b\d{1,2}\s*(?:ص|م)\b"),                 # 8 ص
-    re.compile(r"\b\d{1,2}\s*(?:إلى|حتى|-\s*|–\s*)\s*\d{1,2}\b"),  # 8 إلى 3 / 8-3
-    re.compile(r"\b\d{1,3}\s*[%٪]\b"),                    # 150% / ١٥٠٪
+    re.compile(r"\b\d{1,2}:\d{2}\b"),
+    re.compile(r"\b\d{1,2}[:٫]\d{2}\b"),
+    re.compile(r"\b\d{1,2}\s*(?:ص|م)\b"),
+    re.compile(r"\b\d{1,2}\s*(?:إلى|حتى|-\s*|–\s*)\s*\d{1,2}\b"),
+    re.compile(r"\b\d{1,3}\s*[%٪]\b"),
     re.compile(r"\b\d{1,2}\s*(?:دقيقة|دقائق|ساعة|ساعات|يوم|أيام)\b"),
-    re.compile(r"\b\d+\b"),                               # plain numbers
+    re.compile(r"\b\d+\b"),
 ]
-
 ACCOUNTING_BAN = {"اهلاك","الاستهلاك","أصل","الاصول","الميزانيه","الاهلاك","القيمه الدفتريه"}
 
 def _line_has_generic_numeric(t):
@@ -371,16 +447,14 @@ def _regex_hunt_generic(text, q_kws, intent=None):
         if "فهرس المحتويات" in L or "جميع الحقوق محفوظة" in L: continue
         if _arabic_ratio(L) < 0.4 and not _line_has_generic_numeric(L):
             continue
-        # ban accounting lexemes for non-finance intents
         if intent in ("work_hours","ramadan_hours","overtime","annual_leave","sick_leave","hourly_exit"):
-            if any(b in L for b in ACCOUNTING_BAN):
+            if any(b in L for b in ACCOUNTING_BAN): 
                 continue
         score = 0
         if _line_has_generic_numeric(L): score += 3
         for kw in q_kws:
             if kw and kw in norm(L): score += 1
         if any(v in L for v in POLICY_VERBS): score += 1
-        # polarity preference for approval-type intents
         if intent in ("overtime","salary_advance","remote_work","hourly_exit"):
             has_req = any(k in norm(L) for k in REQ)
             has_neg = any(k in norm(L) for k in NEG)
