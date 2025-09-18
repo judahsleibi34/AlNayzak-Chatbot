@@ -367,7 +367,7 @@ def _sentences(txt):
     lines = [l.strip() for l in txt.splitlines() if l.strip()]
     keep = []
     for l in lines:
-        if any(re.match(p, l) for p in _HEADING_PATTERNS): 
+        if any(re.match(p, l) for p in _HEADING_PATTERNS):
             continue
         keep.append(l.strip())
     txt2 = " ".join(keep)
@@ -388,11 +388,11 @@ def _clean_text(txt):
     lines = [l.strip() for l in txt.splitlines() if l.strip()]
     keep = []
     for l in lines:
-        if any(re.match(p, l) for p in _HEADING_PATTERNS): 
+        if any(re.match(p, l) for p in _HEADING_PATTERNS):
             continue
         # drop TOC-ish and boilerplate/slogans/vision-values
         L = l.strip()
-        if ("فهرس المحتويات" in L or "جميع الحقوق محفوظة" in L or 
+        if ("فهرس المحتويات" in L or "جميع الحقوق محفوظة" in L or
             "القيم" in L or "الرؤية" in L or "الرسالة" in L or
             "قيمنا" in L or "رؤيتنا" in L or "مهمتنا" in L or
             _SECTION_HEAVY.search(L)):
@@ -438,7 +438,7 @@ def _question_keywords(q):
     if "ساعات" in qn or "دوام" in qn: extras += ["ساعات","دوام","من","إلى","حتى"]
     if "رمضان" in qn: extras += ["رمضان","الصوم"]
     if "اضاف" in qn: extras += ["اضافيه","العمل الاضافي","اجر"]
-    if "عطل" in qn or "عطله" in qn: extras += ["العطل","الرسمية","عطله","نهاية","أسبوع"]
+    if "عطل" in qn او "عطله" in qn: extras += ["العطل","الرسمية","عطله","نهاية","أسبوع"]
     if "استراح" in qn or "راحه" in qn: extras += ["استراحه","راحه","مده","مدتها"]
     if "مغادر" in qn: extras += ["مغادره","ساعيه","الحد","الاقصى","شهري"]
     if "اجازه" in qn: extras += ["اجازه","ايام","مده","سنو"]
@@ -508,37 +508,26 @@ def _regex_hunt_generic(text, q_kws, intent=None):
             continue
         # ban accounting lexemes for non-finance intents
         if intent in ("work_hours","ramadan_hours","overtime","annual_leave","sick_leave","hourly_exit"):
-            if any(b in L for b in ACCOUNTING_BAN): 
+            if any(b in L for b in ACCOUNTING_BAN):
                 continue
 
         # -------- enhanced scoring --------
         score = 0
-        # strong boost for numeric/time/day lines
-        if _line_has_generic_numeric(L): 
-            score += 5   # was 3
-
-        # keyword overlap
+        if _line_has_generic_numeric(L):
+            score += 5
         NL = norm(L)
         for kw in q_kws:
-            if kw and kw in NL: 
+            if kw and kw in NL:
                 score += 1
-
-        # policy verb hint
-        if any(v in L for v in POLICY_VERBS): 
+        if any(v in L for v in POLICY_VERBS):
             score += 1
-
-        # approval-style polarity
         if intent in ("overtime","salary_advance","remote_work","hourly_exit"):
             has_req = any(k in NL for k in REQ)
             has_neg = any(k in NL for k in NEG)
             if has_req and not has_neg: score += 3
             if has_req and has_neg:     score -= 3
-
-        # tiny penalty for very short fragments (e.g., stray headings)
-        if len(L) < 12: 
+        if len(L) < 12:
             score -= 1
-        # ----------------------------------
-
         if score > 0:
             hits.append((score, L))
     hits.sort(key=lambda x: (-x[0], len(x[1])))
@@ -654,7 +643,7 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
                 if len(hunted) >= 14: break
         # prefer hunted lines when strict numerics expected
         if hunted and (_expects_numerics(question) or hours_like):
-            body_raw = "\n".join(hunted[:12])   # keep more concrete lines
+            body_raw = "\n".join(hunted[:12])
 
     # 3) Final formatting (LLM optional, but we keep it off-safe by default)
     def _final(dt, text, srcs):
@@ -757,8 +746,7 @@ def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
             cfg2 = SimpleNamespace(regex_hunt=True, hourlines_only=True,
                                    max_bullets=min(3, cfg.max_bullets),
                                    bullet_max_chars=max(140, cfg.bullet_max_chars),
-                                   paginate_chars=max(700, cfg.paginate_ch
-ars))
+                                   paginate_chars=max(700, cfg.paginate_chars))
             bullets_num = _bullets_for_display(body_clean or body_raw, question, intent, cfg2)
             if bullets_num:
                 bullets = bullets_num
