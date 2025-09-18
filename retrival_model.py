@@ -1,167 +1,717 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — grounded-only answers, page-aware fallback, compact bullets,
-pagination, and persistent artifacts for sanity tests. (HARDENED + COMPACT)
+Arabic-first hybrid retriever with persistence (for RAG).
 
-Adds on top of your version:
-- Compact bullets: salient-line selection, noise filtering, deduplication, smart truncation
-- CLI knobs: --max-bullets, --bullet-max-chars, --paginate-chars, --hourlines-only
-- Hours/days hardening still in place (page-aware rescue + time/day focus)
-- Arabic-only purge + mojibake cleanup
+Features
+--------
+- Robust JSON/JSONL loader for chunks
+- Section/alias gating (optional)
+- Hybrid retrieval (dense + TF-IDF char/word), optional CE re-rank
+- Arabic normalization & OCR-aware sentence splitting
+- Intent classification + must-have concept guards
+- Policy-aware time-range extraction (work hours / Ramadan)
+- Answer synthesizers per intent
+- Index persistence: save/load embeddings, FAISS, TF-IDF to speed startup
 
-Usage examples:
-# Strict, compact, no LLM (recommended for your strict criteria)
-python NewRag.py \
-  --chunks Data_pdf_clean_chunks.jsonl \
-  --sanity \
-  --device cuda \
-  --use-4bit \
-  --no-llm \
-  --max-bullets 5 \
-  --bullet-max-chars 140 \
-  --paginate-chars 700 \
-  --hourlines-only \
-  --out-dir runs
+Usage examples
+--------------
+Build from scratch and save an index:
+  python retrival_model.py --chunks ".\\Data_pdf_clean_chunks.jsonl" --hier-index ".\\heading_inverted_index.json" --aliases ".\\section_aliases.json" --save-index ".artifact" --rerank
 
-# Single question
-python NewRag.py \
-  --chunks Data_pdf_clean_chunks.jsonl \
-  --ask "ما هي ساعات الدوام الرسمية من وإلى؟" \
-  --device cuda \
-  --use-4bit \
-  --no-llm \
-  --max-bullets 5 \
-  --bullet-max-chars 140 \
-  --hourlines-only
+Load a saved index (fast) and run interactive QA:
+  python retrival_model.py --chunks ".\\Data_pdf_clean_chunks.jsonl" --load-index ".artifact" --rerank
+
+Run the bundled sanity suite:
+  python retrival_model.py --chunks ".\\Data_pdf_clean_chunks.jsonl" --hier-index ".\\heading_inverted_index.json" --aliases ".\\section_aliases.json" --sanity --rerank
 """
 
-import os
-import sys
-import re
-import json
-import time
-import argparse
-import logging
-from datetime import datetime
-from collections import defaultdict
+import os, re, sys, json, argparse, logging, pickle, hashlib
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict, Any, Set
 
-# Quieter logs / stable console
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-os.environ.setdefault("TQDM_DISABLE", "1")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import numpy as np
+
+# Optional deps (faiss, sklearn)
+try:
+    import faiss  # type: ignore
+except Exception:
+    faiss = None
 
 try:
-    import torch
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.utils import Bunch
+    import joblib
 except Exception:
-    torch = None
+    TfidfVectorizer = None
+    joblib = None
 
-# Your retriever module
-import retrival_model as RET
+try:
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers.cross_encoder import CrossEncoder
+except Exception:
+    print("Please install: pip install sentence-transformers scikit-learn faiss-cpu joblib")
+    raise
 
-# ---------------- Utilities for dict-or-object chunks ----------------
-def _get_attr_or_key(obj, key, default=None):
-    """Return obj[key] if dict-like, else getattr(obj, key, default).
-       Also tries common nesting spots like .meta / .metadata if present."""
-    # dict-like
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    # object attribute
-    val = getattr(obj, key, None)
-    if val is not None:
-        return val
-    # nested common containers
-    for nest in ("meta", "metadata", "__dict__"):
-        container = getattr(obj, nest, None)
-        if isinstance(container, dict) and key in container:
-            return container.get(key)
-    return default
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+LOG = logging.getLogger(__name__)
 
-def _first_non_empty(*vals):
-    for v in vals:
-        if v is None:
+# ---------------- Arabic utils ----------------
+
+AR_DIAC = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]')  # tashkeel
+AR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"٠١٢٣٤٥٦٧٨٩")}
+IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
+
+def ar_normalize(s: str) -> str:
+    if not s: return ""
+    s = s.replace('\u0640','')                # tatweel
+    s = AR_DIAC.sub('', s)                    # remove diacritics
+    s = (s.replace('أ','ا').replace('إ','ا').replace('آ','ا')
+           .replace('ى','ي').replace('ة','ه'))  # unify alif/ya/ta marbuta
+    s = s.translate(AR_NUMS).translate(IR_NUMS)   # Arabic/Indic -> ASCII
+    s = s.replace('،', ',').replace('٫','.')
+    s = ' '.join(s.split())
+    return s
+
+def rtl_wrap(t: str) -> str:
+    return '\u202B' + t + '\u202C'
+
+SENT_SPLIT_RE = re.compile(r'(?<=[\.\!\؟\?،]|[\n])\s+')
+
+def sent_split(s: str) -> List[str]:
+    # OCR-aware: split then drop junk fragments
+    parts = [p.strip() for p in SENT_SPLIT_RE.split(s) if p and p.strip()]
+    out = []
+    for p in parts:
+        pn = ar_normalize(p)
+        # drop fragments that are too short or symbol-heavy
+        if len(pn) < 6:
             continue
-        s = str(v)
-        if s.strip():
-            return s
-    return ""
-
-def _first_page_like(obj):
-    """Try multiple possible page fields and coerce to int if possible."""
-    candidates = (
-        _get_attr_or_key(obj, "page"),
-        _get_attr_or_key(obj, "page_number"),
-        _get_attr_or_key(obj, "page_num"),
-        _get_attr_or_key(obj, "page_idx"),
-        _get_attr_or_key(obj, "pageno"),
-        _get_attr_or_key(obj, "page_start"),
-    )
-    for c in candidates:
-        if c is None or str(c).strip() == "":
+        if sum(ch.isalpha() for ch in pn) < 0.5 * len(pn.replace(" ", "")):
+            # reject if <50% letters (likely noise/IDs)
             continue
-        try:
-            return int(str(c).strip())
-        except Exception:
-            pass
+        out.append(p)
+    return out if out else ([s.strip()] if s.strip() else [])
+
+# ---------------- Data IO ----------------
+
+CHUNKS_PATH = "Data_pdf_clean_chunks.jsonl"
+PDF_PATH    = "Data_pdf.pdf"
+
+@dataclass
+class Chunk:
+    id: int
+    page: int
+    text: str
+    norm: str
+
+# --------- Robust JSON/JSONL loader
+
+_TEXT_KEYS = {"text","text_display","content","body","raw","paragraph","para","line","value","data","clean_text","norm"}
+_TEXT_ARRAY_KEYS = {"lines","paragraphs","paras","sentences","chunks","blocks","spans","tokens"}
+_PAGE_KEYS = {"page","page_no","page_num","pageNumber","page_index","Page","PageNo"}
+_ID_KEYS = {"id","chunk_id","cid","idx","index","Id","ID"}
+
+def _as_text(v):
+    if isinstance(v, str):
+        return v.strip() if v.strip() else None
+    if isinstance(v, list):
+        parts = [str(x).strip() for x in v if isinstance(x, (str,int,float)) and str(x).strip()]
+        return "\n".join(parts) if parts else None
     return None
 
-# ---------------- Global page index (built in main) ----------------
-CHUNKS_BY_PAGE = {}  # {int page: "full concatenated text for that page"}
+def _get_any(d: dict, keys: set):
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    lower = {k.lower(): k for k in d.keys()}
+    for k in keys:
+        lk = k.lower()
+        if lk in lower and d[lower[lk]] not in (None, ""):
+            return d[lower[lk]]
+    return None
 
-def _build_page_text_index(chunks):
-    pages = defaultdict(list)
-    for ch in chunks:
-        # robust text extraction (support dicts and objects)
-        txt = _first_non_empty(
-            _get_attr_or_key(ch, "text"),
-            _get_attr_or_key(ch, "content"),
-            _get_attr_or_key(ch, "chunk"),
-            _get_attr_or_key(ch, "body"),
-            "",
-        )
-        if isinstance(txt, bytes):
+def _file_hash(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1<<20)
+            if not b: break
+            h.update(b)
+    return h.hexdigest()
+
+def load_chunks(path=CHUNKS_PATH) -> Tuple[List[Chunk], str]:
+    if not os.path.exists(path):
+        LOG.error("Chunks file not found: %s", path); sys.exit(1)
+    LOG.info("Loading documents from %s ...", path)
+
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        first = f.read(1)
+        f.seek(0)
+        if first == "[":
+            rows = json.load(f)
+        else:
+            for line in f:
+                line = line.strip().rstrip(",")
+                if not line: continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    if line.startswith('"') and line.endswith('"'):
+                        rows.append(line.strip('"'))
+                    continue
+
+    chunks: List[Chunk] = []
+    for idx, j in enumerate(rows):
+        if isinstance(j, str):
+            t = j; page = -1; cid = idx
+        elif isinstance(j, dict):
+            t = _as_text(_get_any(j, _TEXT_KEYS)) or _as_text(_get_any(j, _TEXT_ARRAY_KEYS))
+            if not t: continue
+            page = _get_any(j, _PAGE_KEYS)
+            try: page = int(page) if page is not None else -1
+            except Exception: page = -1
+            cid = _get_any(j, _ID_KEYS)
+            try: cid = int(cid)
+            except Exception: cid = idx
+        else:
+            continue
+        t = t.strip()
+        if not t: continue
+        chunks.append(Chunk(id=int(cid), page=int(page), text=t, norm=ar_normalize(t)))
+
+    LOG.info("Loaded %d chunks", len(chunks))
+    if len(chunks) == 0:
+        LOG.error("No chunks parsed. Check that your file contains textual fields.")
+        sys.exit(1)
+    return chunks, _file_hash(path)
+
+# ---------------- Hierarchy / aliases (section gating)
+
+@dataclass
+class HierData:
+    inverted: Dict[str, List[int]]
+    aliases: Dict[str, List[str]]
+
+def _load_json(path: Optional[str]) -> Dict[str, Any]:
+    if not path or not os.path.exists(path): return {}
+    with open(path, "r", encoding="utf-8") as f: return json.load(f)
+
+def load_hierarchy(hier_index_path: Optional[str], aliases_path: Optional[str]) -> Optional[HierData]:
+    inv = _load_json(hier_index_path)
+    aliases = _load_json(aliases_path)
+    if not inv:
+        LOG.info("No hierarchy index provided/loaded.")
+        return None
+
+    def _n(s: str) -> str: return ar_normalize(s).lower()
+
+    # tolerate string IDs in the inverted index: coerce if possible, skip otherwise
+    inv_n: Dict[str, List[int]] = {}
+    for k, v in inv.items():
+        if not isinstance(v, list): continue
+        cleaned: List[int] = []
+        for x in v:
             try:
-                txt = txt.decode("utf-8", "ignore")
+                cleaned.append(int(x))
             except Exception:
-                txt = ""
-        pg = _first_page_like(ch)
-        if pg is None:
-            # sometimes chunks carry page in a nested "source" string (e.g., "Data_pdf.pdf - page 16")
-            src = _get_attr_or_key(ch, "source") or _get_attr_or_key(ch, "doc_source") or ""
-            try:
-                pg_guess = re.search(r"(?:[Pp]age|صفحة|الصفحة)\s+(\d+)", str(src))
-                if pg_guess:
-                    pg = int(pg_guess.group(1))
-            except Exception:
-                pg = None
-        if pg is not None and txt:
-            pages[int(pg)].append(str(txt))
-    # join per page
-    return {p: "\n".join(v) for p, v in pages.items()}
+                m = re.search(r'(\d+)$', str(x))
+                if m:
+                    try:
+                        cleaned.append(int(m.group(1)))
+                    except Exception:
+                        pass
+        inv_n[_n(k)] = cleaned
 
-# ---------------- Logging ----------------
-def setup_logger(log_path: str):
-    logger = logging.getLogger("rag_orchestrator")
-    logger.setLevel(logging.INFO)
+    aliases_n = {_n(k): [_n(a) for a in v] for k, v in (aliases or {}).items()}
+    LOG.info("Loaded hierarchy: %d index keys, %d alias sets", len(inv_n), len(aliases_n))
+    return HierData(inverted=inv_n, aliases=aliases_n)
 
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+def _hier_candidates(query: str, hd: HierData) -> Set[int]:
+    qn = ar_normalize(query).lower()
+    toks = [t for t in re.split(r"[\s\|\:/,;]+", qn) if t]
+    keys = set(toks)
+    for canon, alist in hd.aliases.items():
+        if any(a in qn for a in alist+[canon]):
+            keys.add(canon)
+    cand: Set[int] = set()
+    for k in keys:
+        if k in hd.inverted:
+            cand.update(hd.inverted[k])
+    return cand
 
-    fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(message)s"))
+# ---------------- Index with persistence ----------------
 
-    logger.handlers = []
-    logger.addHandler(ch)
-    logger.addHandler(fh)
-    return logger
+class HybridIndex:
+    def __init__(self, chunks: List[Chunk], chunks_hash: str, hier: Optional[HierData] = None,
+                 model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
+        self.chunks = chunks
+        self.chunks_hash = chunks_hash
+        self.hier = hier
+        self.model_name = model_name
+        self.model = SentenceTransformer(model_name)
+        self.emb = None
+        self.faiss = None
+        self.tf_char = None
+        self.tf_word = None
+        self.char_mat = None
+        self.word_mat = None
 
-LOG = logging.getLogger("rag_orchestrator")  # reconfigured in main()
+    # ---------- Persistence helpers
+    def save(self, out_dir: str):
+        os.makedirs(out_dir, exist_ok=True)
+        meta = {
+            "model_name": self.model_name,
+            "chunks_hash": self.chunks_hash,
+            "n_chunks": len(self.chunks),
+            "ids": [c.id for c in self.chunks],
+        }
+        with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
 
-# ---------------- Sanity Prompts ----------------
-DEFAULT_SANITY_PROMPTS = [
+        if self.emb is not None:
+            np.save(os.path.join(out_dir, "embeddings.npy"), self.emb)
+
+        if faiss is not None and self.faiss is not None:
+            faiss.write_index(self.faiss, os.path.join(out_dir, "faiss.index"))
+
+        if joblib and TfidfVectorizer is not None:
+            if self.tf_char is not None:
+                joblib.dump(self.tf_char, os.path.join(out_dir, "tf_char.pkl"))
+            if self.tf_word is not None:
+                joblib.dump(self.tf_word, os.path.join(out_dir, "tf_word.pkl"))
+            if self.char_mat is not None:
+                joblib.dump(self.char_mat, os.path.join(out_dir, "char_mat.pkl"))
+            if self.word_mat is not None:
+                joblib.dump(self.word_mat, os.path.join(out_dir, "word_mat.pkl"))
+
+        LOG.info("Saved index artifacts to %s", out_dir)
+
+    def load(self, in_dir: str) -> bool:
+        try:
+            with open(os.path.join(in_dir, "meta.json"), "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if meta.get("chunks_hash") != self.chunks_hash or meta.get("n_chunks") != len(self.chunks):
+                LOG.warning("Artifact/chunks mismatch; will rebuild instead of loading.")
+                return False
+
+            emb_path = os.path.join(in_dir, "embeddings.npy")
+            if os.path.exists(emb_path):
+                self.emb = np.load(emb_path)
+            else:
+                LOG.warning("embeddings.npy missing; cannot load.")
+                return False
+
+            if faiss is not None:
+                faiss_path = os.path.join(in_dir, "faiss.index")
+                if os.path.exists(faiss_path):
+                    self.faiss = faiss.read_index(faiss_path)
+                else:
+                    # Rebuild FAISS quickly from embeddings
+                    d = self.emb.shape[1]
+                    self.faiss = faiss.IndexFlatIP(d)
+                    self.faiss.add(self.emb.astype('float32'))
+            else:
+                self.faiss = None
+
+            if joblib and TfidfVectorizer is not None:
+                tp = os.path.join(in_dir, "tf_char.pkl"); wp = os.path.join(in_dir, "tf_word.pkl")
+                cmp = os.path.join(in_dir, "char_mat.pkl"); wmp = os.path.join(in_dir, "word_mat.pkl")
+                if all(os.path.exists(p) for p in [tp, wp, cmp, wmp]):
+                    self.tf_char = joblib.load(tp)
+                    self.tf_word = joblib.load(wp)
+                    self.char_mat = joblib.load(cmp)
+                    self.word_mat = joblib.load(wmp)
+                else:
+                    LOG.warning("TF-IDF artifacts missing; skipping sparse load.")
+
+            LOG.info("Loaded index artifacts from %s", in_dir)
+            return True
+        except Exception as e:
+            LOG.warning("Failed to load artifacts from %s: %s", in_dir, e)
+            return False
+
+    def build(self):
+        LOG.info("Building embeddings...")
+        texts = [c.norm for c in self.chunks]
+        self.emb = self.model.encode(texts, batch_size=128, convert_to_numpy=True,
+                                     show_progress_bar=True, normalize_embeddings=True)
+        if faiss is not None:
+            d = self.emb.shape[1]
+            self.faiss = faiss.IndexFlatIP(d)
+            self.faiss.add(self.emb.astype('float32'))
+            LOG.info("Built FAISS index")
+        else:
+            LOG.warning("faiss not available; dense retrieval will be slower.")
+
+        if TfidfVectorizer is None:
+            LOG.warning("sklearn not available; skipping TF-IDF indexes.")
+        else:
+            self.tf_char = TfidfVectorizer(analyzer='char', ngram_range=(2,5), min_df=1)
+            self.char_mat = self.tf_char.fit_transform(texts)
+            self.tf_word = TfidfVectorizer(analyzer='word', ngram_range=(1,2),
+                                           token_pattern=r"(?u)\b\w+\b", min_df=1)
+            self.word_mat = self.tf_word.fit_transform(texts)
+            LOG.info("Built TF-IDF (char+word) indexes")
+
+        LOG.info("Built embeddings for %d chunks", len(self.chunks))
+
+    def dense(self, q: str, topk=60, restrict_ids: Optional[Set[int]] = None):
+        qv = self.model.encode([q], convert_to_numpy=True, normalize_embeddings=True)
+        if self.faiss is not None:
+            D, I = self.faiss.search(qv.astype('float32'), max(topk, 60))
+            scores, idxs = D[0], I[0]
+        else:
+            sims = self.emb @ qv[0]
+            idxs = np.argsort(-sims)[:max(topk, 60)]
+            scores = sims[idxs]
+        if restrict_ids is None:
+            return scores[:topk], idxs[:topk]
+        # STRICT gating: keep only restricted; if empty -> later we fall back with penalty
+        filtS, filtI = [], []
+        rset = set(int(x) for x in restrict_ids)
+        for s, i in zip(scores, idxs):
+            if int(i) in rset:
+                filtS.append(float(s)); filtI.append(int(i))
+            if len(filtI) >= topk: break
+        return np.array(filtS), np.array(filtI)
+
+    def sparse(self, q: str):
+        if self.tf_char is None or self.tf_word is None:
+            return None, None
+        qc = self.tf_char.transform([q])
+        qw = self.tf_word.transform([q])
+        c_scores = (self.char_mat @ qc.T).toarray().ravel()
+        w_scores = (self.word_mat @ qw.T).toarray().ravel()
+        return c_scores, w_scores
+
+# ---------------- Intents ----------------
+
+KW_HOURS = re.compile(r'(ساعات)\s+(الدوام|العمل)')
+KW_RAMADAN = re.compile(r'رمضان')
+KW_LEAVE = re.compile(r'(إجاز|اجاز)')
+KW_OVERTIME = re.compile(r'(إضافي|اضافي)')
+KW_FLEX = re.compile(r'(مرون|الحضور|الانصراف|تأخير|تاخير|خصم|بصمة)')
+KW_BREAK = re.compile(r'(استراح|راحة|بريك|رضاعه|رضاع)')
+KW_PROC = re.compile(r'(شراء|مشتريات|عروض|مناقصة|توريد|تأمين|حد|سقف)')
+KW_WORKDAYS = re.compile(r'(ايام|أيام).*(العمل|الدوام)|السبت|الاحد|الخميس')
+
+def classify_intent(q: str) -> str:
+    qn = ar_normalize(q)
+    if KW_HOURS.search(qn) and KW_RAMADAN.search(qn): return "ramadan_hours"
+    if KW_WORKDAYS.search(qn): return "workdays"
+    if KW_HOURS.search(qn): return "work_hours"
+    if KW_FLEX.search(qn): return "flex"
+    if KW_BREAK.search(qn): return "break"
+    if KW_OVERTIME.search(qn): return "overtime"
+    if KW_LEAVE.search(qn): return "leave"
+    if KW_PROC.search(qn): return "procurement"
+    # travel/per-diem hints
+    if re.search(r'(مياوم|مياومات|بدل\s*سفر|نفقات|فواتير|ايصالات|تذاكر|فندق)', qn):
+        return "per_diem"
+    return "general"
+
+INTENT_HINTS = {
+    "flex":    ["مرون", "تاخير", "تأخير", "الحضور", "الانصراف", "خصم", "بصمه","بصمة"],
+    "break":   ["استراح", "راحة", "فسحه", "فسحة", "بريك","رضاعه","رضاع","دقيقه","دقائق","ساعه","ساعة"],
+    "overtime":["اضافي", "ساعات اضافيه", "تعويض", "موافقه", "اعتماد", "العطل","العطل الرسميه","نسبه","125","أجر","احتساب"],
+    "leave":   ["اجاز", "سنويه", "مرضيه", "طارئه", "امومه", "حداد","بدون راتب","رصيد"],
+    "work_hours": ["ساعات", "دوام", "العمل", "الى", "حتي", "حتى","من","ايام","اوقات"],
+    "ramadan_hours": ["رمضان", "ساعات", "دوام", "العمل", "الى", "حتي", "حتى","من","اوقات"],
+    "procurement": ["عروض","ثلاثه","ثلاث","3","عرض","مناقص","سقف","حد","شراء","مشتريات","شيكل","₪","دينار","دولار","توريد"],
+    "per_diem": ["مياومه","مياومات","بدل","سفر","صرف","نفقات","مصاريف","فواتير","ايصالات","تذاكر","فندق","اقامه","اقامة"],
+    "workdays": ["ايام","العمل","الدوام","السبت","الاحد","الخميس","من","الى"]
+}
+
+# Map of must-have concept tokens per intent (guard-check) – expanded forms/variants
+INTENT_MUST = {
+    "ramadan_hours": ["رمضان","ساعات","دوام","العمل","من","الى","حتى","حتي"],
+    "work_hours":    ["ساعات","دوام","العمل","من","الى","حتى","حتي"],
+    "workdays":      ["ايام","العمل","الدوام","السبت","الاحد","الخميس","من","الى"],
+    "overtime":      ["اضافي","أجر","اجر","احتساب","نسبه","125","موافقه","اعتماد"],
+    "procurement":   ["عروض","عرض","ثلاث","ثلاثه","3","شراء","سقف","حد","شيكل","₪","دينار","دولار","توريد","مشتريات"],
+    "per_diem":      ["مياومات","مياومه","بدل","سفر","صرف","نفقات","مصاريف","فواتير","ايصالات","تذاكر","فندق","اقامه","اقامة"],
+    "break":         ["استراح","راحة","فسحه","فسحة","بريك","رضاع","رضاعه","ساعه","ساعة","دقائق"],
+    "leave":         ["اجاز","اجازه","إجازة","سنويه","سنوية","مرضيه","طارئه","امومه","حداد","بدون","راتب"],
+    "general":       []
+}
+
+def _must_tokens_present(sn_norm: str, intent: str) -> bool:
+    req = INTENT_MUST.get(intent, [])
+    if not req: return True
+    return all(any(tok in sn_norm for tok in [r]) for r in req[:0]) or any(tok in sn_norm for tok in req)
+
+# ---------------- Policy-aware time extraction ----------------
+
+TIME_RE = re.compile(
+    r'(?:من\s*)?'
+    r'(\d{1,2}(?::|\.)?\d{0,2})\s*'
+    r'(?:[-–—]|الى|إلى|حتي|حتى)\s*'
+    r'(\d{1,2}(?::|\.)?\d{0,2})'
+)
+
+def _normalize_hhmm(tok: str) -> str:
+    tok = tok.replace('.', ':')
+    if ':' not in tok:
+        return f"{int(tok):d}:00"
+    h, m = tok.split(':', 1)
+    if m == "": m = "00"
+    return f"{int(h):d}:{int(m):02d}"
+
+def _to_minutes(hhmm: str) -> int:
+    h, m = hhmm.split(':'); return int(h)*60 + int(m)
+
+def _plausible_workday(a: int, b: int) -> bool:
+    # Allow reasonable day window; force end>start
+    return 6*60 <= a <= 20*60+30 and 6*60 <= b <= 20*60+30 and b > a
+
+def extract_all_ranges(text: str, intent: str) -> List[Tuple[int,int]]:
+    """
+    Extract all ranges. For work-hour intents:
+      - If end<=start, try +12h or swap.
+      - If duration < 6h, attempt intelligent flip; accept if 6–11h and plausible daytime.
+      - Keep only plausible daytime 6–11h windows for work-hour intents.
+    """
+    n = ar_normalize(text)
+    ranges: List[Tuple[int,int]] = []
+    for m in TIME_RE.finditer(n):
+        a = _normalize_hhmm(m.group(1)); b = _normalize_hhmm(m.group(2))
+        A, B = _to_minutes(a), _to_minutes(b)
+
+        if B <= A:
+            B_try = B + 12*60
+            if B_try > A:
+                B = B_try
+            else:
+                A, B = B, A
+
+        if intent in ("work_hours", "ramadan_hours"):
+            dur = B - A
+            if dur < 6*60:
+                A2, B2 = B, A
+                if B2 <= A2:
+                    B2 += 12*60
+                dur2 = B2 - A2
+                if 6*60 <= dur2 <= 11*60 and _plausible_workday(A2, B2):
+                    A, B = A2, B2
+
+        ranges.append((A, B))
+
+    if intent in ("work_hours","ramadan_hours"):
+        ranges = [(A,B) for (A,B) in ranges if _plausible_workday(A,B) and 6*60 <= (B-A) <= 11*60]
+    return ranges
+
+def pick_best_range(ranges: List[Tuple[int,int]]) -> Optional[Tuple[str,str]]:
+    if not ranges: return None
+    scored = []
+    for (A,B) in ranges:
+        dur = B - A
+        target = abs(dur - 7.5*60)
+        scored.append((target, -(dur), A, B))
+    scored.sort()
+    _, _, A, B = scored[0]
+    return f"{A//60:d}:{A%60:02d}", f"{B//60:d}:{B%60:02d}"
+
+# ---------------- Retrieval & Answering ----------------
+
+def combine_scores(dense_scores, dense_idx, c_scores, w_scores,
+                   w_dense=0.60, w_char=0.20, w_word=0.20, topk=20):
+    out = []
+    for s, i in zip(dense_scores, dense_idx):
+        sc = float(s) * w_dense
+        if c_scores is not None and len(c_scores) > int(i): sc += float(c_scores[i]) * w_char
+        if w_scores is not None and len(w_scores) > int(i): sc += float(w_scores[i]) * w_word
+        out.append((sc, int(i)))
+    out.sort(key=lambda x: -x[0])
+    return out[:topk]
+
+def _intent_keys(intent: str) -> List[str]:
+    return INTENT_HINTS.get(intent, [])
+
+def retrieve(index: HybridIndex, q: str, rerank: bool) -> List[Tuple[float,int]]:
+    qn = ar_normalize(q)
+    restrict_ids: Optional[Set[int]] = None
+    gated = False
+    if index.hier is not None:
+        cand = _hier_candidates(qn, index.hier)
+        if cand:
+            restrict_ids = cand
+            gated = True
+
+    dS, dI = index.dense(qn, topk=60, restrict_ids=restrict_ids)
+    globally_fallback = False
+    if gated and (dI is None or len(dI) == 0):
+        globally_fallback = True
+        dS, dI = index.dense(qn, topk=60, restrict_ids=None)
+
+    cS, wS = index.sparse(qn)
+    prelim = combine_scores(dS, dI, cS, wS, topk=30)
+
+    if globally_fallback:
+        prelim = [(sc*0.85, i) for (sc,i) in prelim]
+
+    if rerank:
+        try:
+            ce = CrossEncoder("cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+            if len(prelim) > 1:
+                pairs = [(qn, index.chunks[i].text) for _, i in prelim]
+                ce_scores = ce.predict(pairs)
+                prelim = list(zip(list(map(float, ce_scores)), [i for _, i in prelim]))
+                prelim.sort(key=lambda x: -x[0])
+            LOG.info("Cross-encoder loaded: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+        except Exception as e:
+            LOG.warning("CE reranker unavailable (%s). Continuing without.", e)
+
+    return prelim[:8]
+
+def _has_numbers(sn: str) -> bool:
+    return bool(re.search(r'\d', sn))
+
+def _has_time_hint(sn: str) -> bool:
+    sn = ar_normalize(sn)
+    return any(w in sn for w in ["من","الى","حتي","حتى",":","."])
+
+def _looks_junky(sn: str) -> bool:
+    snn = ar_normalize(sn)
+    if len(snn) < 6: return True
+    # reject headings with mostly single tokens or pure numbers/artifacts
+    letters = sum(ch.isalpha() for ch in snn)
+    total = len(snn.replace(" ", ""))
+    if total > 0 and letters/total < 0.5:
+        return True
+    return False
+
+def best_snippet(chunk: Chunk, qnorm: str, intent: str, max_len=260) -> Optional[str]:
+    sents = sent_split(chunk.text)
+    if not sents: return (chunk.text[:max_len] if chunk.text else None)
+    q_terms = set([w for w in qnorm.split() if len(w) >= 3])
+    hints = _intent_keys(intent)
+
+    best, best_score = None, -1e9
+    for s in sents:
+        if _looks_junky(s): 
+            continue
+        sn = ar_normalize(s)
+        # must-have guard
+        if not _must_tokens_present(sn, intent):
+            continue
+        overlap = len(q_terms & set(sn.split()))
+        has_time = _has_numbers(sn) and _has_time_hint(sn)
+        has_hint = any(h in sn for h in hints)
+        score = 0.0
+        score += 1.2 * overlap
+        if has_time: score += 1.0
+        if has_hint: score += 0.8
+        if _has_numbers(sn) and intent in ("work_hours","ramadan_hours","overtime","leave","procurement","per_diem"):
+            score += 0.4
+        # generic penalty for bland lines
+        if overlap == 0 and not (has_time or has_hint):
+            score -= 0.6
+        if score > best_score:
+            best, best_score = s, score
+
+    if not best:
+        # fallback: take the least junky first sentence
+        for s in sents:
+            if not _looks_junky(s):
+                best = s; break
+
+    if not best:
+        return None
+
+    txt = best.strip()
+    return (txt[:max_len] + ("…" if len(txt) > max_len else ""))
+
+# ---------------- Answer synthesis helpers ----------------
+
+def _compose_hours_answer(chunks: List[Chunk], hits: List[Tuple[float,int]], intent: str) -> Optional[str]:
+    for _, i in hits:
+        sents = sent_split(chunks[i].text)
+        for s in sents:
+            if not _must_tokens_present(ar_normalize(s), intent):
+                continue
+            ranges = extract_all_ranges(s, intent)
+            rng = pick_best_range(ranges)
+            if rng:
+                a, b = rng
+                suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
+                txt = f"ساعات الدوام{suffix} من {a} إلى {b}."
+                src = f"Data_pdf.pdf - page {chunks[i].page}"
+                return rtl_wrap(txt) + "\n" + f"Sources:\n1. {src}"
+    return None
+
+def _compose_procurement_threshold(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    for _, i in hits:
+        sents = sent_split(chunks[i].text)
+        for s in sents:
+            sn = ar_normalize(s)
+            if any(w in sn for w in ["عروض","ثلاث","3","سقف","حد","شيكل","₪","دينار","دولار","شراء","مشتريات"]):
+                srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k, (_, j) in enumerate(hits, 1)]
+                return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
+def _compose_overtime(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    found = {"approval": None, "calc": None, "form": None}
+    for _, i in hits:
+        for s in sent_split(chunks[i].text):
+            sn = ar_normalize(s)
+            if any(w in sn for w in ["موافق", "اعتماد", "موافقه مسبقه"]) and found["approval"] is None:
+                found["approval"] = s.strip()
+            if any(w in sn for w in ["احتساب", "يتم الاحتساب", "نسبة", "أجر","اجر","125"]) and found["calc"] is None:
+                found["calc"] = s.strip()
+            if any(w in sn for w in ["نموذج", "كشف الساعات"]) and found["form"] is None:
+                found["form"] = s.strip()
+    if any(found.values()):
+        lines = [v for v in [found["approval"], found["calc"], found["form"]] if v]
+        srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k, (_, j) in enumerate(hits, 1)]
+        return rtl_wrap(" ".join(lines)) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
+def _compose_leave(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    for _, i in hits:
+        for s in sent_split(chunks[i].text):
+            sn = ar_normalize(s)
+            if _has_numbers(sn) and any(w in sn for w in ["اجاز","سنويه","سنوية","مرضيه","حداد","امومه","طارئه","بدون راتب"]):
+                srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k, (_, j) in enumerate(hits, 1)]
+                return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
+# ---------------- Main answer function ----------------
+
+def answer(q: str, index: HybridIndex, intent: str, use_rerank_flag: bool) -> str:
+    hits = retrieve(index, q, use_rerank_flag)
+    if not hits:
+        return rtl_wrap("لم أعثر على إجابة واضحة في الدليل.")
+
+    chunks = index.chunks
+
+    if intent in ("work_hours", "ramadan_hours"):
+        composed = _compose_hours_answer(chunks, hits, intent)
+        if composed: return composed
+
+    if intent == "procurement":
+        composed = _compose_procurement_threshold(chunks, hits)
+        if composed: return composed
+
+    if intent == "overtime":
+        composed = _compose_overtime(chunks, hits)
+        if composed: return composed
+
+    if intent == "leave":
+        composed = _compose_leave(chunks, hits)
+        if composed: return composed
+
+    # Fallback: pick best snippet with intent-aware scoring
+    _, idx0 = hits[0]
+    sn = best_snippet(chunks[idx0], ar_normalize(q), intent)
+    if not sn:
+        return rtl_wrap("لم أعثر على إجابة مناسبة.")
+    srcs = [f"{k}. Data_pdf.pdf - page {chunks[i].page}" for k, (_, i) in enumerate(hits, 1)]
+    return rtl_wrap(sn) + "\n" + "Sources:\n" + "\n".join(srcs)
+
+# ---------------- CLI ----------------
+
+SANITY_PROMPTS = [
     "ما هي ساعات الدوام الرسمية من وإلى؟",
     "هل يوجد مرونة في الحضور والانصراف؟ وكيف تُحسب دقائق التأخير؟",
     "هل توجد استراحة خلال الدوام؟ وكم مدتها؟",
@@ -194,776 +744,67 @@ DEFAULT_SANITY_PROMPTS = [
     "هل توجد مياومات/بدل سفر؟ وكيف تُصرف",
 ]
 
-# ---------------- Arabic helpers / checks ----------------
-_HEADING_PATTERNS = [
-    r"^\s*الإجابة\s*:?$",
-    r"^\s*الإجابة\s+المختصرة\s*:?\s*$",
-    r"^\s*الخلاصة\s*:?\s*$",
-    r"^\s*الملخص\s*:?\s*$",
-    r"^\s*Summary\s*:?\s*$",
-    r"^\s*Answer\s*:?\s*$",
-]
+def run_sanity(index: HybridIndex, use_rerank_flag: bool):
+    LOG.info("Running sanity suite...\n")
+    passed = 0
+    for q in SANITY_PROMPTS:
+        intent = classify_intent(q)
+        out = answer(q, index, intent, use_rerank_flag)
+        # simple pass heuristic: if it found sources & isn't the generic fail
+        ok = "Sources:" in out and "لم أعثر" not in out
+        if ok: passed += 1
+        print(("✅ " if ok else "❌ ") + f"Q: {q}")
+        print(out)
+        print("-"*80)
+    print(f"Concept-check PASS: {passed}/{len(SANITY_PROMPTS)}")
 
-_AR_DAYS = ["الأحد", "الإثنين", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
-
-# Accepts: 8:30, 8٫30, 8-5, 8 – 5, 8 إلى 5, 8 حتى 5, 8 ص/5 م
-_TIME_PATTERNS = [
-    r"\b\d{1,2}:\d{2}\b",                 # 8:30
-    r"\b\d{1,2}[:٫]\d{2}\b",              # 8٫30
-    r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b",      # 8-5 / 8–5
-    r"\b\d{1,2}\s*(?:إلى|حتى)\s*\d{1,2}\b",  # 8 إلى 5 / 8 حتى 5
-    r"\b\d{1,2}\s*(?:ص|م)\b",             # 8 ص / 5 م
-]
-
-_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-_AR_LETTER_RX = re.compile(r"[ء-ي]")  # coarse Arabic block
-
-def _to_western_digits(s: str) -> str:
-    return (s or "").translate(_ARABIC_DIGITS)
-
-def _strip_mojibake(s: str) -> str:
-    if not s:
-        return ""
-    s = s.replace("\ufeff", "").replace(" ", "").replace("\uFFFD", "")
-    s = re.sub(r"uni[0-9A-Fa-f]{4}", "", s)
-    return s
-
-def _arabic_ratio(s: str) -> float:
-    if not s:
-        return 1.0
-    letters = re.findall(r"\w", s, flags=re.UNICODE)
-    if not letters:
-        return 1.0
-    arabic = _AR_LETTER_RX.findall(s)
-    return (len(arabic) / max(1, len(letters)))
-
-def _purge_non_arabic_lines(s: str, min_ratio: float = 0.80) -> str:
-    """Drop lines with too many Latin/CJK letters; keep numbers/punct."""
-    if not s:
-        return s
-    keep = []
-    for line in s.splitlines():
-        ln = line.strip()
-        if not ln:
-            continue
-        ratio = _arabic_ratio(ln)
-        # allow short tokens like "8:30"
-        has_word = bool(re.search(r"[^\W\d_]", ln, flags=re.UNICODE))
-        if (not has_word) or ratio >= min_ratio:
-            keep.append(ln)
-    return "\n".join(keep)
-
-def _extract_numbers_set(s: str):
-    if not s:
-        return set()
-    s2 = _to_western_digits(s)
-    pats = [
-        r"\b\d{1,2}:\d{2}\b",
-        r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b",
-        r"\b\d+(?:\.\d+)?\b",
-    ]
-    vals = set()
-    for p in pats:
-        for m in re.findall(p, s2):
-            vals.add(m)
-    return vals
-
-def _has_times_or_days(txt: str) -> bool:
-    if not txt:
-        return False
-    t = _to_western_digits(txt)
-    if any(day in t for day in _AR_DAYS):
-        return True
-    return any(re.search(p, t) for p in _TIME_PATTERNS)
-
-def _sentences(txt: str):
-    if not txt:
-        return []
-    lines = [l.strip() for l in txt.splitlines() if l.strip()]
-    keep = []
-    for l in lines:
-        if any(re.match(p, l) for p in _HEADING_PATTERNS):
-            continue
-        keep.append(l)
-    txt2 = " ".join(keep)
-    parts = re.split(r"(?<=[\.!\؟])\s+|[\n\r]+|[•\-–]\s+", txt2)
-    parts = [p.strip(" -–•\t") for p in parts if p and len(p.strip()) > 0]
-    merged = []
-    for p in parts:
-        if merged and len(p) < 10:
-            merged[-1] = merged[-1] + " " + p
-        else:
-            merged.append(p)
-    return merged
-
-def _clean_text(txt: str) -> str:
-    if not txt:
-        return ""
-    txt = _strip_mojibake(txt)
-    txt = re.sub(r"^```.*?$", "", txt, flags=re.M | re.S)
-    lines = [l.strip() for l in txt.splitlines() if l.strip()]
-    keep = []
-    for l in lines:
-        if any(re.match(p, l) for p in _HEADING_PATTERNS):
-            continue
-        keep.append(l)
-    txt = " ".join(keep).strip()
-    txt = re.sub(r"\s+", " ", txt).strip()
-    return txt
-
-def _is_meaningful(txt: str) -> bool:
-    return bool(txt and len(re.sub(r"\s+", "", txt)) >= 12)
-
-def _as_bullets(sents, max_items=8):
-    out = []
-    for s in sents[:max_items]:
-        s = s.strip()
-        if s:
-            out.append(f"• {s}")
-    return "\n".join(out)
-
-def _closest_bullets(txt: str, max_sents: int = 6) -> str:
-    sents = _sentences(txt)[:max_sents]
-    return _as_bullets(sents, max_items=max_sents)
-
-def _paginate_text(text: str, max_chars: int = 900):
-    text = text.strip()
-    if len(text) <= max_chars:
-        return [text]
-    parts, cur, count = [], [], 0
-    for line in text.splitlines():
-        if count + len(line) + 1 > max_chars:
-            parts.append("\n".join(cur).strip())
-            cur, count = [line], len(line)
-        else:
-            cur.append(line)
-            count += len(line) + 1
-    if cur:
-        parts.append("\n".join(cur).strip())
-    return parts
-
-def _split_answer(answer_text: str):
-    if not answer_text:
-        return "", ""
-    parts = re.split(r"\n(?=Sources:|المصادر:)", answer_text, maxsplit=1)
-    body = parts[0].strip()
-    sources = parts[1].strip() if len(parts) > 1 else ""
-    return body, sources
-
-def _format_with_intro_and_bullets(body_text: str, intro: str = "استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:"):
-    sents = _sentences(body_text)
-    if len(sents) <= 1:
-        content = f"{intro}\n{(sents[0] if sents else body_text.strip())}"
-    else:
-        content = f"{intro}\n{_as_bullets(sents)}"
-    return content
-
-def _parse_pages_from_sources(sources_text: str):
-    """Extract page numbers from Sources lines like 'Data_pdf.pdf - page 16'
-       and Arabic 'الصفحة/صفحة 16'. Handles Arabic digits too."""
-    if not sources_text:
-        return []
-    s = _to_western_digits(sources_text)
-    pages = set()
-    for m in re.findall(r"(?:\b[Pp]age\b|(?:ال)?صفحة)\s+(\d+)", s):
+def interactive_loop(index: HybridIndex, use_rerank_flag: bool):
+    print("Ready.")
+    print("اسأل عن سياسات الدليل (عربي). اكتب 'exit' للخروج.\n")
+    while True:
         try:
-            pages.add(int(m))
-        except Exception:
-            pass
-    return sorted(pages)
+            q = input("سؤالك: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting."); break
+        if not q: continue
+        if q.lower() in ("exit","quit","q"): print("Exiting."); break
+        LOG.info("Searching...")
+        intent = classify_intent(q)
+        print(answer(q, index, intent, use_rerank_flag))
+        print("-"*66)
 
-def _page_ctx_from_sources(sources_text: str, max_chars: int = 3500):
-    pages = _parse_pages_from_sources(sources_text)
-    if not pages:
-        return ""
-    buf = []
-    total = 0
-    for p in pages:
-        txt = CHUNKS_BY_PAGE.get(p, "")
-        if not txt:
-            continue
-        if total + len(txt) > max_chars:
-            remaining = max_chars - total
-            if remaining > 200:
-                buf.append(txt[:remaining])
-                total = max_chars
-                break
-        else:
-            buf.append(txt)
-            total += len(txt)
-    return _clean_text("\n".join(buf))
-
-def _is_hours_like(question: str, intent: str = "") -> bool:
-    q = (question or "").strip()
-    hours_kws = ["ساعات", "الدوام", "رمضان", "أيام الدوام", "الساعات الإضافية", "العطل الرسمية", "استراحة", "مغادرة ساعية"]
-    if any(kw in q for kw in hours_kws):
-        return True
-    return intent in ("work_hours", "ramadan_hours", "overtime", "work_days", "breaks")
-
-# ---------------- Compact bullets helpers ----------------
-_NOISE_PATTERNS = [
-    r"جميع الحقوق محفوظة",
-    r"فهرس المحتويات",
-    r"الدليل\s+الإداري",
-    r"للتعليم المساند والإبداع العلمي",
-    r"صفحة\s*\d+",
-]
-
-def _is_noise_line(ln: str) -> bool:
-    if not ln or len(ln) < 6:
-        return True
-    for rx in _NOISE_PATTERNS:
-        if re.search(rx, ln):
-            return True
-    # super short numbers-only lines are noise
-    if re.fullmatch(r"[0-9:؛–\-\s\(\)]+", _to_western_digits(ln) or ""):
-        return True
-    return False
-
-def _split_to_lines(txt: str):
-    if not txt: return []
-    # break on newlines and common list separators
-    raw = re.split(r"[\n\r]+|[•·\-\u2022]\s+|(?<=\.)\s+|(?<=\؟)\s+|(?<=\!)\s+", txt)
-    # normalize spaces
-    lines = [re.sub(r"\s+", " ", l).strip(" .-–•\t") for l in raw]
-    lines = [l for l in lines if l]
-    return lines
-
-def _smart_truncate(s: str, limit: int) -> str:
-    s = re.sub(r"\s+", " ", s).strip()
-    if len(s) <= limit:
-        return s
-    # try to cut at a natural boundary before limit
-    cut = max(
-        s.rfind("،", 0, limit),
-        s.rfind("؛", 0, limit),
-        s.rfind(".", 0, limit),
-        s.rfind(" - ", 0, limit),
-        s.rfind(" — ", 0, limit),
-        s.rfind(":", 0, limit),
-    )
-    if cut < max(20, limit // 2):
-        cut = limit
-    return s[:cut].rstrip() + "…"
-
-def _select_salient_lines(text: str, question: str, hours_like: bool, max_lines: int, force_time_lines: bool = False):
-    lines = _split_to_lines(text)
-    # purge noise & non-Arabic-heavy lines
-    cleaned = []
-    for ln in lines:
-        if _is_noise_line(ln):
-            continue
-        # keep Arabic-heavy or purely numeric/time lines
-        if _arabic_ratio(ln) < 0.6 and not _has_times_or_days(ln):
-            continue
-        cleaned.append(ln)
-
-    if hours_like:
-        if force_time_lines:
-            cleaned = [l for l in cleaned if _has_times_or_days(l)]
-        else:
-            with_time = [l for l in cleaned if _has_times_or_days(l)]
-            if with_time:
-                cleaned = with_time
-
-    # dedupe exact duplicates
-    seen, deduped = set(), []
-    for l in cleaned:
-        if l in seen:
-            continue
-        seen.add(l); deduped.append(l)
-
-    return deduped[:max_lines]
-
-def _format_compact(question: str, text: str, hours_like: bool, max_bullets: int, bullet_max_chars: int, hourlines_only: bool):
-    lines = _select_salient_lines(text, question, hours_like, max_bullets, force_time_lines=(hours_like and hourlines_only))
-    if not lines:
-        # fallback to old behavior
-        return _format_with_intro_and_bullets(text)
-    clipped = [_smart_truncate(l, bullet_max_chars) for l in lines]
-    bullets = "\n".join(f"• {l}" for l in clipped)
-    return "استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n" + bullets
-
-# ---------------- Q&A ----------------
-def ask_once(index: RET.HybridIndex,
-             tokenizer,
-             model,
-             question: str,
-             use_llm: bool = True,
-             use_rerank_flag: bool = True,
-             paginate_chars: int = 900,
-             max_bullets: int = 6,
-             bullet_max_chars: int = 160,
-             hourlines_only: bool = False) -> str:
-    """
-    1) classify intent
-    2) retrieve via RET.answer (returns text+sources)
-    3) if extractive is weak → FALL BACK to full page text from Sources pages
-    4) optional LLM refine — strictly grounded (no new facts)
-    5) format: compact bullets; paginate long outputs
-    """
-    t0 = time.time()
-    intent = RET.classify_intent(question)
-
-    extractive_answer = RET.answer(question, index, intent, use_rerank_flag=use_rerank_flag)
-
-    # Split body/sources
-    lines = str(extractive_answer or "").split('\n')
-    body_lines, source_lines, sources_started = [], [], False
-    for line in lines:
-        ls = line.strip()
-        if ls.startswith("Sources:") or ls.startswith("المصادر:"):
-            sources_started = True
-            source_lines.append(line)
-        elif sources_started:
-            source_lines.append(line)
-        else:
-            body_lines.append(line)
-
-    body_raw = '\n'.join(body_lines).strip()
-    sources = '\n'.join(source_lines).strip()
-
-    # Build page-aware context if needed
-    page_ctx = _page_ctx_from_sources(sources, max_chars=3500)
-
-    # -------------- HARDENING START --------------
-    hours_like = _is_hours_like(question, intent)
-    if page_ctx:
-        # Normalize both before checks
-        tmp_body = _clean_text(body_raw)
-        if (not tmp_body) or ("لا توجد معلومات" in tmp_body) or ("لم أعثر" in tmp_body):
-            body_raw = page_ctx
-        elif hours_like and not _has_times_or_days(tmp_body):
-            if _has_times_or_days(page_ctx):
-                body_raw = page_ctx
-            else:
-                # collect only segments from cited pages that contain times/days
-                pages = _parse_pages_from_sources(sources)
-                focused = []
-                for p in pages:
-                    t = CHUNKS_BY_PAGE.get(p, "")
-                    if t and _has_times_or_days(t):
-                        focused.append(t)
-                if focused:
-                    body_raw = _clean_text("\n".join(focused))
-
-    # If still nothing → grounded insufficiency
-    if not body_raw or len(body_raw.strip()) == 0:
-        dt = time.time() - t0
-        return _final(dt, "لا يقدّم النص المسترجَع تفاصيل كافية للإجابة بشكل قاطع من المصدر نفسه.", paginate_chars, sources)
-
-    body_clean = _clean_text(body_raw)
-
-    # If LLM disabled/unavailable → format extractive/page_ctx directly (compact)
-    if (not use_llm) or (tokenizer is None) or (model is None):
-        # Arabic-only purge of obvious noise before formatting
-        body_clean2 = _purge_non_arabic_lines(body_clean)
-        if hours_like and not _has_times_or_days(body_clean2) and _has_times_or_days(page_ctx):
-            body_clean2 = _clean_text(page_ctx)
-        dt = time.time() - t0
-        formatted = _format_compact(
-            question,
-            (body_clean2 or body_clean or body_raw),
-            hours_like=hours_like,
-            max_bullets=max_bullets,
-            bullet_max_chars=bullet_max_chars,
-            hourlines_only=hourlines_only,
-        )
-        return _final(dt, formatted, paginate_chars, sources)
-
-    # Short-circuit for hour-like answers already containing times/days
-    if hours_like and _has_times_or_days(body_clean):
-        dt = time.time() - t0
-        formatted = _format_compact(
-            question,
-            body_clean,
-            hours_like=hours_like,
-            max_bullets=max_bullets,
-            bullet_max_chars=bullet_max_chars,
-            hourlines_only=hourlines_only,
-        )
-        return _final(dt, formatted, paginate_chars, sources)
-
-    # LLM refinement (strictly grounded; Arabic-only)
-    try:
-        system_prompt = (
-            "أعد صياغة المقتطف العربي التالي بوضوح واختصار دون إضافة أي معلومة جديدة أو استنتاج. "
-            "اعتمد حصراً على هذا النص. لا تولّد أرقاماً/أوقات/أياماً غير موجودة. "
-            "حافظ على جميع الأرقام/الأوقات/الأيام كما وردت حرفياً. "
-            "اكتب الإجابة بالعربية الفصحى فقط دون استخدام أي لغة أخرى أو حروف لاتينية."
-        )
-        user_prompt = f"السؤال: {question}\nالنص لإعادة الصياغة:\n{body_clean or body_raw}"
-
-        msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        if hasattr(tokenizer, "apply_chat_template"):
-            prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        else:
-            prompt = f"[system]\n{system_prompt}\n\n[user]\n{user_prompt}\n\n[assistant]\n"
-
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-        if hasattr(model, "device"):
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-        eos_id = getattr(tokenizer, "eos_token_id", None)
-        pad_id = eos_id if eos_id is not None else getattr(tokenizer, "pad_token_id", None)
-
-        out_ids = model.generate(
-            **inputs,
-            max_new_tokens=160,
-            do_sample=False,
-            repetition_penalty=1.05,
-            eos_token_id=eos_id,
-            pad_token_id=pad_id,
-        )
-        start = inputs["input_ids"].shape[1]
-        raw = tokenizer.decode(out_ids[0][start:], skip_special_tokens=True).strip()
-        resp = _clean_text(raw)
-        resp = _purge_non_arabic_lines(resp)
-
-        # Guardrails: fidelity checks vs the true context (body_raw/body_clean)
-        src_text_for_check = body_clean or body_raw
-        src_nums = _extract_numbers_set(src_text_for_check)
-        out_nums = _extract_numbers_set(resp)
-
-        # Hour-like strictness: must retain times/days if asked
-        if hours_like and not _has_times_or_days(resp):
-            resp = ""  # reject; will fallback
-
-        # No new numbers
-        if not out_nums.issubset(src_nums):
-            resp = ""  # introduced new numbers → reject
-
-        dt = time.time() - t0
-
-        if not _is_meaningful(resp):
-            # Safe fallback: bullets from grounded context (prefer page_ctx if it has times/days)
-            fallback_txt = src_text_for_check
-            if hours_like and _has_times_or_days(page_ctx):
-                fallback_txt = _clean_text(page_ctx)
-            if _is_meaningful(fallback_txt):
-                formatted = _format_compact(
-                    question,
-                    fallback_txt,
-                    hours_like=hours_like,
-                    max_bullets=max_bullets,
-                    bullet_max_chars=bullet_max_chars,
-                    hourlines_only=hourlines_only,
-                )
-                return _final(dt, formatted, paginate_chars, sources)
-            return _final(dt, "لا يقدّم النص المسترجَع تفاصيل كافية للإجابة بشكل قاطع من المصدر نفسه.", paginate_chars, sources)
-
-        # Final formatting (compact)
-        formatted = _format_compact(
-            question,
-            resp,
-            hours_like=hours_like,
-            max_bullets=max_bullets,
-            bullet_max_chars=bullet_max_chars,
-            hourlines_only=hourlines_only,
-        )
-        return _final(dt, formatted, paginate_chars, sources)
-
-    except Exception as e:
-        LOG.warning(f"LLM generation failed: {e}")
-        dt = time.time() - t0
-        # Prefer page_ctx if it's more informative for hour-like
-        fallback_txt = body_clean if _is_meaningful(body_clean) else body_raw
-        if hours_like and _has_times_or_days(page_ctx):
-            fallback_txt = _clean_text(page_ctx)
-        formatted = _format_compact(
-            question,
-            fallback_txt,
-            hours_like=hours_like,
-            max_bullets=max_bullets,
-            bullet_max_chars=bullet_max_chars,
-            hourlines_only=hourlines_only,
-        )
-        return _final(dt, formatted, paginate_chars, sources)
-
-# helper for final formatting with pagination
-def _final(dt, text, paginate_chars, sources):
-    parts = _paginate_text(text, max_chars=paginate_chars)
-    if len(parts) > 1:
-        labeled = []
-        for i, p in enumerate(parts, 1):
-            labeled.append(f"الجزء {i}/{len(parts)}:\n{p}")
-        text = "\n\n".join(labeled)
-    return f"⏱ {dt:.2f}s | 🤖 {text}\n{sources}" if sources else f"⏱ {dt:.2f}s | 🤖 {text}"
-
-# ---------------- Sanity runner ----------------
-def _gather_sanity_prompts() -> list:
-    ret_prompts = []
-    try:
-        ret_prompts = list(getattr(RET, "SANITY_PROMPTS", []) or [])
-    except Exception:
-        ret_prompts = []
-    seen, merged = set(), []
-    for q in (ret_prompts + DEFAULT_SANITY_PROMPTS):
-        if q not in seen:
-            seen.add(q); merged.append(q)
-    return merged
-
-def _pass_loose(answer_text: str) -> bool:
-    has_sources = ("Sources:" in answer_text) or ("المصادر:" in answer_text)
-    bad = ("لا يقدّم النص المسترجَع تفاصيل كافية" in answer_text)
-    return bool(has_sources and not bad)
-
-def _pass_strict(question: str, body_only: str) -> bool:
-    if not _is_meaningful(body_only):
-        return False
-    q = question or ""
-    hours_like = any(kw in q for kw in [
-        "ساعات", "الدوام", "رمضان", "أيام الدوام", "الساعات الإضافية", "العطل الرسمية", "استراحة", "مغادرة ساعية"
-    ])
-    if hours_like:
-        return _has_times_or_days(body_only)
-    return True
-
-def run_test_prompts(index: RET.HybridIndex, tokenizer, model,
-                     use_llm: bool, use_rerank_flag: bool, artifacts_dir: str,
-                     max_bullets: int, bullet_max_chars: int, paginate_chars: int, hourlines_only: bool):
-    os.makedirs(artifacts_dir, exist_ok=True)
-    results_path = os.path.join(artifacts_dir, "results.jsonl")
-    summary_md   = os.path.join(artifacts_dir, "summary.md")
-    report_txt   = os.path.join(artifacts_dir, "report.txt")
-
-    results_f = open(results_path, "w", encoding="utf-8")
-    report_f  = open(report_txt,  "w", encoding="utf-8")
-
-    def _tee(line=""):
-        print(line)
-        report_f.write(line + "\n")
-        report_f.flush()
-
-    tests = _gather_sanity_prompts()
-    if not tests:
-        _tee("❌ No sanity prompts available.")
-        results_f.close(); report_f.close()
-        return
-
-    _tee("🧪 Running sanity prompts ...")
-    _tee("=" * 80)
-
-    total = len(tests)
-    pass_loose_count, pass_strict_count = 0, 0
-
-    for i, q in enumerate(tests, 1):
-        _tee(f"\n📝 Test {i}/{total}: {q}")
-        _tee("-" * 60)
-        try:
-            result = ask_once(index, tokenizer, model, q,
-                              use_llm=use_llm, use_rerank_flag=use_rerank_flag,
-                              paginate_chars=paginate_chars,
-                              max_bullets=max_bullets,
-                              bullet_max_chars=bullet_max_chars,
-                              hourlines_only=hourlines_only)
-            _tee(result)
-
-            body_only, _src_blk = _split_answer(result)
-            loose = _pass_loose(result)
-            strict = _pass_strict(q, body_only)
-
-            pass_loose_count += int(loose)
-            pass_strict_count += int(strict)
-
-            _tee("✅ PASS_LOOSE" if loose else "❌ FAIL_LOOSE")
-            _tee("✅ PASS_STRICT" if strict else "❌ FAIL_STRICT")
-            _tee("=" * 80)
-
-            rec = {
-                "index": i,
-                "question": q,
-                "answer": result,
-                "body_only": body_only,
-                "pass_loose": loose,
-                "pass_strict": strict,
-            }
-            results_f.write(json.dumps(rec, ensure_ascii=False) + "\n"); results_f.flush()
-
-        except Exception as e:
-            _tee(f"❌ Error: {e}")
-            _tee("=" * 80)
-
-    summary = (
-        f"# Sanity Summary\n\n"
-        f"- Total: {total}\n"
-        f"- PASS_LOOSE: {pass_loose_count}/{total}\n"
-        f"- PASS_STRICT: {pass_strict_count}/{total}\n"
-        f"\nArtifacts:\n- results.jsonl\n- report.txt\n"
-    )
-    with open(summary_md, "w", encoding="utf-8") as f:
-        f.write(summary)
-
-    _tee(f"\nSummary: PASS_LOOSE {pass_loose_count}/{total} | PASS_STRICT {pass_strict_count}/{total}")
-    _tee(f"Artifacts saved in: {artifacts_dir}")
-
-    results_f.close(); report_f.close()
-
-# ---------------- CLI ----------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--chunks", type=str, default="Data_pdf_clean_chunks.jsonl", help="Path to chunks (JSONL/JSON)")
-    parser.add_argument("--hier-index", type=str, default="heading_inverted_index.json")
-    parser.add_argument("--aliases", type=str, default="section_aliases.json")
-    parser.add_argument("--save-index", type=str, default=None)
-    parser.add_argument("--load-index", type=str, default=None)
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--ask", type=str, default=None)
-    parser.add_argument("--test", action="store_true", help="Run sanity prompts")
-    parser.add_argument("--sanity", action="store_true", help="Alias for --test")
-    parser.add_argument("--no-llm", action="store_true", help="Disable LLM refinement")
-    parser.add_argument("--use-4bit", action="store_true", help="Quantize 4-bit (bitsandbytes)")
-    parser.add_argument("--use-8bit", action="store_true", help="Quantize 8-bit (bitsandbytes)")
-    parser.add_argument("--no-rerank", action="store_true", help="Disable cross-encoder reranker (save VRAM)")
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="LLM device")
-    parser.add_argument("--out-dir", type=str, default="runs", help="Directory for run artifacts")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--chunks", type=str, default=CHUNKS_PATH, help="Path to chunks (JSONL or JSON)")
+    ap.add_argument("--hier-index", type=str, default="heading_inverted_index.json", help="(Optional) hierarchical inverted index path")
+    ap.add_argument("--aliases", type=str, default="section_aliases.json", help="(Optional) section aliases")
+    ap.add_argument("--sanity", action="store_true", help="Run sanity prompts and exit")
+    ap.add_argument("--rerank", action="store_true", help="Enable cross-encoder reranking")
+    ap.add_argument("--save-index", type=str, default=None, help="Directory to save index artifacts")
+    ap.add_argument("--load-index", type=str, default=None, help="Directory to load index artifacts from")
+    args = ap.parse_args()
 
-    # NEW knobs for compacting output
-    parser.add_argument("--max-bullets", type=int, default=6, help="Max bullets per answer")
-    parser.add_argument("--bullet-max-chars", type=int, default=160, help="Max chars per bullet")
-    parser.add_argument("--paginate-chars", type=int, default=900, help="Chars per page chunk before pagination")
-    parser.add_argument("--hourlines-only", action="store_true", help="For hours-like questions, keep only lines that contain times/days")
-
-    args = parser.parse_args()
-
-    # Artifacts dir
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(args.out_dir, f"run_{timestamp}")
-    os.makedirs(run_dir, exist_ok=True)
-
-    # Logger
-    global LOG
-    LOG = setup_logger(os.path.join(run_dir, "run.log"))
-    LOG.info("Artifacts will be saved under: %s", run_dir)
-
-    # Build/load index
-    hier = RET.load_hierarchy(args.hier_index, args.aliases)
-    if not os.path.exists(args.chunks):
-        LOG.error("Chunks file not found: %s", args.chunks)
-        return
-    chunks, chunks_hash = RET.load_chunks(path=args.chunks)
-
-    # Build global page index for page-aware fallback (works for dicts or Chunk objects)
-    global CHUNKS_BY_PAGE
-    CHUNKS_BY_PAGE = _build_page_text_index(chunks)
-
-    index = RET.HybridIndex(chunks, chunks_hash, hier=hier)
+    hier = load_hierarchy(args.hier_index, args.aliases)
+    chunks, chunks_hash = load_chunks(path=args.chunks)
+    index = HybridIndex(chunks, chunks_hash, hier=hier)
 
     loaded = False
-    if args.load_index and os.path.exists(args.load_index):
-        try:
-            rlog = logging.getLogger("retrival_model")
-            lvl = rlog.level
-            rlog.setLevel(logging.ERROR)
-            loaded = index.load(args.load_index)
-            rlog.setLevel(lvl)
-            if loaded:
-                LOG.info("Index loaded successfully from %s", args.load_index)
-        except Exception as e:
-            LOG.info("Will rebuild index: %s", e)
+    if args.load_index:
+        loaded = index.load(args.load_index)
 
     if not loaded:
-        LOG.info("Building index ...")
         index.build()
         if args.save_index:
-            try:
-                index.save(args.save_index)
-                LOG.info("Index saved to %s", args.save_index)
-            except Exception as e:
-                LOG.warning("Failed to save index: %s", e)
+            index.save(args.save_index)
 
-    # Optional LLM
-    tok = mdl = None
-    use_llm = not args.no_llm
-    if use_llm:
-        try:
-            from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-            use_cuda = (args.device != "cpu") and (torch is not None) and hasattr(torch, "cuda") and torch.cuda.is_available()
-            if args.device == "cuda" and not use_cuda:
-                LOG.warning("CUDA requested but not available; falling back to CPU.")
-            bf16_supported = use_cuda and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
-            dtype_fp = torch.bfloat16 if (bf16_supported and torch is not None) else (torch.float16 if (use_cuda and torch is not None) else None)
+    LOG.info("Cross-encoder reranker %s.", "ENABLED.." if args.rerank else "disabled...")
+    LOG.info("Ready.")
 
-            model_kwargs = {"trust_remote_code": True}
-            if args.device == "cpu" or not use_cuda:
-                model_kwargs["device_map"] = "cpu"
-                if torch is not None:
-                    model_kwargs["torch_dtype"] = torch.float32
-            else:
-                model_kwargs["device_map"] = "auto"
-                if dtype_fp is not None:
-                    model_kwargs["torch_dtype"] = dtype_fp
-
-            if args.use_4bit or args.use_8bit:
-                try:
-                    model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                        load_in_4bit=bool(args.use_4bit),
-                        load_in_8bit=bool(args.use_8bit),
-                        bnb_4bit_compute_dtype=(torch.bfloat16 if bf16_supported else (torch.float16 if use_cuda else None)),
-                    )
-                except Exception as e:
-                    LOG.warning("Quantization setup failed: %s", e)
-
-            tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-            mdl = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
-        except Exception as e:
-            LOG.warning("Failed to load LLM (%s); continuing retrieval-only. Error: %s", args.model, e)
-            tok = mdl = None
-            use_llm = False
-
-    # Execute
-    use_rerank_flag = not args.no_rerank
-
-    if args.test or args.sanity:
-        run_test_prompts(index, tok, mdl,
-                         use_llm=use_llm, use_rerank_flag=use_rerank_flag, artifacts_dir=run_dir,
-                         max_bullets=args.max_bullets, bullet_max_chars=args.bullet_max_chars,
-                         paginate_chars=args.paginate_chars, hourlines_only=args.hourlines_only)
-        print(f"\n✅ Saved artifacts under: {run_dir}")
+    if args.sanity:
+        run_sanity(index, use_rerank_flag=args.rerank)
         return
 
-    if args.ask:
-        ans = ask_once(index, tok, mdl, args.ask,
-                       use_llm=use_llm, use_rerank_flag=use_rerank_flag,
-                       paginate_chars=args.paginate_chars,
-                       max_bullets=args.max_bullets,
-                       bullet_max_chars=args.bullet_max_chars,
-                       hourlines_only=args.hourlines_only)
-        single_path = os.path.join(run_dir, "single_answer.txt")
-        with open(single_path, "w", encoding="utf-8") as f:
-            f.write(ans)
-        print(ans)
-        print(f"\n✅ Saved single answer to: {single_path}")
-        return
-
-    # Interactive
-    print("Ready. اطرح سؤالك (اكتب 'exit' للخروج)\n")
-    interactive_path = os.path.join(run_dir, "interactive_transcript.txt")
-    with open(interactive_path, "w", encoding="utf-8") as trans:
-        while True:
-            try:
-                q = input("سؤالك: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nExiting.")
-                break
-            if not q:
-                continue
-            if q.lower() in ("exit", "quit", "q"):
-                print("Exiting.")
-                break
-            ans = ask_once(index, tok, mdl, q,
-                           use_llm=use_llm, use_rerank_flag=use_rerank_flag,
-                           paginate_chars=args.paginate_chars,
-                           max_bullets=args.max_bullets,
-                           bullet_max_chars=args.bullet_max_chars,
-                           hourlines_only=args.hourlines_only)
-            print(ans)
-            trans.write(f"\nQ: {q}\n{ans}\n"); trans.flush()
-    print(f"\n✅ Interactive transcript saved to: {interactive_path}")
+    interactive_loop(index, use_rerank_flag=args.rerank)
 
 if __name__ == "__main__":
     main()
