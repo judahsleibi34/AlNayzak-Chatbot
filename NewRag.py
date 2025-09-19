@@ -19,6 +19,7 @@ import os, sys, re, json, time, argparse, logging
 from datetime import datetime
 from collections import defaultdict
 from types import SimpleNamespace
+from collections.abc import Mapping  # NEW: for robust type checks
 
 # --------------------------------------------------------------------------------------
 # Inline minimal helpers that previously lived in separate files
@@ -69,35 +70,111 @@ _INTENT_TO_HEADING_STEMS = {
     "per_diem": ["مياومات","بدل سفر","السفر","بدل المياومات"],
 }
 
+# ----------- FIXED: fully robust iterator over many possible hierarchy shapes ----------
 def _iter_headings(hier):
-    # Yield (heading_text, pages_set) robustly
-    if not hier: return
-    if isinstance(hier, dict):
-        for k, v in hier.items():
-            hd = k
-            pages = set()
-            if isinstance(v, dict):
-                pg = v.get("pages") or v.get("page_set") or []
-                if isinstance(pg, (list,set,tuple)): pages = set(pg)
-                elif isinstance(pg, int): pages = {pg}
-            yield str(hd), pages
+    """
+    Yield (heading_text, pages_set) robustly from many possible 'hier' shapes,
+    including custom classes (e.g., HierData) that are not directly iterable.
+    Supports:
+      - Mapping (dict-like): { heading: {pages: [...]}, ... }
+      - Iterable of dicts/tuples: [{'heading':..,'pages':[...]}] or [(heading, pages)]
+      - Custom objects exposing to_dict()/as_dict()
+      - Custom objects with attributes: headings/nodes/sections/children/data/items
+    """
+    if not hier:
         return
-    # list-like
-    for item in hier:
-        hd = None; pages = set()
-        if isinstance(item, dict):
-            hd = item.get("heading") or item.get("title") or item.get("name") or item.get("h")
-            pg = item.get("pages") or item.get("page_set") or item.get("p") or []
-            if isinstance(pg, (list,set,tuple)): pages = set(pg)
-            elif isinstance(pg, int): pages = {pg}
-        elif isinstance(item, (list,tuple)) and item:
-            hd = item[0]
-            if len(item) > 1:
-                pg = item[1]
-                if isinstance(pg, (list,set,tuple)): pages = set(pg)
-                elif isinstance(pg, int): pages = {pg}
-        if hd:
-            yield str(hd), pages
+
+    obj = hier
+
+    # 1) Try to unwrap custom containers into a dict first
+    for meth in ("to_dict", "as_dict"):
+        if hasattr(obj, meth) and callable(getattr(obj, meth)):
+            try:
+                obj = getattr(obj, meth)()
+            except Exception:
+                pass
+            break
+
+    # Helper to normalize a page payload → set[int]
+    def _to_pages(pg):
+        if isinstance(pg, (list, set, tuple)):
+            return {int(x) for x in pg if str(x).strip() != ""}
+        if isinstance(pg, int):
+            return {pg}
+        return set()
+
+    # Case A: dict-like (Mapping)
+    if isinstance(obj, Mapping):
+        for k, v in obj.items():
+            hd = str(k)
+            pages = set()
+            if isinstance(v, Mapping):
+                pg = v.get("pages") or v.get("page_set") or v.get("p") or v.get("page") or []
+                pages = _to_pages(pg)
+            yield hd, pages
+        return
+
+    # Case B: directly iterable (list/tuple/etc.) and not a string/bytes
+    try:
+        iterator = iter(obj)
+        is_iterable = not isinstance(obj, (str, bytes))
+    except TypeError:
+        iterator = None
+        is_iterable = False
+
+    if is_iterable and iterator is not None:
+        for item in obj:
+            hd = None; pages = set()
+            if isinstance(item, Mapping):
+                hd = item.get("heading") or item.get("title") or item.get("name") or item.get("h")
+                pg = item.get("pages") or item.get("page_set") or item.get("p") or item.get("page") or []
+                pages = _to_pages(pg)
+            elif isinstance(item, (list, tuple)) and item:
+                hd = item[0]
+                if len(item) > 1:
+                    pages = _to_pages(item[1])
+            if hd:
+                yield str(hd), pages
+        return
+
+    # Case C: Fallback – look for common attributes inside custom classes (e.g., HierData)
+    for attr in ("headings", "nodes", "sections", "children", "data", "items"):
+        payload = getattr(obj, attr, None)
+        if payload is None:
+            continue
+
+        # Mapping payload
+        if isinstance(payload, Mapping):
+            for k, v in payload.items():
+                hd = str(k)
+                pages = set()
+                if isinstance(v, Mapping):
+                    pg = v.get("pages") or v.get("page_set") or v.get("p") or v.get("page") or []
+                    pages = _to_pages(pg)
+                yield hd, pages
+            return
+
+        # Iterable payload
+        try:
+            for item in payload:
+                hd = None; pages = set()
+                if isinstance(item, Mapping):
+                    hd = item.get("heading") or item.get("title") or item.get("name") or item.get("h")
+                    pg = item.get("pages") or item.get("page_set") or item.get("p") or item.get("page") or []
+                    pages = _to_pages(pg)
+                elif isinstance(item, (list, tuple)) and item:
+                    hd = item[0]
+                    if len(item) > 1:
+                        pages = _to_pages(item[1])
+                if hd:
+                    yield str(hd), pages
+            return
+        except TypeError:
+            continue
+
+    # If we reach here, we couldn't extract headings – just yield nothing (no priors)
+    return
+# --------------------------------------------------------------------------------------
 
 def derive_section_priors(intent: str, hier) -> dict:
     """
@@ -113,7 +190,14 @@ def derive_section_priors(intent: str, hier) -> dict:
         elif "عروض" in norm_int or "سقف" in norm_int: stems = _INTENT_TO_HEADING_STEMS["procurement_thresholds"]
 
     pages, matched = set(), []
-    for heading, pset in _iter_headings(hier):
+
+    # ----------- FIXED: guard against non-iterable/odd 'hier' -----------
+    try:
+        iterator = _iter_headings(hier)
+    except Exception:
+        iterator = []
+
+    for heading, pset in iterator:
         nh = norm(heading)
         ok = False
         for stem in stems:
@@ -798,6 +882,13 @@ def main():
 
     # Build/load index
     hier = RET.load_hierarchy(args.hier_index, args.aliases)
+
+    # DEBUG aid (optional): reveal shape of 'hier' once per run
+    try:
+        LOG.info("hier type=%s; attrs(sample)=%s", type(hier), list(dir(hier))[:15])
+    except Exception:
+        pass
+
     if not os.path.exists(args.chunks):
         LOG.error("Chunks file not found: %s", args.chunks); return
     chunks, chunks_hash = RET.load_chunks(path=args.chunks)
@@ -819,8 +910,10 @@ def main():
     if not loaded:
         LOG.info("Building index ..."); index.build()
         if args.save_index:
-            try: index.save(args.save_index); LOG.info("Index saved to %s", args.save_index)
-            except Exception as e: LOG.warning("Failed to save index: %s", e)
+            try:
+                index.save(args.save_index); LOG.info("Index saved to %s", args.save_index)
+            except Exception as e:
+                LOG.warning("Failed to save index: %s", e)
 
     # Optional LLM
     tok = mdl = None
