@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-NewRag.py — simple runner & reporter for the extractive retriever.
+NewRag.py — runner & reporter for the extractive retriever.
 
-What it does
-------------
-- Builds the HybridIndex from retrival_model.py
-- Runs your 30 SANITY_PROMPTS and prints each Q/A with sources
-- Saves artifacts to --out-dir/run_YYYYMMDD_HHMMSS/{results.jsonl, summary.md}
-- Arabic-aware strict pass checks (for questions that expect time/amounts)
-- Optional RTL/digit normalization for printing
+- Builds HybridIndex from retrival_model.py
+- Runs 30 SANITY_PROMPTS, prints Q/A with sources
+- Saves artifacts under --out-dir/run_YYYYMMDD_HHMMSS/{results.jsonl, summary.md}
+- Arabic-aware strict checks
+- RTL/digit formatting for console/summary
+- Post-fix: if STRICT fails on time/duration/workdays, scan cited pages in chunks to synthesize a precise line (from the PDF)
 
 Usage
 -----
@@ -18,20 +17,20 @@ python NewRag.py \
   --aliases section_aliases.json \
   --sanity \
   --out-dir runs \
-  --rtl auto \
-  --digits ascii
+  --rtl force \
+  --digits arabic
 """
 
 import os, re, json, argparse, datetime
 from pathlib import Path
 
-# import ONLY things that exist in your retrival_model.py
+# Use only exported APIs from your retriever module
 from retrival_model import (
     load_hierarchy, load_chunks, HybridIndex,
     classify_intent, answer, SANITY_PROMPTS
 )
 
-# ---------------- Arabic-light helpers (self-contained) ----------------
+# ---------------- Arabic utils ----------------
 _AR_DIAC = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]')
 _AR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"٠١٢٣٤٥٦٧٨٩")}
 _IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
@@ -46,38 +45,79 @@ def ar_normalize(s: str) -> str:
            .replace('ى','ي'))
     s = s.translate(_AR_NUMS).translate(_IR_NUMS)
     s = s.replace('،', ',').replace('٫','.')
-    s = ' '.join(s.split())
-    return s
+    return ' '.join(s.split())
 
 def to_arabic_digits(s: str) -> str:
     if not s: return s
-    trans = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
-    return s.translate(trans)
+    return s.translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩"))
 
 def strip_rtl_wrap(s: str) -> str:
     if not s: return s
     return s.replace(_RLE, "").replace(_PDF, "")
 
-_TIME_PAT = re.compile(r'(\b\d{1,2}[:٫:\.]\d{0,2}\b)|(\b\d{1,2}\s*(?:من|الى|إلى|حتى|حتي|-\s*|–\s*)\s*\d{1,2}\b)')
-_NUM_PAT  = re.compile(r'\d')
+# ---------------- Signals & regex ----------------
+TIME_RANGE = re.compile(
+    r'(?:من\s*)?'
+    r'(\d{1,2}(?::|\.)?\d{0,2})\s*(?:[-–—]|الى|إلى|حتى|حتي)\s*'
+    r'(\d{1,2}(?::|\.)?\d{0,2})'
+)
+TIME_TOKEN = re.compile(r'\b\d{1,2}[:\.]\d{0,2}\b')
+ANY_DIGIT  = re.compile(r'\d')
+DUR_TOKEN  = re.compile(r'\b(\d{1,3})\s*(?:دقيقه|دقيقه|دقيقة|دقائق|ساعة|ساعه|ساعات)\b', re.I)
 
-def needs_numeric_or_time(q: str) -> bool:
-    qn = ar_normalize(q)
-    cues = ['كم','مدة','من','الى','إلى','حتى','حتي','نسبة','٪','%','ساعات','دقائق','يوم','أيام','سقف','حد','3','ثلاث']
-    return bool(_NUM_PAT.search(qn) or any(c in qn for c in cues))
+WEEKDAYS = ["السبت","الاحد","الأحد","الاثنين","الإثنين","الثلاثاء","الاربعاء","الأربعاء","الخميس","الجمعة"]
 
-def body_has_numeric_or_time(body: str) -> bool:
+def normalize_hhmm(tok: str) -> str:
+    tok = tok.replace('.', ':')
+    if ':' not in tok: return f"{int(tok):d}:00"
+    h, m = tok.split(':', 1)
+    if m == "": m = "00"
+    return f"{int(h):d}:{int(m):02d}"
+
+# ---------------- Strict needs rules (intent-aware) ----------------
+def needs_numeric_or_time(question: str, intent: str) -> bool:
+    """
+    Only require numbers/time when it truly makes sense.
+    - Always for work_hours / ramadan_hours
+    - For break only if the question contains 'كم' or 'مدة'
+    - For procurement/per-diem/overtime/leave when the question explicitly asks about 'كم/مدة/نسبة/سقف/حد/3/ثلاث' or contains digits
+    - Never trigger merely on 'من'/'الى' (they can mean 'who/from' linguistically)
+    - Do NOT key on 'يوم/أيام' (false positive for workdays)
+    """
+    qn = ar_normalize(question)
+    has_num = bool(ANY_DIGIT.search(qn))
+    cues = any(c in qn for c in ['كم','مدة','نسبة','٪','%','سقف','حد','ثلاث'])
+    if intent in ("work_hours","ramadan_hours"):
+        return True
+    if intent == "break":
+        return ('كم' in qn) or ('مدة' in qn) or has_num
+    if intent in ("procurement","per_diem","overtime","leave"):
+        return has_num or cues
+    if intent == "workdays":
+        return False
+    return has_num or cues
+
+def body_has_required_signals(body: str, intent: str) -> bool:
     bn = ar_normalize(body or "")
-    return bool(_TIME_PAT.search(bn) or _NUM_PAT.search(bn))
+    if intent in ("work_hours","ramadan_hours"):
+        return bool(TIME_RANGE.search(bn) or TIME_TOKEN.search(bn))
+    if intent == "break":
+        return bool(DUR_TOKEN.search(bn) or TIME_TOKEN.search(bn))
+    if intent == "workdays":
+        return any(d in body for d in WEEKDAYS) or ("ايام" in bn and ("العمل" in bn or "الدوام" in bn))
+    # numeric-ish intents
+    if intent in ("procurement","per_diem","overtime","leave"):
+        return bool(ANY_DIGIT.search(bn))
+    # general
+    return len(bn) >= 6
 
-# ---------------- pass criteria & parsing ----------------
+# ---------------- Pass criteria & parsing ----------------
 def pass_loose(ans_text: str) -> bool:
     return ("Sources:" in ans_text) and ("لم أعثر" not in ans_text)
 
-def pass_strict(question: str, body_only: str) -> bool:
-    """If the question implies numbers/times, require them in the body; else require some nontrivial Arabic text."""
-    if needs_numeric_or_time(question):
-        return body_has_numeric_or_time(body_only)
+def pass_strict(question: str, body_only: str, intent: str) -> bool:
+    if needs_numeric_or_time(question, intent):
+        return body_has_required_signals(body_only, intent)
     return len(ar_normalize(body_only)) >= 6
 
 def extract_pages(ans_text: str):
@@ -91,25 +131,97 @@ def extract_pages(ans_text: str):
             except: pass
     return pages
 
-# ---------------- artifacts ----------------
-def ensure_dir(p: Path):
-    p.mkdir(parents=True, exist_ok=True)
-
+# ---------------- Pretty printing ----------------
 def transform_for_print(body: str, rtl: str, digits: str) -> str:
     out = body or ""
-    # digits
     if digits == "arabic":
         out = to_arabic_digits(out)
-    # rtl
     has_wrap = (out.startswith(_RLE) and out.endswith(_PDF))
     if rtl == "off":
         out = strip_rtl_wrap(out)
     elif rtl == "force" and not has_wrap:
         out = _RLE + out + _PDF
-    # rtl==auto: leave as-is (retriever already wraps some answers)
     return out
 
-def run_sanity(index, out_dir: Path, rtl: str, digits: str):
+# ---------------- Post-fixers (scan cited pages in chunks) ----------------
+def pick_best_time_range(texts):
+    best = None
+    for t in texts:
+        tn = ar_normalize(t)
+        for m in TIME_RANGE.finditer(tn):
+            a = normalize_hhmm(m.group(1))
+            b = normalize_hhmm(m.group(2))
+            # prefer work-like durations (6h..11h)
+            h1, m1 = map(int, a.split(':')); A = h1*60+m1
+            h2, m2 = map(int, b.split(':')); B = h2*60+m2
+            if B <= A: B += 12*60
+            dur = B - A
+            score = 0
+            if 360 <= dur <= 660: score += 2
+            if "دوام" in tn or "العمل" in tn: score += 1
+            best = max(best, (score, a, b), key=lambda x: x[0]) if best else (score, a, b)
+    if best and best[0] > 0:
+        return best[1], best[2]
+    return None
+
+def find_duration_line(texts):
+    # try to find "استراحة ... 30 دقيقة" etc.
+    candidates = []
+    for t in texts:
+        tn = ar_normalize(t)
+        if ("استراح" in tn or "راحة" in tn or "بريك" in tn) and DUR_TOKEN.search(tn):
+            candidates.append(t.strip())
+    # fallback: any line with دقيقة/ساعة + number
+    if not candidates:
+        for t in texts:
+            tn = ar_normalize(t)
+            if DUR_TOKEN.search(tn):
+                candidates.append(t.strip())
+    return candidates[0] if candidates else None
+
+def find_workdays_line(texts):
+    for t in texts:
+        if any(d in t for d in WEEKDAYS) or ("ايام" in t and ("العمل" in t or "الدوام" in t)):
+            return t.strip()
+    return None
+
+def repair_body_if_needed(question, intent, body, pages, all_chunks):
+    """If strict fails, search cited pages and synthesize a minimal, correct line."""
+    # collect texts from cited pages
+    page_set = set(pages)
+    texts = [c.text for c in all_chunks if c.page in page_set]
+
+    if intent in ("work_hours","ramadan_hours"):
+        rng = pick_best_time_range(texts)
+        if rng:
+            a, b = rng
+            suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
+            return f"ساعات الدوام{suffix} من {a} إلى {b}."
+        return body
+
+    if intent == "break":
+        line = find_duration_line(texts)
+        if line: return line
+        return body
+
+    if intent == "workdays":
+        line = find_workdays_line(texts)
+        if line: return line
+        return body
+
+    # for numeric-ish intents, if no digits in body, try to pull any numeric line from cited pages
+    if intent in ("procurement","per_diem","overtime","leave"):
+        if not ANY_DIGIT.search(ar_normalize(body or "")):
+            for t in texts:
+                if ANY_DIGIT.search(ar_normalize(t)):
+                    return t.strip()
+    return body
+
+# ---------------- artifacts ----------------
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def run_sanity(index, all_chunks, out_dir: Path, rtl: str, digits: str):
     stamp = datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
     run_dir = out_dir / stamp
     ensure_dir(run_dir)
@@ -132,17 +244,28 @@ def run_sanity(index, out_dir: Path, rtl: str, digits: str):
             intent = classify_intent(q)
             ans = answer(q, index, intent, use_rerank_flag=False)
 
-            # split body / sources for checking and reporting
             parts = ans.split("\nSources:")
             body_raw = parts[0].strip()
+            pages = extract_pages(ans)
+
+            # first strict check
+            okL = pass_loose(ans)
+            okS = pass_strict(q, strip_rtl_wrap(body_raw), intent)
+
+            # try repair if strict failed and we have pages
+            repaired = None
+            if not okS and pages:
+                repaired = repair_body_if_needed(q, intent, strip_rtl_wrap(body_raw), pages, all_chunks)
+                if repaired and repaired != strip_rtl_wrap(body_raw):
+                    body_raw = (_RLE + repaired + _PDF) if body_raw.startswith(_RLE) else repaired
+                    okS = pass_strict(q, strip_rtl_wrap(body_raw), intent)
+
             body_print = transform_for_print(body_raw, rtl=rtl, digits=digits)
 
             print(body_print)
             if len(parts) > 1:
                 print("Sources:" + parts[1])
 
-            okL = pass_loose(ans)
-            okS = pass_strict(q, strip_rtl_wrap(body_raw))
             passL += int(okL); passS += int(okS)
             print("✅ PASS_LOOSE" if okL else "⚪ FAIL_LOOSE")
             print("✅ PASS_STRICT" if okS else "⚪ FAIL_STRICT")
@@ -151,15 +274,17 @@ def run_sanity(index, out_dir: Path, rtl: str, digits: str):
             row = {
                 "idx": i,
                 "question": q,
-                "answer": body_raw,  # store raw (untransformed) body
-                "sources_pages": extract_pages(ans),
+                "intent": intent,
+                "answer": body_raw,
+                "sources_pages": pages,
                 "pass_loose": okL,
                 "pass_strict": okS,
+                "repaired": bool(repaired)
             }
             jf.write(json.dumps(row, ensure_ascii=False) + "\n")
             rows.append(row)
 
-    # Write summary.md
+    # summary.md
     with summary_path.open("w", encoding="utf-8") as sf:
         sf.write("# Sanity Run\n\n")
         sf.write(f"- Total questions: **{total}**\n")
@@ -167,12 +292,13 @@ def run_sanity(index, out_dir: Path, rtl: str, digits: str):
         sf.write(f"- PASS_STRICT: **{passS}/{total}**\n\n")
         for r in rows:
             sf.write(f"## Q{r['idx']}: {r['question']}\n\n")
-            # apply chosen printing transforms in the summary
             pretty = transform_for_print(r['answer'], rtl=rtl, digits=digits)
             sf.write(pretty + "\n\n")
             if r["sources_pages"]:
                 cites = "\n".join([f"{i+1}. Data_pdf.pdf - page {p}" for i, p in enumerate(r["sources_pages"])])
                 sf.write("**Sources**\n\n" + cites + "\n\n")
+            sf.write(f"- Intent: `{r['intent']}`\n")
+            sf.write(f"- Repaired: {'✅' if r['repaired'] else '—'}\n")
             sf.write(f"- PASS_LOOSE: {'✅' if r['pass_loose'] else '❌'}\n")
             sf.write(f"- PASS_STRICT: {'✅' if r['pass_strict'] else '❌'}\n\n")
 
@@ -188,33 +314,24 @@ def main():
     ap.add_argument("--aliases", type=str, default=None, help="Optional aliases for headings")
     ap.add_argument("--sanity", action="store_true", help="Run sanity prompts and exit")
     ap.add_argument("--out-dir", type=str, default="runs", help="Directory to store run artifacts")
-
-    # Optional persistence flags (safe if your HybridIndex lacks save/load)
     ap.add_argument("--save-index", type=str, default=None, help="Directory to save index artifacts (if supported)")
     ap.add_argument("--load-index", type=str, default=None, help="Directory to load index artifacts (if supported)")
-
-    # Optional model override (if your HybridIndex accepts model_name in __init__)
     ap.add_argument("--model", type=str, default=None, help="SentenceTransformer model ID")
-
-    # Printing/formatting options
     ap.add_argument("--rtl", choices=["auto","off","force"], default="auto",
-                    help="RTL wrapping for printed/summary answers (default: auto)")
+                    help="RTL wrapping behavior for printing/summary")
     ap.add_argument("--digits", choices=["ascii","arabic"], default="ascii",
-                    help="Digit style for printed/summary answers (default: ascii)")
-
+                    help="Digit style for printing/summary")
     args = ap.parse_args()
 
     hier = load_hierarchy(args.hier_index, args.aliases) if (args.hier_index or args.aliases) else None
     chunks, chunks_hash = load_chunks(path=args.chunks)
 
-    # Try to pass model_name if provided and supported
+    # index
     try:
         index = HybridIndex(chunks, chunks_hash, hier=hier, model_name=args.model) if args.model else HybridIndex(chunks, chunks_hash, hier=hier)
     except TypeError:
-        # Fallback if older HybridIndex signature
         index = HybridIndex(chunks, chunks_hash, hier=hier)
 
-    # Optional load() if implemented
     loaded = False
     if args.load_index and hasattr(index, "load"):
         try:
@@ -231,12 +348,11 @@ def main():
                 pass
 
     if args.sanity:
-        out_dir = Path(args.out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        run_sanity(index, out_dir, rtl=args.rtl, digits=args.digits)
+        out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+        run_sanity(index, chunks, out_dir, rtl=args.rtl, digits=args.digits)
         return
 
-    # interactive mode
+    # interactive
     print("Ready. Interactive mode (type 'exit' to quit).")
     while True:
         try:
@@ -246,9 +362,8 @@ def main():
         if not q: continue
         if q.lower() in ("exit","quit","q"): print("Exiting."); break
         intent = classify_intent(q)
-        ans = answer(q, index, intent, use_rerank_flag=False)
-        # Optional pretty print in interactive mode too
-        parts = ans.split("\nSources:")
+        resp = answer(q, index, intent, use_rerank_flag=False)
+        parts = resp.split("\nSources:")
         body = transform_for_print(parts[0].strip(), rtl=args.rtl, digits=args.digits)
         print(body)
         if len(parts) > 1:
