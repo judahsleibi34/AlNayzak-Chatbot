@@ -2,23 +2,15 @@
 """
 Arabic-first hybrid retriever with persistence (for RAG).
 
-Fixes in this version
----------------------
-- BUGFIX: _must_tokens_present() now truly enforces required concept tokens.
-- Best-snippet gating tightened per intent; skip boilerplate/rights lines.
-- Work-hours composer only accepts time ranges from lines that also mention "دوام/العمل/ساعات".
-- OCR/garbage guards for headings, section numbers, and low-letter lines.
-
-Usage examples
---------------
-Build from scratch and save an index:
-  python retrival_model.py --chunks ".\\Data_pdf_clean_chunks.jsonl" --hier-index ".\\heading_inverted_index.json" --aliases ".\\section_aliases.json" --save-index ".artifact" --rerank
-
-Load a saved index (fast) and run interactive QA:
-  python retrival_model.py --chunks ".\\Data_pdf_clean_chunks.jsonl" --load-index ".artifact" --rerank
-
-Run the bundled sanity suite:
-  python retrival_model.py --chunks ".\\Data_pdf_clean_chunks.jsonl" --hier-index ".\\heading_inverted_index.json" --aliases ".\\section_aliases.json" --sanity --rerank
+What’s new in this revision
+---------------------------
+- STRICT fix: better intent gates; real "must tokens" enforcement.
+- Hours composer: scans sentence- AND chunk-level for a plausible daily range.
+- New composers:
+    * _compose_break_answer(): finds استراحة/راحة/بريك/رضاعة + duration.
+    * _compose_hourly_leave(): handles إذن مغادرة ساعية + limits.
+- Leave/procurement selection stays numeric-first.
+- OCR hygiene: skip boilerplate lines; ignore section numbers only for time intents.
 """
 
 import os, re, sys, json, argparse, logging, hashlib
@@ -27,7 +19,6 @@ from typing import List, Tuple, Optional, Dict, Any, Set
 
 import numpy as np
 
-# Optional deps (faiss, sklearn)
 try:
     import faiss  # type: ignore
 except Exception:
@@ -52,20 +43,20 @@ LOG = logging.getLogger(__name__)
 
 # ---------------- Arabic utils ----------------
 
-AR_DIAC = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]')  # tashkeel
+AR_DIAC = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]')
 AR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"٠١٢٣٤٥٦٧٨٩")}
 IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
 NOISY_UNI = re.compile(r'\buni[0-9A-Fa-f]{3,6}\b')
 RIGHTS_LINE = re.compile(r'جميع الحقوق محفوظة|التعليم المساند والإبداع العلمي')
-SECTION_NUM = re.compile(r'\b\d+\.\d+\b')  # e.g., 3.5, 14.2
+SECTION_NUM = re.compile(r'\b\d+\.\d+\b')
 
 def ar_normalize(s: str) -> str:
     if not s: return ""
-    s = s.replace('\u0640','')                # tatweel
-    s = AR_DIAC.sub('', s)                    # remove diacritics
+    s = s.replace('\u0640','')
+    s = AR_DIAC.sub('', s)
     s = (s.replace('أ','ا').replace('إ','ا').replace('آ','ا')
-           .replace('ى','ي').replace('ة','ه'))  # unify alif/ya/ta marbuta
-    s = s.translate(AR_NUMS).translate(IR_NUMS)   # Arabic/Indic -> ASCII digits
+           .replace('ى','ي').replace('ة','ه'))
+    s = s.translate(AR_NUMS).translate(IR_NUMS)
     s = s.replace('،', ',').replace('٫','.')
     s = NOISY_UNI.sub('', s)
     s = ' '.join(s.split())
@@ -77,17 +68,18 @@ def rtl_wrap(t: str) -> str:
 SENT_SPLIT_RE = re.compile(r'(?<=[\.\!\؟\?،]|[\n])\s+')
 
 def sent_split(s: str) -> List[str]:
-    # OCR-aware: split then drop junk fragments
     parts = [p.strip() for p in SENT_SPLIT_RE.split(s) if p and p.strip()]
     out = []
     for p in parts:
         pn = ar_normalize(p)
-        # drop fragments that are too short or symbol-heavy
-        if len(pn) < 6:
+        if len(pn) < 6:                 # very short/junk
             continue
-        if RIGHTS_LINE.search(p) or SECTION_NUM.search(pn):
+        if RIGHTS_LINE.search(p):       # boilerplate
             continue
-        if sum(ch.isalpha() for ch in pn) < 0.5 * len(pn.replace(" ", "")):
+        # NOTE: we DO NOT filter section numbers here; selection functions will do it per-intent.
+        letters = sum(ch.isalpha() for ch in pn)
+        total = len(pn.replace(" ", ""))
+        if total > 0 and letters/total < 0.5:
             continue
         out.append(p)
     return out if out else ([s.strip()] if s.strip() else [])
@@ -103,8 +95,6 @@ class Chunk:
     page: int
     text: str
     norm: str
-
-# --------- Robust JSON/JSONL loader
 
 _TEXT_KEYS = {"text","text_display","content","body","raw","paragraph","para","line","value","data","clean_text","norm"}
 _TEXT_ARRAY_KEYS = {"lines","paragraphs","paras","sentences","chunks","blocks","spans","tokens"}
@@ -139,7 +129,7 @@ def _file_hash(path: str) -> str:
             h.update(b)
     return h.hexdigest()
 
-def load_chunks(path=CHUNKS_PATH) -> Tuple[List[Chunk], str]:
+def load_chunks(path=CHUNKS_PATH):
     if not os.path.exists(path):
         LOG.error("Chunks file not found: %s", path); sys.exit(1)
     LOG.info("Loading documents from %s ...", path)
@@ -186,7 +176,7 @@ def load_chunks(path=CHUNKS_PATH) -> Tuple[List[Chunk], str]:
         sys.exit(1)
     return chunks, _file_hash(path)
 
-# ---------------- Hierarchy / aliases (section gating)
+# ---------------- Hierarchy / aliases ----------------
 
 @dataclass
 class HierData:
@@ -389,6 +379,7 @@ KW_LEAVE = re.compile(r'(إجاز|اجاز)')
 KW_OVERTIME = re.compile(r'(إضافي|اضافي)')
 KW_FLEX = re.compile(r'(مرون|الحضور|الانصراف|تأخير|تاخير|خصم|بصمة|بصمه)')
 KW_BREAK = re.compile(r'(استراح|راحة|بريك|رضاعه|رضاع)')
+KW_HOURLY = re.compile(r'(مغادره|مغادرة|اذن|إذن).*(ساعيه|ساعية)|مغادرة\s*ساعية')
 KW_PROC = re.compile(r'(شراء|مشتريات|عروض|مناقصة|توريد|تأمين|حد|سقف)')
 KW_WORKDAYS = re.compile(r'(ايام|أيام).*(العمل|الدوام)|السبت|الاحد|الخميس|الأحد')
 
@@ -396,6 +387,7 @@ def classify_intent(q: str) -> str:
     qn = ar_normalize(q)
     if KW_HOURS.search(qn) and KW_RAMADAN.search(qn): return "ramadan_hours"
     if KW_WORKDAYS.search(qn): return "workdays"
+    if KW_HOURLY.search(qn): return "hourly_leave"
     if KW_HOURS.search(qn): return "work_hours"
     if KW_FLEX.search(qn): return "flex"
     if KW_BREAK.search(qn): return "break"
@@ -408,9 +400,10 @@ def classify_intent(q: str) -> str:
 
 INTENT_HINTS = {
     "flex":    ["مرون", "تاخير", "تأخير", "الحضور", "الانصراف", "خصم", "بصمه","بصمة"],
-    "break":   ["استراح", "راحة", "فسحه", "فسحة", "بريك","رضاعه","رضاع","دقيقه","دقائق","ساعه","ساعة"],
+    "break":   ["استراح", "راحة", "فسحه", "فسحة", "بريك","رضاعه","رضاع","دقيقه","دقائق","ساعه","ساعة","نصف","ربع"],
     "overtime":["اضافي", "ساعات اضافيه", "تعويض", "موافقه", "اعتماد", "العطل","العطل الرسميه","نسبه","125","أجر","اجر","احتساب"],
     "leave":   ["اجاز", "اجازه","إجازة","سنويه","سنوية","مرضيه","طارئه","امومه","حداد","بدون","راتب"],
+    "hourly_leave": ["مغادر","اذن","ساعيه","ساعية","حد","اقصى","شهري"],
     "work_hours": ["ساعات", "دوام", "العمل","اوقات","من","الى","حتى","حتي"],
     "ramadan_hours": ["رمضان","ساعات", "دوام", "العمل","اوقات","من","الى","حتى","حتي"],
     "procurement": ["عروض","ثلاث","ثلاثه","3","شراء","سقف","حد","شيكل","₪","دينار","دولار","توريد","مشتريات"],
@@ -418,27 +411,26 @@ INTENT_HINTS = {
     "workdays": ["ايام","العمل","الدوام","السبت","الاحد","الأحد","الخميس","من","الى"]
 }
 
-# Required tokens per intent
 INTENT_MUST = {
     "ramadan_hours": ["رمضان","دوام","ساعات"],
     "work_hours":    ["دوام","ساعات","عمل"],
     "workdays":      ["ايام","العمل","الدوام","السبت","الاحد","الأحد","الخميس"],
-    "overtime":      ["اضافي","اجر","أجر","احتساب","موافقه","اعتماد"],
+    "overtime":      ["اضافي","اجر","أجر","احتساب","موافقه","اعتماد","العطل"],
     "procurement":   ["عروض","عرض","ثلاث","ثلاثه","شراء","سقف","حد"],
     "per_diem":      ["بدل","سفر","مصاريف","نفقات","ايصالات","فواتير","تذاكر","فندق"],
-    "break":         ["استراح","راحة","بريك","رضاع","رضاعه","دقائق","ساعة","ساعه"],
+    "break":         ["استراح","راحة","بريك","رضاع","رضاعه","دقائق","ساعة","ساعه","نصف","ربع"],
+    "hourly_leave":  ["مغادر","اذن","ساعيه","ساعية"],
     "leave":         ["اجاز","اجازه","إجازة"],
     "general":       []
 }
 
 def _must_tokens_present(sn_norm: str, intent: str) -> bool:
-    # FIXED: actually enforce that at least one of the required tokens appears
     req = INTENT_MUST.get(intent, [])
-    if not req: 
+    if not req:
         return True
     return any(tok in sn_norm for tok in req)
 
-# ---------------- Policy-aware time extraction ----------------
+# ---------------- Policy-aware time & duration extraction ----------------
 
 TIME_RE = re.compile(
     r'(?:من\s*)?'
@@ -446,6 +438,7 @@ TIME_RE = re.compile(
     r'(?:[-–—]|الى|إلى|حتي|حتى)\s*'
     r'(\d{1,2}(?::|\.)?\d{0,2})'
 )
+DUR_TOKEN = re.compile(r'\b(\d{1,3})\s*(?:دقيقه|دقيقة|دقائق|ساعه|ساعة|ساعات)\b', re.I)
 
 def _normalize_hhmm(tok: str) -> str:
     tok = tok.replace('.', ':')
@@ -463,35 +456,21 @@ def _plausible_workday(a: int, b: int) -> bool:
 
 def extract_all_ranges(text: str, intent: str) -> List[Tuple[int,int]]:
     n = ar_normalize(text)
-    # ignore section numbers posing as times
-    if SECTION_NUM.search(n) or RIGHTS_LINE.search(text):
-        return []
     ranges: List[Tuple[int,int]] = []
     for m in TIME_RE.finditer(n):
         a = _normalize_hhmm(m.group(1)); b = _normalize_hhmm(m.group(2))
         A, B = _to_minutes(a), _to_minutes(b)
-
-        if B <= A:
+        if B <= A:  # handle 8:30 -> 3:00 style
             B_try = B + 12*60
             if B_try > A:
                 B = B_try
             else:
                 A, B = B, A
-
-        if intent in ("work_hours", "ramadan_hours"):
+        if intent in ("work_hours","ramadan_hours"):
             dur = B - A
-            if dur < 6*60:
-                A2, B2 = B, A
-                if B2 <= A2:
-                    B2 += 12*60
-                dur2 = B2 - A2
-                if 6*60 <= dur2 <= 11*60 and _plausible_workday(A2, B2):
-                    A, B = A2, B2
-
+            if not (6*60 <= dur <= 11*60) or not _plausible_workday(A,B):
+                continue
         ranges.append((A, B))
-
-    if intent in ("work_hours","ramadan_hours"):
-        ranges = [(A,B) for (A,B) in ranges if _plausible_workday(A,B) and 6*60 <= (B-A) <= 11*60]
     return ranges
 
 def pick_best_range(ranges: List[Tuple[int,int]]) -> Optional[Tuple[str,str]]:
@@ -499,8 +478,7 @@ def pick_best_range(ranges: List[Tuple[int,int]]) -> Optional[Tuple[str,str]]:
     scored = []
     for (A,B) in ranges:
         dur = B - A
-        target = abs(dur - 7.5*60)
-        scored.append((target, -(dur), A, B))
+        scored.append((abs(dur - 7.5*60), -(dur), A, B))
     scored.sort()
     _, _, A, B = scored[0]
     return f"{A//60:d}:{A%60:02d}", f"{B//60:d}:{B%60:02d}"
@@ -567,7 +545,7 @@ def _has_time_hint(sn: str) -> bool:
 def _looks_junky(sn: str) -> bool:
     snn = ar_normalize(sn)
     if len(snn) < 6: return True
-    if RIGHTS_LINE.search(sn) or SECTION_NUM.search(snn):
+    if RIGHTS_LINE.search(sn):
         return True
     letters = sum(ch.isalpha() for ch in snn)
     total = len(snn.replace(" ", ""))
@@ -586,10 +564,9 @@ def best_snippet(chunk: Chunk, qnorm: str, intent: str, max_len=260) -> Optional
         if _looks_junky(s): 
             continue
         sn = ar_normalize(s)
-        # must-have guard (FIXED)
         if not _must_tokens_present(sn, intent):
             continue
-        # extra guard for numeric-ish intents
+        # time intents: demand numbers + hint + context
         if intent in ("work_hours","ramadan_hours") and not (_has_numbers(sn) and _has_time_hint(sn) and ("دوام" in sn or "عمل" in sn or "ساعات" in sn)):
             continue
         overlap = len(q_terms & set(sn.split()))
@@ -599,7 +576,7 @@ def best_snippet(chunk: Chunk, qnorm: str, intent: str, max_len=260) -> Optional
         score += 1.2 * overlap
         if has_time: score += 1.0
         if has_hint: score += 0.8
-        if _has_numbers(sn) and intent in ("work_hours","ramadan_hours","overtime","leave","procurement","per_diem"):
+        if _has_numbers(sn) and intent in ("work_hours","ramadan_hours","overtime","leave","procurement","per_diem","hourly_leave"):
             score += 0.4
         if overlap == 0 and not (has_time or has_hint):
             score -= 0.6
@@ -607,7 +584,6 @@ def best_snippet(chunk: Chunk, qnorm: str, intent: str, max_len=260) -> Optional
             best, best_score = s, score
 
     if not best:
-        # fallback: take the least junky first sentence that passes must tokens
         for s in sents:
             sn = ar_normalize(s)
             if not _looks_junky(s) and _must_tokens_present(sn, intent):
@@ -622,11 +598,11 @@ def best_snippet(chunk: Chunk, qnorm: str, intent: str, max_len=260) -> Optional
 # ---------------- Answer synthesis helpers ----------------
 
 def _compose_hours_answer(chunks: List[Chunk], hits: List[Tuple[float,int]], intent: str) -> Optional[str]:
+    # pass 1: sentence-level
     for _, i in hits:
         sents = sent_split(chunks[i].text)
         for s in sents:
             sn = ar_normalize(s)
-            # must contain "دوام/عمل/ساعات" to avoid picking times from unrelated lines
             if not (("دوام" in sn) or ("عمل" in sn) or ("ساعات" in sn)):
                 continue
             if not _must_tokens_present(sn, intent):
@@ -639,6 +615,20 @@ def _compose_hours_answer(chunks: List[Chunk], hits: List[Tuple[float,int]], int
                 txt = f"ساعات الدوام{suffix} من {a} إلى {b}."
                 src = f"Data_pdf.pdf - page {chunks[i].page}"
                 return rtl_wrap(txt) + "\n" + f"Sources:\n1. {src}"
+    # pass 2: chunk-level (handles split lines)
+    for _, i in hits:
+        t = chunks[i].text
+        tn = ar_normalize(t)
+        if not (("دوام" in tn) or ("عمل" in tn) or ("ساعات" in tn)):
+            continue
+        ranges = extract_all_ranges(t, intent)
+        rng = pick_best_range(ranges)
+        if rng:
+            a, b = rng
+            suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
+            txt = f"ساعات الدوام{suffix} من {a} إلى {b}."
+            srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
+            return rtl_wrap(txt) + "\n" + "Sources:\n" + "\n".join(srcs)
     return None
 
 def _compose_procurement_threshold(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
@@ -676,6 +666,25 @@ def _compose_leave(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optiona
                 return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
     return None
 
+def _compose_break_answer(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    for _, i in hits:
+        for s in sent_split(chunks[i].text):
+            sn = ar_normalize(s)
+            if any(w in sn for w in ["استراح","راحة","بريك","رضاع","رضاعه"]):
+                if DUR_TOKEN.search(sn) or any(p in sn for p in ["نصف ساعه","نصف ساعة","ربع ساعه","ربع ساعة"]):
+                    srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
+                    return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
+def _compose_hourly_leave(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    for _, i in hits:
+        for s in sent_split(chunks[i].text):
+            sn = ar_normalize(s)
+            if any(w in sn for w in ["مغادر","اذن","إذن"]) and (re.search(r'\d', sn) or "حد" in sn or "اقصى" in sn or "شهري" in sn):
+                srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
+                return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
 # ---------------- Main answer function ----------------
 
 def answer(q: str, index: HybridIndex, intent: str, use_rerank_flag: bool) -> str:
@@ -687,6 +696,14 @@ def answer(q: str, index: HybridIndex, intent: str, use_rerank_flag: bool) -> st
 
     if intent in ("work_hours", "ramadan_hours"):
         composed = _compose_hours_answer(chunks, hits, intent)
+        if composed: return composed
+
+    if intent == "break":
+        composed = _compose_break_answer(chunks, hits)
+        if composed: return composed
+
+    if intent == "hourly_leave":
+        composed = _compose_hourly_leave(chunks, hits)
         if composed: return composed
 
     if intent == "procurement":
@@ -709,7 +726,7 @@ def answer(q: str, index: HybridIndex, intent: str, use_rerank_flag: bool) -> st
     srcs = [f"{k}. Data_pdf.pdf - page {chunks[i].page}" for k, (_, i) in enumerate(hits, 1)]
     return rtl_wrap(sn) + "\n" + "Sources:\n" + "\n".join(srcs)
 
-# ---------------- CLI ----------------
+# ---------------- CLI & sanity ----------------
 
 SANITY_PROMPTS = [
     "ما هي ساعات الدوام الرسمية من وإلى؟",
