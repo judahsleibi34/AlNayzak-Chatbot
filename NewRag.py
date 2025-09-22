@@ -2,22 +2,10 @@
 """
 NewRag.py — runner & reporter for the extractive retriever.
 
-- Builds HybridIndex from retrival_model.py
-- Runs 30 SANITY_PROMPTS, prints Q/A with sources
-- Saves artifacts under --out-dir/run_YYYYMMDD_HHMMSS/{results.jsonl, summary.md}
-- Arabic-aware strict checks (intent-sensitive)
-- RTL/digit formatting controls
-- Post-fix: when STRICT fails, scan cited pages (chunks) to synthesize a minimal, *correct* line
-
-Run:
-python NewRag.py \
-  --chunks Data_pdf_clean_chunks.jsonl \
-  --hier-index heading_inverted_index.json \
-  --aliases section_aliases.json \
-  --sanity \
-  --out-dir runs \
-  --rtl force \
-  --digits arabic
+- Arabic-aware STRICT checks (intent-sensitive)
+- Fails STRICT if the body says "لم أعثر..."
+- Only rejects section-number lines for time-intents (hours/Ramadan)
+- Post-fixers scan cited pages; hours repair now also tries aggregated text
 """
 
 import os, re, json, argparse, datetime
@@ -35,8 +23,7 @@ _IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
 _NOISY_UNI = re.compile(r'\buni[0-9A-Fa-f]{3,6}\b')
 _RIGHTS_LINE = re.compile(r'جميع الحقوق محفوظة|التعليم المساند والإبداع العلمي')
 _SECTION_NUM = re.compile(r'\b\d+\.\d+\b')
-_RLE = '\u202B'  # Right-to-left embedding
-_PDF = '\u202C'  # Pop directional formatting
+_RLE = '\u202B'; _PDF = '\u202C'
 
 def ar_normalize(s: str) -> str:
     if not s: return ""
@@ -80,12 +67,12 @@ def normalize_hhmm(tok: str) -> str:
 def needs_numeric_or_time(question: str, intent: str) -> bool:
     qn = ar_normalize(question)
     has_num = bool(ANY_DIGIT.search(qn))
-    cues = any(c in qn for c in ['كم','مدة','نسبة','٪','%','سقف','حد','ثلاث'])
+    cues = any(c in qn for c in ['كم','مدة','نسبة','٪','%','سقف','حد','ثلاث','اقصى','أقصى'])
     if intent in ("work_hours","ramadan_hours"):
         return True
     if intent == "break":
         return ('كم' in qn) or ('مدة' in qn) or has_num
-    if intent in ("procurement","per_diem","overtime","leave"):
+    if intent in ("procurement","per_diem","overtime","leave","hourly_leave"):
         return has_num or cues
     if intent == "workdays":
         return False
@@ -93,15 +80,18 @@ def needs_numeric_or_time(question: str, intent: str) -> bool:
 
 def body_has_required_signals(body: str, intent: str) -> bool:
     bn = ar_normalize(body or "")
-    if _RIGHTS_LINE.search(body) or _SECTION_NUM.search(bn):
+    if "لم اعثر" in bn:
+        return False
+    if _RIGHTS_LINE.search(body):
+        return False
+    # only time-intents reject section-number lines
+    if intent in ("work_hours","ramadan_hours") and _SECTION_NUM.search(bn):
         return False
     if intent in ("work_hours","ramadan_hours"):
-        # time + context word in the SAME line
         has_time = bool(TIME_RANGE.search(bn) or TIME_TOKEN.search(bn))
         ctx = ("دوام" in bn) or ("عمل" in bn) or ("ساعات" in bn)
         return has_time and ctx
     if intent == "break":
-        # allow spelled durations too
         if DUR_TOKEN.search(bn) or TIME_TOKEN.search(bn):
             return True
         if ("استراح" in bn or "راحة" in bn or "بريك" in bn or "رضاع" in bn):
@@ -110,7 +100,7 @@ def body_has_required_signals(body: str, intent: str) -> bool:
         return False
     if intent == "workdays":
         return any(d in body for d in WEEKDAYS) or ("ايام" in bn and ("العمل" in bn or "الدوام" in bn))
-    if intent in ("procurement","per_diem","overtime","leave"):
+    if intent in ("procurement","per_diem","overtime","leave","hourly_leave"):
         return bool(ANY_DIGIT.search(bn))
     return len(bn) >= 6
 
@@ -119,6 +109,8 @@ def pass_loose(ans_text: str) -> bool:
     return ("Sources:" in ans_text) and ("لم أعثر" not in ans_text)
 
 def pass_strict(question: str, body_only: str, intent: str) -> bool:
+    if "لم أعثر" in body_only or "لم اعثر" in ar_normalize(body_only):
+        return False
     if needs_numeric_or_time(question, intent):
         return body_has_required_signals(body_only, intent)
     return len(ar_normalize(body_only)) >= 6
@@ -153,10 +145,6 @@ def pick_best_time_range(texts):
         if _RIGHTS_LINE.search(t): 
             continue
         tn = ar_normalize(t)
-        if _SECTION_NUM.search(tn):
-            continue
-        if not (("دوام" in tn) or ("عمل" in tn) or ("ساعات" in tn)):
-            continue
         for m in TIME_RANGE.finditer(tn):
             a = normalize_hhmm(m.group(1))
             b = normalize_hhmm(m.group(2))
@@ -166,8 +154,21 @@ def pick_best_time_range(texts):
             dur = B - A
             score = 0
             if 360 <= dur <= 660: score += 2
-            if "دوام" in tn or "العمل" in tn: score += 1
+            if "دوام" in tn or "العمل" in tn or "ساعات" in tn: score += 1
             best = max(best, (score, a, b), key=lambda x: x[0]) if best else (score, a, b)
+    if not best:
+        # aggregated fallback across pages
+        joined = "\n".join(texts)
+        tn = ar_normalize(joined)
+        for m in TIME_RANGE.finditer(tn):
+            a = normalize_hhmm(m.group(1)); b = normalize_hhmm(m.group(2))
+            h1, m1 = map(int, a.split(':')); A = h1*60+m1
+            h2, m2 = map(int, b.split(':')); B = h2*60+m2
+            if B <= A: B += 12*60
+            dur = B - A
+            score = 1 if 360 <= dur <= 660 else 0
+            if score > 0:
+                best = (score, a, b); break
     if best and best[0] > 0:
         return best[1], best[2]
     return None
@@ -197,7 +198,6 @@ def find_workdays_line(texts):
     return None
 
 def repair_body_if_needed(question, intent, body, pages, all_chunks):
-    # collect texts from cited pages
     page_set = set(pages)
     texts = [c.text for c in all_chunks if c.page in page_set]
 
@@ -219,7 +219,7 @@ def repair_body_if_needed(question, intent, body, pages, all_chunks):
         if line: return line
         return body
 
-    if intent in ("procurement","per_diem","overtime","leave"):
+    if intent in ("procurement","per_diem","overtime","leave","hourly_leave"):
         bn = ar_normalize(body or "")
         if not ANY_DIGIT.search(bn):
             for t in texts:
