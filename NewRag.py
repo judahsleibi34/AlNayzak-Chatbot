@@ -2,10 +2,10 @@
 """
 NewRag.py — runner & reporter for the extractive retriever.
 
-- Arabic-aware STRICT checks (intent-sensitive)
-- Fails STRICT if the body says "لم أعثر..."
-- Only rejects section-number lines for time-intents (hours/Ramadan)
-- Post-fixers scan cited pages; hours repair now also tries aggregated text
+- Intent-aware STRICT checks (incl. hourly_leave must mention إذن/مغادرة)
+- Fails STRICT if the body says "لم أعثر…"
+- Post-fixers scan cited pages; hours repair now prefers realistic day windows
+- Display sanitizer removes OCR tokens like "uni06BE" from printed text
 """
 
 import os, re, json, argparse, datetime
@@ -13,14 +13,14 @@ from pathlib import Path
 
 from retrival_model import (
     load_hierarchy, load_chunks, HybridIndex,
-    classify_intent, answer, SANITY_PROMPTS
+    classify_intent, answer, SANITY_PROMPTS, clean_display_text
 )
 
 # ---------------- Arabic utils ----------------
 _AR_DIAC = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]')
 _AR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"٠١٢٣٤٥٦٧٨٩")}
 _IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
-_NOISY_UNI = re.compile(r'\buni[0-9A-Fa-f]{3,6}\b')
+_NOISY_UNI = re.compile(r'/?\buni[0-9A-Fa-f]{3,6}\b')
 _RIGHTS_LINE = re.compile(r'جميع الحقوق محفوظة|التعليم المساند والإبداع العلمي')
 _SECTION_NUM = re.compile(r'\b\d+\.\d+\b')
 _RLE = '\u202B'; _PDF = '\u202C'
@@ -72,8 +72,10 @@ def needs_numeric_or_time(question: str, intent: str) -> bool:
         return True
     if intent == "break":
         return ('كم' in qn) or ('مدة' in qn) or has_num
-    if intent in ("procurement","per_diem","overtime","leave","hourly_leave"):
+    if intent in ("procurement","per_diem","overtime","leave","hourly_leave","carryover_leave"):
         return has_num or cues
+    if intent in ("performance","emergency_leave"):
+        return False
     if intent == "workdays":
         return False
     return has_num or cues
@@ -98,9 +100,15 @@ def body_has_required_signals(body: str, intent: str) -> bool:
             if any(kw in bn for kw in ["نصف ساعه","نصف ساعة","ربع ساعه","ربع ساعة"]):
                 return True
         return False
+    if intent == "hourly_leave":
+        return (("مغادر" in bn or "اذن" in bn or "إذن" in bn) and bool(ANY_DIGIT.search(bn)))
+    if intent == "carryover_leave":
+        return (("ترح" in bn or "غير مستخدم" in bn or "غير المستخدم" in bn) and ("اجاز" in bn or "اجازه" in bn or "إجازة" in bn))
+    if intent == "performance":
+        return ("تقييم" in bn or "الأداء" in bn)
     if intent == "workdays":
         return any(d in body for d in WEEKDAYS) or ("ايام" in bn and ("العمل" in bn or "الدوام" in bn))
-    if intent in ("procurement","per_diem","overtime","leave","hourly_leave"):
+    if intent in ("procurement","per_diem","overtime","leave"):
         return bool(ANY_DIGIT.search(bn))
     return len(bn) >= 6
 
@@ -113,7 +121,7 @@ def pass_strict(question: str, body_only: str, intent: str) -> bool:
         return False
     if needs_numeric_or_time(question, intent):
         return body_has_required_signals(body_only, intent)
-    return len(ar_normalize(body_only)) >= 6
+    return body_has_required_signals(body_only, intent)
 
 def extract_pages(ans_text: str):
     pages = []
@@ -129,6 +137,7 @@ def extract_pages(ans_text: str):
 # ---------------- Pretty printing ----------------
 def transform_for_print(body: str, rtl: str, digits: str) -> str:
     out = body or ""
+    out = clean_display_text(out)  # strip OCR tokens like uni06BE
     if digits == "arabic":
         out = to_arabic_digits(out)
     has_wrap = (out.startswith(_RLE) and out.endswith(_PDF))
@@ -152,12 +161,13 @@ def pick_best_time_range(texts):
             h2, m2 = map(int, b.split(':')); B = h2*60+m2
             if B <= A: B += 12*60
             dur = B - A
-            score = 0
-            if 360 <= dur <= 660: score += 2
-            if "دوام" in tn or "العمل" in tn or "ساعات" in tn: score += 1
+            score = 0.0
+            if 360 <= dur <= 660: score += 3.0
+            if 420 <= dur <= 540: score += 1.0
+            if 420 <= A <= 600: score += 2.0
+            if 780 <= B <= 1080: score += 2.0
             best = max(best, (score, a, b), key=lambda x: x[0]) if best else (score, a, b)
     if not best:
-        # aggregated fallback across pages
         joined = "\n".join(texts)
         tn = ar_normalize(joined)
         for m in TIME_RANGE.finditer(tn):
@@ -166,7 +176,7 @@ def pick_best_time_range(texts):
             h2, m2 = map(int, b.split(':')); B = h2*60+m2
             if B <= A: B += 12*60
             dur = B - A
-            score = 1 if 360 <= dur <= 660 else 0
+            score = 1.0 if 360 <= dur <= 660 else 0.0
             if score > 0:
                 best = (score, a, b); break
     if best and best[0] > 0:
@@ -181,12 +191,12 @@ def find_duration_line(texts):
         tn = ar_normalize(t)
         if ("استراح" in tn or "راحة" in tn or "بريك" in tn or "رضاع" in tn):
             if DUR_TOKEN.search(tn) or ("نصف ساعه" in tn or "نصف ساعة" in tn or "ربع ساعه" in tn or "ربع ساعة" in tn):
-                candidates.append(t.strip())
+                candidates.append(clean_display_text(t.strip()))
     if not candidates:
         for t in texts:
             tn = ar_normalize(t)
             if DUR_TOKEN.search(tn):
-                candidates.append(t.strip())
+                candidates.append(clean_display_text(t.strip()))
     return candidates[0] if candidates else None
 
 def find_workdays_line(texts):
@@ -194,7 +204,7 @@ def find_workdays_line(texts):
         if _RIGHTS_LINE.search(t): 
             continue
         if any(d in t for d in WEEKDAYS) or ("ايام" in t and ("العمل" in t or "الدوام" in t)):
-            return t.strip()
+            return clean_display_text(t.strip())
     return None
 
 def repair_body_if_needed(question, intent, body, pages, all_chunks):
@@ -219,14 +229,20 @@ def repair_body_if_needed(question, intent, body, pages, all_chunks):
         if line: return line
         return body
 
-    if intent in ("procurement","per_diem","overtime","leave","hourly_leave"):
+    if intent in ("procurement","per_diem","overtime","leave","hourly_leave","carryover_leave"):
         bn = ar_normalize(body or "")
         if not ANY_DIGIT.search(bn):
             for t in texts:
                 if _RIGHTS_LINE.search(t): 
                     continue
                 if ANY_DIGIT.search(ar_normalize(t)):
-                    return t.strip()
+                    return clean_display_text(t.strip())
+    if intent in ("performance","emergency_leave"):
+        for t in texts:
+            tn = ar_normalize(t)
+            if (intent == "performance" and ("تقييم" in tn or "الأداء" in tn)) or \
+               (intent == "emergency_leave" and ("طارئ" in tn or "الطارئة" in tn)):
+                return clean_display_text(t.strip())
     return body
 
 # ---------------- artifacts ----------------
@@ -335,6 +351,7 @@ def main():
     hier = load_hierarchy(args.hier_index, args.aliases) if (args.hier_index or args.aliases) else None
     chunks, chunks_hash = load_chunks(path=args.chunks)
 
+    # index
     try:
         index = HybridIndex(chunks, chunks_hash, hier=hier, model_name=args.model) if args.model else HybridIndex(chunks, chunks_hash, hier=hier)
     except TypeError:
