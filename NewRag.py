@@ -5,12 +5,11 @@ NewRag.py — runner & reporter for the extractive retriever.
 - Builds HybridIndex from retrival_model.py
 - Runs 30 SANITY_PROMPTS, prints Q/A with sources
 - Saves artifacts under --out-dir/run_YYYYMMDD_HHMMSS/{results.jsonl, summary.md}
-- Arabic-aware strict checks
-- RTL/digit formatting for console/summary
-- Post-fix: if STRICT fails on time/duration/workdays, scan cited pages in chunks to synthesize a precise line (from the PDF)
+- Arabic-aware strict checks (intent-sensitive)
+- RTL/digit formatting controls
+- Post-fix: when STRICT fails, scan cited pages (chunks) to synthesize a minimal, *correct* line
 
-Usage
------
+Run:
 python NewRag.py \
   --chunks Data_pdf_clean_chunks.jsonl \
   --hier-index heading_inverted_index.json \
@@ -24,7 +23,6 @@ python NewRag.py \
 import os, re, json, argparse, datetime
 from pathlib import Path
 
-# Use only exported APIs from your retriever module
 from retrival_model import (
     load_hierarchy, load_chunks, HybridIndex,
     classify_intent, answer, SANITY_PROMPTS
@@ -34,6 +32,9 @@ from retrival_model import (
 _AR_DIAC = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]')
 _AR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"٠١٢٣٤٥٦٧٨٩")}
 _IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
+_NOISY_UNI = re.compile(r'\buni[0-9A-Fa-f]{3,6}\b')
+_RIGHTS_LINE = re.compile(r'جميع الحقوق محفوظة|التعليم المساند والإبداع العلمي')
+_SECTION_NUM = re.compile(r'\b\d+\.\d+\b')
 _RLE = '\u202B'  # Right-to-left embedding
 _PDF = '\u202C'  # Pop directional formatting
 
@@ -45,6 +46,7 @@ def ar_normalize(s: str) -> str:
            .replace('ى','ي'))
     s = s.translate(_AR_NUMS).translate(_IR_NUMS)
     s = s.replace('،', ',').replace('٫','.')
+    s = _NOISY_UNI.sub('', s)
     return ' '.join(s.split())
 
 def to_arabic_digits(s: str) -> str:
@@ -63,10 +65,7 @@ TIME_RANGE = re.compile(
 )
 TIME_TOKEN = re.compile(r'\b\d{1,2}[:\.]\d{0,2}\b')
 ANY_DIGIT  = re.compile(r'\d')
-DUR_TOKEN  = re.compile(r'\b(\d{1,3})\s*(?:دقيقه|دقيقه|دقيقة|دقائق|ساعة|ساعه|ساعات)\b', re.I)
-
-HALF_HOUR_PAT    = re.compile(r'\bنصف\s+ساع[هة]\b')
-QUARTER_HOUR_PAT = re.compile(r'\bربع\s+ساع[هة]\b')
+DUR_TOKEN  = re.compile(r'\b(\d{1,3})\s*(?:دقيقه|دقيقة|دقائق|ساعه|ساعة|ساعات)\b', re.I)
 
 WEEKDAYS = ["السبت","الاحد","الأحد","الاثنين","الإثنين","الثلاثاء","الاربعاء","الأربعاء","الخميس","الجمعة"]
 
@@ -77,18 +76,8 @@ def normalize_hhmm(tok: str) -> str:
     if m == "": m = "00"
     return f"{int(h):d}:{int(m):02d}"
 
-def _to_minutes(hhmm: str) -> int:
-    h, m = map(int, hhmm.split(":"))
-    return h*60 + m
-
-def _plausible_workday(A: int, B: int) -> bool:
-    return 6*60 <= A <= 20*60+30 and 6*60 <= B <= 20*60+30 and B > A
-
 # ---------------- Strict needs rules (intent-aware) ----------------
 def needs_numeric_or_time(question: str, intent: str) -> bool:
-    """
-    Only require numbers/time when it truly makes sense.
-    """
     qn = ar_normalize(question)
     has_num = bool(ANY_DIGIT.search(qn))
     cues = any(c in qn for c in ['كم','مدة','نسبة','٪','%','سقف','حد','ثلاث'])
@@ -104,11 +93,21 @@ def needs_numeric_or_time(question: str, intent: str) -> bool:
 
 def body_has_required_signals(body: str, intent: str) -> bool:
     bn = ar_normalize(body or "")
+    if _RIGHTS_LINE.search(body) or _SECTION_NUM.search(bn):
+        return False
     if intent in ("work_hours","ramadan_hours"):
-        return bool(TIME_RANGE.search(bn) or TIME_TOKEN.search(bn))
+        # time + context word in the SAME line
+        has_time = bool(TIME_RANGE.search(bn) or TIME_TOKEN.search(bn))
+        ctx = ("دوام" in bn) or ("عمل" in bn) or ("ساعات" in bn)
+        return has_time and ctx
     if intent == "break":
-        return bool(DUR_TOKEN.search(bn) or TIME_TOKEN.search(bn) or
-                    HALF_HOUR_PAT.search(bn) or QUARTER_HOUR_PAT.search(bn))
+        # allow spelled durations too
+        if DUR_TOKEN.search(bn) or TIME_TOKEN.search(bn):
+            return True
+        if ("استراح" in bn or "راحة" in bn or "بريك" in bn or "رضاع" in bn):
+            if any(kw in bn for kw in ["نصف ساعه","نصف ساعة","ربع ساعه","ربع ساعة"]):
+                return True
+        return False
     if intent == "workdays":
         return any(d in body for d in WEEKDAYS) or ("ايام" in bn and ("العمل" in bn or "الدوام" in bn))
     if intent in ("procurement","per_diem","overtime","leave"):
@@ -151,53 +150,54 @@ def transform_for_print(body: str, rtl: str, digits: str) -> str:
 def pick_best_time_range(texts):
     best = None
     for t in texts:
+        if _RIGHTS_LINE.search(t): 
+            continue
         tn = ar_normalize(t)
+        if _SECTION_NUM.search(tn):
+            continue
+        if not (("دوام" in tn) or ("عمل" in tn) or ("ساعات" in tn)):
+            continue
         for m in TIME_RANGE.finditer(tn):
             a = normalize_hhmm(m.group(1))
             b = normalize_hhmm(m.group(2))
-            A, B = _to_minutes(a), _to_minutes(b)
-            if B <= A:
-                B += 12*60  # handle "8:30–3:00" typos
-
+            h1, m1 = map(int, a.split(':')); A = h1*60+m1
+            h2, m2 = map(int, b.split(':')); B = h2*60+m2
+            if B <= A: B += 12*60
             dur = B - A
-            if not (360 <= dur <= 660):   # require 6–11 hours
-                continue
-            if not _plausible_workday(A, B):
-                continue
-
-            # score: closeness to 7h30 + presence of دوام/العمل + bonus if start 7:00–9:30
-            score = -abs(dur - 450)
-            if ("دوام" in tn or "العمل" in tn): score += 30
-            if 7*60 <= A <= 9*60+30: score += 10
-
-            cand = (score, a, b)
-            if (best is None) or (cand[0] > best[0]):
-                best = cand
-
-    return (best[1], best[2]) if best else None
+            score = 0
+            if 360 <= dur <= 660: score += 2
+            if "دوام" in tn or "العمل" in tn: score += 1
+            best = max(best, (score, a, b), key=lambda x: x[0]) if best else (score, a, b)
+    if best and best[0] > 0:
+        return best[1], best[2]
+    return None
 
 def find_duration_line(texts):
     candidates = []
     for t in texts:
+        if _RIGHTS_LINE.search(t): 
+            continue
         tn = ar_normalize(t)
-        if (("استراح" in tn or "راحة" in tn or "بريك" in tn or "رضاع" in tn) and
-            (DUR_TOKEN.search(tn) or HALF_HOUR_PAT.search(tn) or QUARTER_HOUR_PAT.search(tn))):
-            candidates.append(t.strip())
+        if ("استراح" in tn or "راحة" in tn or "بريك" in tn or "رضاع" in tn):
+            if DUR_TOKEN.search(tn) or ("نصف ساعه" in tn or "نصف ساعة" in tn or "ربع ساعه" in tn or "ربع ساعة" in tn):
+                candidates.append(t.strip())
     if not candidates:
         for t in texts:
             tn = ar_normalize(t)
-            if DUR_TOKEN.search(tn) or HALF_HOUR_PAT.search(tn) or QUARTER_HOUR_PAT.search(tn):
+            if DUR_TOKEN.search(tn):
                 candidates.append(t.strip())
     return candidates[0] if candidates else None
 
 def find_workdays_line(texts):
     for t in texts:
+        if _RIGHTS_LINE.search(t): 
+            continue
         if any(d in t for d in WEEKDAYS) or ("ايام" in t and ("العمل" in t or "الدوام" in t)):
             return t.strip()
     return None
 
 def repair_body_if_needed(question, intent, body, pages, all_chunks):
-    """If strict fails, search cited pages and synthesize a minimal, correct line."""
+    # collect texts from cited pages
     page_set = set(pages)
     texts = [c.text for c in all_chunks if c.page in page_set]
 
@@ -220,8 +220,11 @@ def repair_body_if_needed(question, intent, body, pages, all_chunks):
         return body
 
     if intent in ("procurement","per_diem","overtime","leave"):
-        if not ANY_DIGIT.search(ar_normalize(body or "")):
+        bn = ar_normalize(body or "")
+        if not ANY_DIGIT.search(bn):
             for t in texts:
+                if _RIGHTS_LINE.search(t): 
+                    continue
                 if ANY_DIGIT.search(ar_normalize(t)):
                     return t.strip()
     return body
@@ -332,7 +335,6 @@ def main():
     hier = load_hierarchy(args.hier_index, args.aliases) if (args.hier_index or args.aliases) else None
     chunks, chunks_hash = load_chunks(path=args.chunks)
 
-    # index
     try:
         index = HybridIndex(chunks, chunks_hash, hier=hier, model_name=args.model) if args.model else HybridIndex(chunks, chunks_hash, hier=hier)
     except TypeError:
@@ -358,7 +360,6 @@ def main():
         run_sanity(index, chunks, out_dir, rtl=args.rtl, digits=args.digits)
         return
 
-    # interactive
     print("Ready. Interactive mode (type 'exit' to quit).")
     while True:
         try:
