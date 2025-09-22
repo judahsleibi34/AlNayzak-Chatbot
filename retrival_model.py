@@ -9,19 +9,19 @@ Public API (used by NewRag.py):
 - classify_intent(question: str) -> str
 - answer(question: str, index: HybridIndex, intent: str, use_rerank_flag=False) -> str
 - SANITY_PROMPTS: List[str]
+- clean_display_text(text: str, *args, **kwargs) -> str    <-- added for NewRag.py
 
 Design notes
 ------------
 - Loader accepts JSONL or JSON and many common keys:
   text: "text" | "content" | "chunk" | "body" | "paragraph" | "chunk_text"
   page: "page" | "page_number" | "page_num" | "pageno" | "pageIndex" | meta.page_number
-  section/heading: "heading" | "title" | meta.heading
-  doc id/name: "doc" | "doc_id" | "document" | "source" | meta.source
+  doc:  "doc" | "doc_id" | "document" | "source" | meta.source
 - Cleans PDF artifacts like '/uni06BE' and collapses whitespace.
-- Arabic normalization keeps letters, removes tatweel/diacritics, normalizes digits (٠١٢… -> 012…).
-- Search = BM25-lite over wordpieces + short exact-phrase boost; no external models required.
-- Answer chooses the *most relevant line* from top chunk based on intent (times, durations, weekdays, numbers).
-- Outputs "Sources:" exactly like your runner expects: "Data_pdf.pdf - page X".
+- Arabic normalization removes diacritics/tatweel and normalizes digits (٠١٢… -> 012…).
+- Search = BM25-lite over wordpieces + small exact-phrase boost — no external models.
+- Answer picks the most relevant line in top chunks using intent cues (times, numbers, weekdays).
+- Sources block matches runner format: "Data_pdf.pdf - page X".
 """
 
 from __future__ import annotations
@@ -38,10 +38,11 @@ _AR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"٠١٢٣٤٥٦٧٨٩")}
 _IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
 # Weird PDF glyph names like /uni06BE
 _PDF_UNI = re.compile(r'/uni[0-9A-Fa-f]{3,6}')
-# Remove control chars but keep bidi wrappers (handled later by caller)
+# Control chars (keep bidi wrappers to let caller decide)
 _CTRL = re.compile(r'[\u0000-\u0008\u000B-\u000C\u000E-\u001F]')
 
 def ar_norm(s: str) -> str:
+    """Aggressive Arabic normalization for indexing/matching."""
     if not s: return ""
     s = _CTRL.sub('', s)
     s = _PDF_UNI.sub('', s)
@@ -50,28 +51,25 @@ def ar_norm(s: str) -> str:
     s = (s.replace('أ','ا').replace('إ','ا').replace('آ','ا')
            .replace('ى','ي').replace('ة','ه'))
     s = s.translate(_AR_NUMS).translate(_IR_NUMS)
-    # unify punctuation spacing
     s = s.replace('،', ',').replace('٫','.')
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
-_AR_LETTER = re.compile(r'[^\u0600-\u06FFa-zA-Z0-9]+')
+def ascii_digits(s: str) -> str:
+    """Convert Eastern/Arabic-Indic digits to ASCII."""
+    return s.translate(_AR_NUMS).translate(_IR_NUMS) if s else s
+
+_AR_LETTER_SPLIT = re.compile(r'[^\u0600-\u06FFa-zA-Z0-9]+')
 def tokenize_ar(s: str) -> List[str]:
+    """Simple Arabic-aware tokenizer for BM25."""
     s = ar_norm(s)
-    # split on non-letters but keep mixed tokens like "8:30"
     s = re.sub(r'[:/\\\-\u2212]+', ' ', s)
-    toks = [t for t in _AR_LETTER.split(s) if t]
-    # prune tiny tokens unless digits
+    toks = [t for t in _AR_LETTER_SPLIT.split(s) if t]
     out = []
     for t in toks:
-        if t.isdigit():
-            out.append(t)
-        elif len(t) >= 2:
+        if t.isdigit() or len(t) >= 2:
             out.append(t)
     return out
-
-def ascii_digits(s: str) -> str:
-    return s.translate(_AR_NUMS).translate(_IR_NUMS) if s else s
 
 # time/duration detectors
 TIME_TOKEN = re.compile(r'\b\d{1,2}[:\.]\d{1,2}\b')  # 8:30, 15.00
@@ -138,7 +136,6 @@ def _iter_records(data) -> Iterable[dict]:
         for r in data: 
             if isinstance(r, dict): yield r
     elif isinstance(data, dict):
-        # Some exporters wrap under 'chunks'
         items = data.get("chunks") or data.get("data") or data.get("records") or []
         if isinstance(items, list):
             for r in items:
@@ -147,7 +144,7 @@ def _iter_records(data) -> Iterable[dict]:
 def load_chunks(path: str) -> Tuple[List[Chunk], str]:
     """
     Accepts .jsonl (one JSON per line) or .json (array/object).
-    Returns (chunks, sha1_hash).
+    Returns (chunks, sha1_hash). Raises if nothing could be parsed.
     """
     chunks: List[Chunk] = []
     h = hashlib.sha1()
@@ -192,9 +189,8 @@ def load_chunks(path: str) -> Tuple[List[Chunk], str]:
                 chunks.append(Chunk(text=txt, page=pg, doc=doc, section=sec, meta=rec))
 
     if not chunks:
-        # Help the caller see what's wrong instead of silently passing.
         raise ValueError(
-            "No chunks loaded. Please confirm your JSON keys. "
+            "No chunks loaded. Please confirm JSON keys. "
             "Expected one of: text|content|chunk|body|paragraph|chunk_text and page|page_number|pageno etc."
         )
 
@@ -233,7 +229,6 @@ class HybridIndex:
         self.doc_len: List[int] = []
         self.idf: Dict[str, float] = {}
         self.avgdl: float = 0.0
-        # simple cache
         self._built = False
 
     def build(self):
@@ -251,7 +246,6 @@ class HybridIndex:
         N = max(1, len(self.chunks))
         self.avgdl = max(1.0, sum(self.doc_len) / N if self.doc_len else 1.0)
         for t, df in self.df.items():
-            # BM25 idf (plus 1 to avoid neg idf when df > N/2)
             self.idf[t] = math.log(1 + (N - df + 0.5) / (df + 0.5))
         self._built = True
 
@@ -271,7 +265,6 @@ class HybridIndex:
         try:
             with open(os.path.join(in_dir, "bm25.pkl"), "rb") as f:
                 obj = pickle.load(f)
-            # trust loaded stats only if hashes match length
             if obj.get("df") and obj.get("doc_tfs") and obj.get("chunks_hash") == self.chunks_hash and len(obj["doc_tfs"]) == len(self.chunks):
                 self.df = obj["df"]; self.doc_tfs = obj["doc_tfs"]
                 self.doc_len = obj["doc_len"]; self.idf = obj["idf"]
@@ -284,7 +277,6 @@ class HybridIndex:
     def _bm25(self, q_toks: List[str], k1=1.5, b=0.75) -> List[Tuple[int,float]]:
         if not self._built:
             self.build()
-        # term frequencies in query (ok to de-duplicate)
         uniq = {}
         for t in q_toks:
             uniq[t] = 1
@@ -300,7 +292,7 @@ class HybridIndex:
                 score += idf * (f * (k1 + 1)) / (denom if denom != 0 else 1.0)
             if score > 0:
                 scores.append((i, score))
-        # exact small-phrase boost (2-3 tokens adjacency)
+        # small phrase boost (first 2-3 tokens)
         phrase = None
         if len(q_toks) >= 2:
             phrase = " ".join(q_toks[:3]).strip()
@@ -362,7 +354,6 @@ def classify_intent(question: str) -> str:
 def _line_score_by_intent(line: str, intent: str) -> float:
     ln = ar_norm(line)
     score = 0.0
-    # generic substance
     if len(ln) >= 12: score += 0.5
     if intent in ("work_hours", "ramadan_hours"):
         if TIME_TOKEN.search(ascii_digits(ln)): score += 3.0
@@ -382,12 +373,10 @@ def _line_score_by_intent(line: str, intent: str) -> float:
     return score
 
 def _best_line_for_intent(text: str, intent: str) -> str:
-    # split on hard breaks; also try bullet-ish splits
     parts = []
     for seg in re.split(r'[\r\n]+', text):
         seg = seg.strip()
         if not seg: continue
-        # further split very long segments on "•" or " - "
         sub = re.split(r'[•\-\u2022]\s+', seg)
         for s in sub:
             s = s.strip()
@@ -409,27 +398,25 @@ def _format_sources(hit_indices: List[int], chunks: List[Chunk], limit: int = 8)
         if key in seen: 
             continue
         seen.append(key)
-        # the runner prints exactly "Data_pdf.pdf - page N"
         out_lines.append(f"{len(out_lines)+1}. {ch.doc} - page {ch.page}")
     return "\n".join(out_lines) if out_lines else "—"
 
 def answer(question: str, index: HybridIndex, intent: str, use_rerank_flag: bool=False) -> str:
     """
-    Returns body + "\nSources:\n<lines>"
-    Never fabricates numeric/time facts: selects the best matching line from top chunks.
+    Returns body + "\nSources:\n<lines>".
+    Picks a precise line; never fabricates numeric/time facts.
     """
     hits = index.search(question, k=8)
     if not hits:
         return "لم أعثر على إجابة مناسبة."
     hit_ids = [i for (i, _) in hits]
-    # choose the single best line among top-3 chunks for precision
+
     best_text = ""
     best_score = -1.0
     for i, _sc in hits[:3]:
         ch = index.chunks[i]
         candidate = _best_line_for_intent(ch.text, intent)
         sc = _line_score_by_intent(candidate, intent)
-        # light question term presence boost
         q_norm = set(tokenize_ar(question))
         cand_norm = set(tokenize_ar(candidate))
         overlap = len(q_norm & cand_norm)
@@ -438,15 +425,32 @@ def answer(question: str, index: HybridIndex, intent: str, use_rerank_flag: bool
             best_score = sc
             best_text = candidate
 
-    best_text = best_text.strip()
+    best_text = ar_norm(best_text).strip()
     if not best_text:
         return "لم أعثر على إجابة مناسبة."
 
-    # Final polish: normalize duplicate spaces, remove stray '/uniXXXX'
-    best_text = ar_norm(best_text)
-
     sources = _format_sources(hit_ids, index.chunks, limit=8)
     return f"{best_text}\nSources:\n{sources}"
+
+# ---------------- Display helper expected by NewRag.py ----------------
+
+def clean_display_text(text: str, *args, **kwargs) -> str:
+    """
+    Minimal, safe display cleaner:
+    - strips PDF /uniXXXX artifacts and control chars
+    - collapses whitespace
+    - leaves RTL wrappers/digits handling to the caller (NewRag controls rtl/digits)
+    Accepts *args/**kwargs to be forward-compatible with callers that pass options.
+    """
+    if not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:
+            return ""
+    text = _CTRL.sub('', text)
+    text = _PDF_UNI.sub('', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 # ---------------- Sanity prompts (stable) ----------------
 
