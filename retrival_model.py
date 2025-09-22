@@ -1,458 +1,732 @@
 # -*- coding: utf-8 -*-
 """
-retrival_model.py — Arabic-friendly hybrid retriever for AlNayzak-Chatbot.
+Arabic-first hybrid retriever with persistence (for RAG).
 
-Public API (used by NewRag.py):
-- load_hierarchy(hier_path: str|None, aliases_path: str|None) -> dict|None
-- load_chunks(path: str) -> (List[Chunk], chunks_hash: str)
-- class HybridIndex: build(), save(dir), load(dir), search(query, k=8)
-- classify_intent(question: str) -> str
-- answer(question: str, index: HybridIndex, intent: str, use_rerank_flag=False) -> str
-- SANITY_PROMPTS: List[str]
-- clean_display_text(text: str, *args, **kwargs) -> str    <-- added for NewRag.py
-
-Design notes
-------------
-- Loader accepts JSONL or JSON and many common keys:
-  text: "text" | "content" | "chunk" | "body" | "paragraph" | "chunk_text"
-  page: "page" | "page_number" | "page_num" | "pageno" | "pageIndex" | meta.page_number
-  doc:  "doc" | "doc_id" | "document" | "source" | meta.source
-- Cleans PDF artifacts like '/uni06BE' and collapses whitespace.
-- Arabic normalization removes diacritics/tatweel and normalizes digits (٠١٢… -> 012…).
-- Search = BM25-lite over wordpieces + small exact-phrase boost — no external models.
-- Answer picks the most relevant line in top chunks using intent cues (times, numbers, weekdays).
-- Sources block matches runner format: "Data_pdf.pdf - page X".
+What’s new in this revision
+---------------------------
+- STRICT fix: better intent gates; real "must tokens" enforcement.
+- Hours composer: scans sentence- AND chunk-level for a plausible daily range.
+- New composers:
+    * _compose_break_answer(): finds استراحة/راحة/بريك/رضاعة + duration.
+    * _compose_hourly_leave(): handles إذن مغادرة ساعية + limits.
+- Leave/procurement selection stays numeric-first.
+- OCR hygiene: skip boilerplate lines; ignore section numbers only for time intents.
 """
 
-from __future__ import annotations
-import os, re, json, math, hashlib, pickle, io
+import os, re, sys, json, argparse, logging, hashlib
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional, Iterable
+from typing import List, Tuple, Optional, Dict, Any, Set
 
-# ---------------- Arabic text utils ----------------
+import numpy as np
 
-_AR_DIAC = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]')
-_TATWEEL = '\u0640'
-# Eastern Arabic and Persian digits -> ASCII 0-9
-_AR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"٠١٢٣٤٥٦٧٨٩")}
-_IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
-# Weird PDF glyph names like /uni06BE
-_PDF_UNI = re.compile(r'/uni[0-9A-Fa-f]{3,6}')
-# Control chars (keep bidi wrappers to let caller decide)
-_CTRL = re.compile(r'[\u0000-\u0008\u000B-\u000C\u000E-\u001F]')
+try:
+    import faiss  # type: ignore
+except Exception:
+    faiss = None
 
-def ar_norm(s: str) -> str:
-    """Aggressive Arabic normalization for indexing/matching."""
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    import joblib
+except Exception:
+    TfidfVectorizer = None
+    joblib = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers.cross_encoder import CrossEncoder
+except Exception:
+    print("Please install: pip install sentence-transformers scikit-learn faiss-cpu joblib")
+    raise
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+LOG = logging.getLogger(__name__)
+
+# ---------------- Arabic utils ----------------
+
+AR_DIAC = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]')
+AR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"٠١٢٣٤٥٦٧٨٩")}
+IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
+NOISY_UNI = re.compile(r'\buni[0-9A-Fa-f]{3,6}\b')
+RIGHTS_LINE = re.compile(r'جميع الحقوق محفوظة|التعليم المساند والإبداع العلمي')
+SECTION_NUM = re.compile(r'\b\d+\.\d+\b')
+
+def ar_normalize(s: str) -> str:
     if not s: return ""
-    s = _CTRL.sub('', s)
-    s = _PDF_UNI.sub('', s)
-    s = s.replace(_TATWEEL, '')
-    s = _AR_DIAC.sub('', s)
+    s = s.replace('\u0640','')
+    s = AR_DIAC.sub('', s)
     s = (s.replace('أ','ا').replace('إ','ا').replace('آ','ا')
            .replace('ى','ي').replace('ة','ه'))
-    s = s.translate(_AR_NUMS).translate(_IR_NUMS)
+    s = s.translate(AR_NUMS).translate(IR_NUMS)
     s = s.replace('،', ',').replace('٫','.')
-    s = re.sub(r'\s+', ' ', s).strip()
+    s = NOISY_UNI.sub('', s)
+    s = ' '.join(s.split())
     return s
 
-def ascii_digits(s: str) -> str:
-    """Convert Eastern/Arabic-Indic digits to ASCII."""
-    return s.translate(_AR_NUMS).translate(_IR_NUMS) if s else s
+def rtl_wrap(t: str) -> str:
+    return '\u202B' + t + '\u202C'
 
-_AR_LETTER_SPLIT = re.compile(r'[^\u0600-\u06FFa-zA-Z0-9]+')
-def tokenize_ar(s: str) -> List[str]:
-    """Simple Arabic-aware tokenizer for BM25."""
-    s = ar_norm(s)
-    s = re.sub(r'[:/\\\-\u2212]+', ' ', s)
-    toks = [t for t in _AR_LETTER_SPLIT.split(s) if t]
+SENT_SPLIT_RE = re.compile(r'(?<=[\.\!\؟\?،]|[\n])\s+')
+
+def sent_split(s: str) -> List[str]:
+    parts = [p.strip() for p in SENT_SPLIT_RE.split(s) if p and p.strip()]
     out = []
-    for t in toks:
-        if t.isdigit() or len(t) >= 2:
-            out.append(t)
-    return out
+    for p in parts:
+        pn = ar_normalize(p)
+        if len(pn) < 6:                 # very short/junk
+            continue
+        if RIGHTS_LINE.search(p):       # boilerplate
+            continue
+        # NOTE: we DO NOT filter section numbers here; selection functions will do it per-intent.
+        letters = sum(ch.isalpha() for ch in pn)
+        total = len(pn.replace(" ", ""))
+        if total > 0 and letters/total < 0.5:
+            continue
+        out.append(p)
+    return out if out else ([s.strip()] if s.strip() else [])
 
-# time/duration detectors
-TIME_TOKEN = re.compile(r'\b\d{1,2}[:\.]\d{1,2}\b')  # 8:30, 15.00
-DUR_TOKEN  = re.compile(r'\b(\d{1,3})\s*(?:دقيقه|دقيقة|دقائق|ساعة|ساعه|ساعات)\b', re.I)
-WEEKDAYS   = ("السبت","الأحد","الاحد","الإثنين","الاثنين","الثلاثاء","الأربعاء","الاربعاء","الخميس","الجمعة")
+# ---------------- Data IO ----------------
 
-# ---------------- Data structures ----------------
+CHUNKS_PATH = "Data_pdf_clean_chunks.jsonl"
+PDF_PATH    = "Data_pdf.pdf"
 
 @dataclass
 class Chunk:
-    text: str
+    id: int
     page: int
-    doc: str = "Data_pdf.pdf"
-    section: str = ""
-    meta: dict = None
+    text: str
+    norm: str
 
-# ---------------- Loaders ----------------
+_TEXT_KEYS = {"text","text_display","content","body","raw","paragraph","para","line","value","data","clean_text","norm"}
+_TEXT_ARRAY_KEYS = {"lines","paragraphs","paras","sentences","chunks","blocks","spans","tokens"}
+_PAGE_KEYS = {"page","page_no","page_num","pageNumber","page_index","Page","PageNo"}
+_ID_KEYS = {"id","chunk_id","cid","idx","index","Id","ID"}
 
-def _coerce_int(x, default=0):
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-def _first(*vals):
-    for v in vals:
-        if v is None: continue
-        if isinstance(v, str) and v.strip(): return v
-        if isinstance(v, (int, float)) and v != 0: return v
+def _as_text(v):
+    if isinstance(v, str):
+        return v.strip() if v.strip() else None
+    if isinstance(v, list):
+        parts = [str(x).strip() for x in v if isinstance(x, (str,int,float)) and str(x).strip()]
+        return "\n".join(parts) if parts else None
     return None
 
-def _extract_text(rec: dict) -> Optional[str]:
-    return _first(
-        rec.get("text"), rec.get("content"), rec.get("chunk"),
-        rec.get("body"), rec.get("paragraph"), rec.get("chunk_text"),
-        rec.get("Text"), rec.get("Content")
-    )
+def _get_any(d: dict, keys: set):
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    lower = {k.lower(): k for k in d.keys()}
+    for k in keys:
+        lk = k.lower()
+        if lk in lower and d[lower[lk]] not in (None, ""):
+            return d[lower[lk]]
+    return None
 
-def _extract_page(rec: dict) -> Optional[int]:
-    page = _first(
-        rec.get("page"), rec.get("page_number"), rec.get("page_num"),
-        rec.get("pageno"), rec.get("pageIndex"), rec.get("page_index")
-    )
-    if page is None and isinstance(rec.get("meta"), dict):
-        m = rec["meta"]
-        page = _first(m.get("page"), m.get("page_number"), m.get("page_num"), m.get("pageno"))
-    return _coerce_int(page, 0) if page is not None else 0
+def _file_hash(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1<<20)
+            if not b: break
+            h.update(b)
+    return h.hexdigest()
 
-def _extract_doc(rec: dict) -> str:
-    doc = _first(rec.get("doc"), rec.get("doc_id"), rec.get("document"),
-                 rec.get("source"), rec.get("file"), rec.get("filename"))
-    if doc is None and isinstance(rec.get("meta"), dict):
-        doc = _first(rec["meta"].get("source"), rec["meta"].get("file"))
-    return str(doc) if doc else "Data_pdf.pdf"
+def load_chunks(path=CHUNKS_PATH):
+    if not os.path.exists(path):
+        LOG.error("Chunks file not found: %s", path); sys.exit(1)
+    LOG.info("Loading documents from %s ...", path)
 
-def _extract_section(rec: dict) -> str:
-    sec = _first(rec.get("heading"), rec.get("title"), rec.get("section"))
-    if sec is None and isinstance(rec.get("meta"), dict):
-        sec = _first(rec["meta"].get("heading"), rec["meta"].get("title"))
-    return str(sec) if sec else ""
-
-def _iter_records(data) -> Iterable[dict]:
-    if isinstance(data, list):
-        for r in data: 
-            if isinstance(r, dict): yield r
-    elif isinstance(data, dict):
-        items = data.get("chunks") or data.get("data") or data.get("records") or []
-        if isinstance(items, list):
-            for r in items:
-                if isinstance(r, dict): yield r
-
-def load_chunks(path: str) -> Tuple[List[Chunk], str]:
-    """
-    Accepts .jsonl (one JSON per line) or .json (array/object).
-    Returns (chunks, sha1_hash). Raises if nothing could be parsed.
-    """
-    chunks: List[Chunk] = []
-    h = hashlib.sha1()
-
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"chunks file not found: {path}")
-
-    _, ext = os.path.splitext(path.lower())
-    with io.open(path, "r", encoding="utf-8") as f:
-        if ext == ".jsonl":
-            for line in f:
-                line = line.strip()
-                if not line: continue
-                h.update(line.encode("utf-8", errors="ignore"))
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                txt = _extract_text(rec)
-                if not txt: continue
-                txt = ar_norm(txt)
-                if not txt or len(txt) < 3: continue
-                pg  = _extract_page(rec)
-                doc = _extract_doc(rec)
-                sec = _extract_section(rec)
-                chunks.append(Chunk(text=txt, page=pg, doc=doc, section=sec, meta=rec))
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        first = f.read(1)
+        f.seek(0)
+        if first == "[":
+            rows = json.load(f)
         else:
-            raw = f.read()
-            h.update(raw.encode("utf-8", errors="ignore"))
+            for line in f:
+                line = line.strip().rstrip(",")
+                if not line: continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    if line.startswith('"') and line.endswith('"'):
+                        rows.append(line.strip('"'))
+                    continue
+
+    chunks: List[Chunk] = []
+    for idx, j in enumerate(rows):
+        if isinstance(j, str):
+            t = j; page = -1; cid = idx
+        elif isinstance(j, dict):
+            t = _as_text(_get_any(j, _TEXT_KEYS)) or _as_text(_get_any(j, _TEXT_ARRAY_KEYS))
+            if not t: continue
+            page = _get_any(j, _PAGE_KEYS)
+            try: page = int(page) if page is not None else -1
+            except Exception: page = -1
+            cid = _get_any(j, _ID_KEYS)
+            try: cid = int(cid)
+            except Exception: cid = idx
+        else:
+            continue
+        t = t.strip()
+        if not t: continue
+        chunks.append(Chunk(id=int(cid), page=int(page), text=t, norm=ar_normalize(t)))
+
+    LOG.info("Loaded %d chunks", len(chunks))
+    if len(chunks) == 0:
+        LOG.error("No chunks parsed. Check that your file contains textual fields.")
+        sys.exit(1)
+    return chunks, _file_hash(path)
+
+# ---------------- Hierarchy / aliases ----------------
+
+@dataclass
+class HierData:
+    inverted: Dict[str, List[int]]
+    aliases: Dict[str, List[str]]
+
+def _load_json(path: Optional[str]) -> Dict[str, Any]:
+    if not path or not os.path.exists(path): return {}
+    with open(path, "r", encoding="utf-8") as f: return json.load(f)
+
+def load_hierarchy(hier_index_path: Optional[str], aliases_path: Optional[str]) -> Optional[HierData]:
+    inv = _load_json(hier_index_path)
+    aliases = _load_json(aliases_path)
+    if not inv:
+        LOG.info("No hierarchy index provided/loaded.")
+        return None
+
+    def _n(s: str) -> str: return ar_normalize(s).lower()
+
+    inv_n: Dict[str, List[int]] = {}
+    for k, v in inv.items():
+        if not isinstance(v, list): continue
+        cleaned: List[int] = []
+        for x in v:
             try:
-                data = json.loads(raw)
+                cleaned.append(int(x))
             except Exception:
-                raise ValueError("invalid JSON in chunks file")
-            for rec in _iter_records(data):
-                txt = _extract_text(rec)
-                if not txt: continue
-                txt = ar_norm(txt)
-                if not txt or len(txt) < 3: continue
-                pg  = _extract_page(rec)
-                doc = _extract_doc(rec)
-                sec = _extract_section(rec)
-                chunks.append(Chunk(text=txt, page=pg, doc=doc, section=sec, meta=rec))
+                m = re.search(r'(\d+)$', str(x))
+                if m:
+                    try:
+                        cleaned.append(int(m.group(1)))
+                    except Exception:
+                        pass
+        inv_n[_n(k)] = cleaned
 
-    if not chunks:
-        raise ValueError(
-            "No chunks loaded. Please confirm JSON keys. "
-            "Expected one of: text|content|chunk|body|paragraph|chunk_text and page|page_number|pageno etc."
-        )
+    aliases_n = {_n(k): [_n(a) for a in v] for k, v in (aliases or {}).items()}
+    LOG.info("Loaded hierarchy: %d index keys, %d alias sets", len(inv_n), len(aliases_n))
+    return HierData(inverted=inv_n, aliases=aliases_n)
 
-    return chunks, h.hexdigest()
+def _hier_candidates(query: str, hd: HierData) -> Set[int]:
+    qn = ar_normalize(query).lower()
+    toks = [t for t in re.split(r"[\s\|\:/,;]+", qn) if t]
+    keys = set(toks)
+    for canon, alist in hd.aliases.items():
+        if any(a in qn for a in alist+[canon]):
+            keys.add(canon)
+    cand: Set[int] = set()
+    for k in keys:
+        if k in hd.inverted:
+            cand.update(hd.inverted[k])
+    return cand
 
-# ---------------- Hierarchy / aliases (optional) ----------------
-
-def load_hierarchy(hier_path: Optional[str], aliases_path: Optional[str]) -> Optional[dict]:
-    hier = None
-    if hier_path and os.path.isfile(hier_path):
-        try:
-            with io.open(hier_path, "r", encoding="utf-8") as f:
-                hier = json.load(f)
-        except Exception:
-            hier = None
-    if aliases_path and os.path.isfile(aliases_path):
-        try:
-            with io.open(aliases_path, "r", encoding="utf-8") as f:
-                aliases = json.load(f)
-            if hier is None: hier = {}
-            hier["_aliases"] = aliases
-        except Exception:
-            pass
-    return hier
-
-# ---------------- HybridIndex (BM25-lite + exact phrase boost) ----------------
+# ---------------- Index with persistence ----------------
 
 class HybridIndex:
-    def __init__(self, chunks: List[Chunk], chunks_hash: str, hier: Optional[dict]=None, model_name: Optional[str]=None):
-        self.chunks: List[Chunk] = chunks
+    def __init__(self, chunks: List[Chunk], chunks_hash: str, hier: Optional[HierData] = None,
+                 model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
+        self.chunks = chunks
         self.chunks_hash = chunks_hash
-        self.hier = hier or {}
-        # inverted
-        self.df: Dict[str, int] = {}
-        self.doc_tfs: List[Dict[str, int]] = []
-        self.doc_len: List[int] = []
-        self.idf: Dict[str, float] = {}
-        self.avgdl: float = 0.0
-        self._built = False
-
-    def build(self):
-        self.df.clear(); self.doc_tfs.clear(); self.doc_len.clear(); self.idf.clear()
-        for ch in self.chunks:
-            toks = tokenize_ar(ch.text)
-            tf: Dict[str,int] = {}
-            for t in toks:
-                tf[t] = tf.get(t, 0) + 1
-            self.doc_tfs.append(tf)
-            self.doc_len.append(sum(tf.values()))
-            for t in tf.keys():
-                self.df[t] = self.df.get(t, 0) + 1
-
-        N = max(1, len(self.chunks))
-        self.avgdl = max(1.0, sum(self.doc_len) / N if self.doc_len else 1.0)
-        for t, df in self.df.items():
-            self.idf[t] = math.log(1 + (N - df + 0.5) / (df + 0.5))
-        self._built = True
+        self.hier = hier
+        self.model_name = model_name
+        self.model = SentenceTransformer(model_name)
+        self.emb = None
+        self.faiss = None
+        self.tf_char = None
+        self.tf_word = None
+        self.char_mat = None
+        self.word_mat = None
 
     def save(self, out_dir: str):
         os.makedirs(out_dir, exist_ok=True)
-        with open(os.path.join(out_dir, "bm25.pkl"), "wb") as f:
-            pickle.dump({
-                "chunks_hash": self.chunks_hash,
-                "df": self.df,
-                "doc_tfs": self.doc_tfs,
-                "doc_len": self.doc_len,
-                "idf": self.idf,
-                "avgdl": self.avgdl,
-            }, f, protocol=pickle.HIGHEST_PROTOCOL)
+        meta = {
+            "model_name": self.model_name,
+            "chunks_hash": self.chunks_hash,
+            "n_chunks": len(self.chunks),
+            "ids": [c.id for c in self.chunks],
+        }
+        with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        if self.emb is not None:
+            np.save(os.path.join(out_dir, "embeddings.npy"), self.emb)
+
+        if faiss is not None and self.faiss is not None:
+            faiss.write_index(self.faiss, os.path.join(out_dir, "faiss.index"))
+
+        if joblib and TfidfVectorizer is not None:
+            if self.tf_char is not None:
+                joblib.dump(self.tf_char, os.path.join(out_dir, "tf_char.pkl"))
+            if self.tf_word is not None:
+                joblib.dump(self.tf_word, os.path.join(out_dir, "tf_word.pkl"))
+            if self.char_mat is not None:
+                joblib.dump(self.char_mat, os.path.join(out_dir, "char_mat.pkl"))
+            if self.word_mat is not None:
+                joblib.dump(self.word_mat, os.path.join(out_dir, "word_mat.pkl"))
+
+        LOG.info("Saved index artifacts to %s", out_dir)
 
     def load(self, in_dir: str) -> bool:
         try:
-            with open(os.path.join(in_dir, "bm25.pkl"), "rb") as f:
-                obj = pickle.load(f)
-            if obj.get("df") and obj.get("doc_tfs") and obj.get("chunks_hash") == self.chunks_hash and len(obj["doc_tfs"]) == len(self.chunks):
-                self.df = obj["df"]; self.doc_tfs = obj["doc_tfs"]
-                self.doc_len = obj["doc_len"]; self.idf = obj["idf"]
-                self.avgdl = obj["avgdl"]; self._built = True
-                return True
-        except Exception:
+            with open(os.path.join(in_dir, "meta.json"), "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if meta.get("chunks_hash") != self.chunks_hash or meta.get("n_chunks") != len(self.chunks):
+                LOG.warning("Artifact/chunks mismatch; will rebuild instead of loading.")
+                return False
+
+            emb_path = os.path.join(in_dir, "embeddings.npy")
+            if os.path.exists(emb_path):
+                self.emb = np.load(emb_path)
+            else:
+                LOG.warning("embeddings.npy missing; cannot load.")
+                return False
+
+            if faiss is not None:
+                faiss_path = os.path.join(in_dir, "faiss.index")
+                if os.path.exists(faiss_path):
+                    self.faiss = faiss.read_index(faiss_path)
+                else:
+                    d = self.emb.shape[1]
+                    self.faiss = faiss.IndexFlatIP(d)
+                    self.faiss.add(self.emb.astype('float32'))
+            else:
+                self.faiss = None
+
+            if joblib and TfidfVectorizer is not None:
+                tp = os.path.join(in_dir, "tf_char.pkl"); wp = os.path.join(in_dir, "tf_word.pkl")
+                cmp = os.path.join(in_dir, "char_mat.pkl"); wmp = os.path.join(in_dir, "word_mat.pkl")
+                if all(os.path.exists(p) for p in [tp, wp, cmp, wmp]):
+                    self.tf_char = joblib.load(tp)
+                    self.tf_word = joblib.load(wp)
+                    self.char_mat = joblib.load(cmp)
+                    self.word_mat = joblib.load(wmp)
+                else:
+                    LOG.warning("TF-IDF artifacts missing; skipping sparse load.")
+
+            LOG.info("Loaded index artifacts from %s", in_dir)
+            return True
+        except Exception as e:
+            LOG.warning("Failed to load artifacts from %s: %s", in_dir, e)
             return False
-        return False
 
-    def _bm25(self, q_toks: List[str], k1=1.5, b=0.75) -> List[Tuple[int,float]]:
-        if not self._built:
-            self.build()
-        uniq = {}
-        for t in q_toks:
-            uniq[t] = 1
-        scores: List[Tuple[int,float]] = []
-        for i, tf in enumerate(self.doc_tfs):
-            dl = self.doc_len[i] or 1
-            score = 0.0
-            for t in uniq.keys():
-                if t not in tf: continue
-                idf = self.idf.get(t, 0.0)
-                f = tf[t]
-                denom = f + k1 * (1 - b + b * dl / self.avgdl)
-                score += idf * (f * (k1 + 1)) / (denom if denom != 0 else 1.0)
-            if score > 0:
-                scores.append((i, score))
-        # small phrase boost (first 2-3 tokens)
-        phrase = None
-        if len(q_toks) >= 2:
-            phrase = " ".join(q_toks[:3]).strip()
-        if phrase:
-            pat = re.compile(re.escape(phrase))
-            for j, (i, sc) in enumerate(scores):
-                if pat.search(self.chunks[i].text):
-                    scores[j] = (i, sc * 1.15)
-        scores.sort(key=lambda x: x[1], reverse=True)
-        return scores
+    def build(self):
+        LOG.info("Building embeddings...")
+        texts = [c.norm for c in self.chunks]
+        self.emb = self.model.encode(texts, batch_size=128, convert_to_numpy=True,
+                                     show_progress_bar=True, normalize_embeddings=True)
+        if faiss is not None:
+            d = self.emb.shape[1]
+            self.faiss = faiss.IndexFlatIP(d)
+            self.faiss.add(self.emb.astype('float32'))
+            LOG.info("Built FAISS index")
+        else:
+            LOG.warning("faiss not available; dense retrieval will be slower.")
 
-    def search(self, query: str, k: int=8) -> List[Tuple[int, float]]:
-        query = ar_norm(query)
-        q_toks = tokenize_ar(query)
-        if not q_toks:
-            return []
-        ranked = self._bm25(q_toks)
-        return ranked[:k]
+        if TfidfVectorizer is None:
+            LOG.warning("sklearn not available; skipping TF-IDF indexes.")
+        else:
+            self.tf_char = TfidfVectorizer(analyzer='char', ngram_range=(2,5), min_df=1)
+            self.char_mat = self.tf_char.fit_transform(texts)
+            self.tf_word = TfidfVectorizer(analyzer='word', ngram_range=(1,2),
+                                           token_pattern=r"(?u)\b\w+\b", min_df=1)
+            self.word_mat = self.tf_word.fit_transform(texts)
+            LOG.info("Built TF-IDF (char+word) indexes")
 
-# ---------------- Intent & line picking ----------------
+        LOG.info("Built embeddings for %d chunks", len(self.chunks))
 
-def classify_intent(question: str) -> str:
-    q = ar_norm(question)
-    q_no_digits = re.sub(r'\d+', '', q)
+    def dense(self, q: str, topk=60, restrict_ids: Optional[Set[int]] = None):
+        qv = self.model.encode([q], convert_to_numpy=True, normalize_embeddings=True)
+        if self.faiss is not None:
+            D, I = self.faiss.search(qv.astype('float32'), max(topk, 60))
+            scores, idxs = D[0], I[0]
+        else:
+            sims = self.emb @ qv[0]
+            idxs = np.argsort(-sims)[:max(topk, 60)]
+            scores = sims[idxs]
+        if restrict_ids is None:
+            return scores[:topk], idxs[:topk]
+        filtS, filtI = [], []
+        rset = set(int(x) for x in restrict_ids)
+        for s, i in zip(scores, idxs):
+            if int(i) in rset:
+                filtS.append(float(s)); filtI.append(int(i))
+            if len(filtI) >= topk: break
+        return np.array(filtS), np.array(filtI)
 
-    if "رمضان" in q_no_digits:
-        return "ramadan_hours"
-    if ("ساعات" in q_no_digits or "الدوام" in q_no_digits or "العمل" in q_no_digits) and ("من" in q_no_digits or "الى" in q_no_digits or "إلى" in q_no_digits):
-        return "work_hours"
-    if "استراح" in q_no_digits or "بريك" in q_no_digits or "راحة" in q_no_digits:
-        return "break"
-    if "ايام" in q or "أيام" in question or "السبت" in q or "الجمعة" in q:
-        return "workdays"
-    if "ساعات اضافية" in q or "العمل الاضافي" in q or "العمل الإضافي" in q or "اوفر تايم" in q or "overtime" in q.lower():
-        return "overtime"
-    if "مياومات" in q or "بدل سفر" in q or "سفر" in q:
+    def sparse(self, q: str):
+        if self.tf_char is None or self.tf_word is None:
+            return None, None
+        qc = self.tf_char.transform([q])
+        qw = self.tf_word.transform([q])
+        c_scores = (self.char_mat @ qc.T).toarray().ravel()
+        w_scores = (self.word_mat @ qw.T).toarray().ravel()
+        return c_scores, w_scores
+
+# ---------------- Intents ----------------
+
+KW_HOURS = re.compile(r'(ساعات)\s+(الدوام|العمل)')
+KW_RAMADAN = re.compile(r'رمضان')
+KW_LEAVE = re.compile(r'(إجاز|اجاز)')
+KW_OVERTIME = re.compile(r'(إضافي|اضافي)')
+KW_FLEX = re.compile(r'(مرون|الحضور|الانصراف|تأخير|تاخير|خصم|بصمة|بصمه)')
+KW_BREAK = re.compile(r'(استراح|راحة|بريك|رضاعه|رضاع)')
+KW_HOURLY = re.compile(r'(مغادره|مغادرة|اذن|إذن).*(ساعيه|ساعية)|مغادرة\s*ساعية')
+KW_PROC = re.compile(r'(شراء|مشتريات|عروض|مناقصة|توريد|تأمين|حد|سقف)')
+KW_WORKDAYS = re.compile(r'(ايام|أيام).*(العمل|الدوام)|السبت|الاحد|الخميس|الأحد')
+
+def classify_intent(q: str) -> str:
+    qn = ar_normalize(q)
+    if KW_HOURS.search(qn) and KW_RAMADAN.search(qn): return "ramadan_hours"
+    if KW_WORKDAYS.search(qn): return "workdays"
+    if KW_HOURLY.search(qn): return "hourly_leave"
+    if KW_HOURS.search(qn): return "work_hours"
+    if KW_FLEX.search(qn): return "flex"
+    if KW_BREAK.search(qn): return "break"
+    if KW_OVERTIME.search(qn): return "overtime"
+    if KW_LEAVE.search(qn): return "leave"
+    if KW_PROC.search(qn): return "procurement"
+    if re.search(r'(مياوم|مياومات|بدل\s*سفر|نفقات|فواتير|تذاكر|فندق|اقام)', qn):
         return "per_diem"
-    if "شراء" in q or "عروض اسعار" in q or "عروض أسعار" in q or "توريد" in q:
-        return "procurement"
-    if "اجازه" in q or "إجازة" in q or "اجازة" in q:
-        if "اموم" in q: return "maternity"
-        if "مرض" in q: return "sick_leave"
-        if "طارئ" in q or "طارئة" in q: return "emergency_leave"
-        return "leave"
-    if "هدايا" in q or "الضيافه" in q or "الضيافة" in q:
-        return "gifts"
-    if "عهدة" in q or "عهده" in q:
-        return "custody"
-    if "رواتب" in q or "راتب" in q:
-        return "payroll"
-    if "تضارب المصالح" in q:
-        return "conflict_of_interest"
-    if "السلوك" in q or "التحرش" in q:
-        return "conduct_harassment"
-    if "السرية" in q or "حماية المعلومات" in q:
-        return "confidentiality"
     return "general"
 
-def _line_score_by_intent(line: str, intent: str) -> float:
-    ln = ar_norm(line)
-    score = 0.0
-    if len(ln) >= 12: score += 0.5
-    if intent in ("work_hours", "ramadan_hours"):
-        if TIME_TOKEN.search(ascii_digits(ln)): score += 3.0
-        if "من" in ln and ("الى" in ln or "إلى" in ln): score += 1.0
-        if "رمضان" in ln and intent == "ramadan_hours": score += 1.0
-    elif intent == "break":
-        if DUR_TOKEN.search(ln): score += 2.0
-        if "استراح" in ln or "راحة" in ln or "بريك" in ln: score += 1.0
-    elif intent == "workdays":
-        if any(d in ln for d in WEEKDAYS): score += 2.0
-        if "ايام" in ln and ("العمل" in ln or "الدوام" in ln): score += 1.0
-    elif intent in ("overtime", "per_diem", "procurement", "leave", "maternity", "sick_leave", "emergency_leave", "payroll"):
-        if re.search(r'\d', ln): score += 1.8
-        if "نموذج" in ln or "طلب" in ln: score += 0.5
-    elif intent in ("gifts","custody","conflict_of_interest","conduct_harassment","confidentiality"):
-        if "يمنع" in ln or "ممنوع" in ln or "سياسة" in ln: score += 1.0
-    return score
+INTENT_HINTS = {
+    "flex":    ["مرون", "تاخير", "تأخير", "الحضور", "الانصراف", "خصم", "بصمه","بصمة"],
+    "break":   ["استراح", "راحة", "فسحه", "فسحة", "بريك","رضاعه","رضاع","دقيقه","دقائق","ساعه","ساعة","نصف","ربع"],
+    "overtime":["اضافي", "ساعات اضافيه", "تعويض", "موافقه", "اعتماد", "العطل","العطل الرسميه","نسبه","125","أجر","اجر","احتساب"],
+    "leave":   ["اجاز", "اجازه","إجازة","سنويه","سنوية","مرضيه","طارئه","امومه","حداد","بدون","راتب"],
+    "hourly_leave": ["مغادر","اذن","ساعيه","ساعية","حد","اقصى","شهري"],
+    "work_hours": ["ساعات", "دوام", "العمل","اوقات","من","الى","حتى","حتي"],
+    "ramadan_hours": ["رمضان","ساعات", "دوام", "العمل","اوقات","من","الى","حتى","حتي"],
+    "procurement": ["عروض","ثلاث","ثلاثه","3","شراء","سقف","حد","شيكل","₪","دينار","دولار","توريد","مشتريات"],
+    "per_diem": ["مياومات","مياومه","بدل","سفر","صرف","نفقات","مصاريف","فواتير","ايصالات","تذاكر","فندق","اقامه","اقامة"],
+    "workdays": ["ايام","العمل","الدوام","السبت","الاحد","الأحد","الخميس","من","الى"]
+}
 
-def _best_line_for_intent(text: str, intent: str) -> str:
-    parts = []
-    for seg in re.split(r'[\r\n]+', text):
-        seg = seg.strip()
-        if not seg: continue
-        sub = re.split(r'[•\-\u2022]\s+', seg)
-        for s in sub:
-            s = s.strip()
-            if s: parts.append(s)
-    if not parts:
-        return text.strip()
-    scored = [(p, _line_score_by_intent(p, intent)) for p in parts]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return scored[0][0].strip() if scored[0][1] > 0 else parts[0].strip()
+INTENT_MUST = {
+    "ramadan_hours": ["رمضان","دوام","ساعات"],
+    "work_hours":    ["دوام","ساعات","عمل"],
+    "workdays":      ["ايام","العمل","الدوام","السبت","الاحد","الأحد","الخميس"],
+    "overtime":      ["اضافي","اجر","أجر","احتساب","موافقه","اعتماد","العطل"],
+    "procurement":   ["عروض","عرض","ثلاث","ثلاثه","شراء","سقف","حد"],
+    "per_diem":      ["بدل","سفر","مصاريف","نفقات","ايصالات","فواتير","تذاكر","فندق"],
+    "break":         ["استراح","راحة","بريك","رضاع","رضاعه","دقائق","ساعة","ساعه","نصف","ربع"],
+    "hourly_leave":  ["مغادر","اذن","ساعيه","ساعية"],
+    "leave":         ["اجاز","اجازه","إجازة"],
+    "general":       []
+}
 
-# ---------------- Answer synthesis ----------------
+def _must_tokens_present(sn_norm: str, intent: str) -> bool:
+    req = INTENT_MUST.get(intent, [])
+    if not req:
+        return True
+    return any(tok in sn_norm for tok in req)
 
-def _format_sources(hit_indices: List[int], chunks: List[Chunk], limit: int = 8) -> str:
-    seen = []
-    out_lines = []
-    for i in hit_indices[:limit]:
-        ch = chunks[i]
-        key = (ch.doc, ch.page)
-        if key in seen: 
-            continue
-        seen.append(key)
-        out_lines.append(f"{len(out_lines)+1}. {ch.doc} - page {ch.page}")
-    return "\n".join(out_lines) if out_lines else "—"
+# ---------------- Policy-aware time & duration extraction ----------------
 
-def answer(question: str, index: HybridIndex, intent: str, use_rerank_flag: bool=False) -> str:
-    """
-    Returns body + "\nSources:\n<lines>".
-    Picks a precise line; never fabricates numeric/time facts.
-    """
-    hits = index.search(question, k=8)
-    if not hits:
-        return "لم أعثر على إجابة مناسبة."
-    hit_ids = [i for (i, _) in hits]
+TIME_RE = re.compile(
+    r'(?:من\s*)?'
+    r'(\d{1,2}(?::|\.)?\d{0,2})\s*'
+    r'(?:[-–—]|الى|إلى|حتي|حتى)\s*'
+    r'(\d{1,2}(?::|\.)?\d{0,2})'
+)
+DUR_TOKEN = re.compile(r'\b(\d{1,3})\s*(?:دقيقه|دقيقة|دقائق|ساعه|ساعة|ساعات)\b', re.I)
 
-    best_text = ""
-    best_score = -1.0
-    for i, _sc in hits[:3]:
-        ch = index.chunks[i]
-        candidate = _best_line_for_intent(ch.text, intent)
-        sc = _line_score_by_intent(candidate, intent)
-        q_norm = set(tokenize_ar(question))
-        cand_norm = set(tokenize_ar(candidate))
-        overlap = len(q_norm & cand_norm)
-        sc += 0.1 * overlap
-        if sc > best_score:
-            best_score = sc
-            best_text = candidate
+def _normalize_hhmm(tok: str) -> str:
+    tok = tok.replace('.', ':')
+    if ':' not in tok:
+        return f"{int(tok):d}:00"
+    h, m = tok.split(':', 1)
+    if m == "": m = "00"
+    return f"{int(h):d}:{int(m):02d}"
 
-    best_text = ar_norm(best_text).strip()
-    if not best_text:
-        return "لم أعثر على إجابة مناسبة."
+def _to_minutes(hhmm: str) -> int:
+    h, m = hhmm.split(':'); return int(h)*60 + int(m)
 
-    sources = _format_sources(hit_ids, index.chunks, limit=8)
-    return f"{best_text}\nSources:\n{sources}"
+def _plausible_workday(a: int, b: int) -> bool:
+    return 6*60 <= a <= 20*60+30 and 6*60 <= b <= 20*60+30 and b > a
 
-# ---------------- Display helper expected by NewRag.py ----------------
+def extract_all_ranges(text: str, intent: str) -> List[Tuple[int,int]]:
+    n = ar_normalize(text)
+    ranges: List[Tuple[int,int]] = []
+    for m in TIME_RE.finditer(n):
+        a = _normalize_hhmm(m.group(1)); b = _normalize_hhmm(m.group(2))
+        A, B = _to_minutes(a), _to_minutes(b)
+        if B <= A:  # handle 8:30 -> 3:00 style
+            B_try = B + 12*60
+            if B_try > A:
+                B = B_try
+            else:
+                A, B = B, A
+        if intent in ("work_hours","ramadan_hours"):
+            dur = B - A
+            if not (6*60 <= dur <= 11*60) or not _plausible_workday(A,B):
+                continue
+        ranges.append((A, B))
+    return ranges
 
-def clean_display_text(text: str, *args, **kwargs) -> str:
-    """
-    Minimal, safe display cleaner:
-    - strips PDF /uniXXXX artifacts and control chars
-    - collapses whitespace
-    - leaves RTL wrappers/digits handling to the caller (NewRag controls rtl/digits)
-    Accepts *args/**kwargs to be forward-compatible with callers that pass options.
-    """
-    if not isinstance(text, str):
+def pick_best_range(ranges: List[Tuple[int,int]]) -> Optional[Tuple[str,str]]:
+    if not ranges: return None
+    scored = []
+    for (A,B) in ranges:
+        dur = B - A
+        scored.append((abs(dur - 7.5*60), -(dur), A, B))
+    scored.sort()
+    _, _, A, B = scored[0]
+    return f"{A//60:d}:{A%60:02d}", f"{B//60:d}:{B%60:02d}"
+
+# ---------------- Retrieval & Answering ----------------
+
+def combine_scores(dense_scores, dense_idx, c_scores, w_scores,
+                   w_dense=0.60, w_char=0.20, w_word=0.20, topk=20):
+    out = []
+    for s, i in zip(dense_scores, dense_idx):
+        sc = float(s) * w_dense
+        if c_scores is not None and len(c_scores) > int(i): sc += float(c_scores[i]) * w_char
+        if w_scores is not None and len(w_scores) > int(i): sc += float(w_scores[i]) * w_word
+        out.append((sc, int(i)))
+    out.sort(key=lambda x: -x[0])
+    return out[:topk]
+
+def _intent_keys(intent: str) -> List[str]:
+    return INTENT_HINTS.get(intent, [])
+
+def retrieve(index: HybridIndex, q: str, rerank: bool) -> List[Tuple[float,int]]:
+    qn = ar_normalize(q)
+    restrict_ids: Optional[Set[int]] = None
+    gated = False
+    if index.hier is not None:
+        cand = _hier_candidates(qn, index.hier)
+        if cand:
+            restrict_ids = cand
+            gated = True
+
+    dS, dI = index.dense(qn, topk=60, restrict_ids=restrict_ids)
+    globally_fallback = False
+    if gated and (dI is None or len(dI) == 0):
+        globally_fallback = True
+        dS, dI = index.dense(qn, topk=60, restrict_ids=None)
+
+    cS, wS = index.sparse(qn)
+    prelim = combine_scores(dS, dI, cS, wS, topk=30)
+
+    if globally_fallback:
+        prelim = [(sc*0.85, i) for (sc,i) in prelim]
+
+    if rerank:
         try:
-            text = str(text)
-        except Exception:
-            return ""
-    text = _CTRL.sub('', text)
-    text = _PDF_UNI.sub('', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+            ce = CrossEncoder("cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+            if len(prelim) > 1:
+                pairs = [(qn, index.chunks[i].text) for _, i in prelim]
+                ce_scores = ce.predict(pairs)
+                prelim = list(zip(list(map(float, ce_scores)), [i for _, i in prelim]))
+                prelim.sort(key=lambda x: -x[0])
+            LOG.info("Cross-encoder loaded: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+        except Exception as e:
+            LOG.warning("CE reranker unavailable (%s). Continuing without.", e)
 
-# ---------------- Sanity prompts (stable) ----------------
+    return prelim[:8]
+
+def _has_numbers(sn: str) -> bool:
+    return bool(re.search(r'\d', sn))
+
+def _has_time_hint(sn: str) -> bool:
+    sn = ar_normalize(sn)
+    return any(w in sn for w in ["من","الى","حتي","حتى",":","."])
+
+def _looks_junky(sn: str) -> bool:
+    snn = ar_normalize(sn)
+    if len(snn) < 6: return True
+    if RIGHTS_LINE.search(sn):
+        return True
+    letters = sum(ch.isalpha() for ch in snn)
+    total = len(snn.replace(" ", ""))
+    if total > 0 and letters/total < 0.5:
+        return True
+    return False
+
+def best_snippet(chunk: Chunk, qnorm: str, intent: str, max_len=260) -> Optional[str]:
+    sents = sent_split(chunk.text)
+    if not sents: return (chunk.text[:max_len] if chunk.text else None)
+    q_terms = set([w for w in qnorm.split() if len(w) >= 3])
+    hints = _intent_keys(intent)
+
+    best, best_score = None, -1e9
+    for s in sents:
+        if _looks_junky(s): 
+            continue
+        sn = ar_normalize(s)
+        if not _must_tokens_present(sn, intent):
+            continue
+        # time intents: demand numbers + hint + context
+        if intent in ("work_hours","ramadan_hours") and not (_has_numbers(sn) and _has_time_hint(sn) and ("دوام" in sn or "عمل" in sn or "ساعات" in sn)):
+            continue
+        overlap = len(q_terms & set(sn.split()))
+        has_time = _has_numbers(sn) and _has_time_hint(sn)
+        has_hint = any(h in sn for h in hints)
+        score = 0.0
+        score += 1.2 * overlap
+        if has_time: score += 1.0
+        if has_hint: score += 0.8
+        if _has_numbers(sn) and intent in ("work_hours","ramadan_hours","overtime","leave","procurement","per_diem","hourly_leave"):
+            score += 0.4
+        if overlap == 0 and not (has_time or has_hint):
+            score -= 0.6
+        if score > best_score:
+            best, best_score = s, score
+
+    if not best:
+        for s in sents:
+            sn = ar_normalize(s)
+            if not _looks_junky(s) and _must_tokens_present(sn, intent):
+                best = s; break
+
+    if not best:
+        return None
+
+    txt = best.strip()
+    return (txt[:max_len] + ("…" if len(txt) > max_len else ""))
+
+# ---------------- Answer synthesis helpers ----------------
+
+def _compose_hours_answer(chunks: List[Chunk], hits: List[Tuple[float,int]], intent: str) -> Optional[str]:
+    # pass 1: sentence-level
+    for _, i in hits:
+        sents = sent_split(chunks[i].text)
+        for s in sents:
+            sn = ar_normalize(s)
+            if not (("دوام" in sn) or ("عمل" in sn) or ("ساعات" in sn)):
+                continue
+            if not _must_tokens_present(sn, intent):
+                continue
+            ranges = extract_all_ranges(s, intent)
+            rng = pick_best_range(ranges)
+            if rng:
+                a, b = rng
+                suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
+                txt = f"ساعات الدوام{suffix} من {a} إلى {b}."
+                src = f"Data_pdf.pdf - page {chunks[i].page}"
+                return rtl_wrap(txt) + "\n" + f"Sources:\n1. {src}"
+    # pass 2: chunk-level (handles split lines)
+    for _, i in hits:
+        t = chunks[i].text
+        tn = ar_normalize(t)
+        if not (("دوام" in tn) or ("عمل" in tn) or ("ساعات" in tn)):
+            continue
+        ranges = extract_all_ranges(t, intent)
+        rng = pick_best_range(ranges)
+        if rng:
+            a, b = rng
+            suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
+            txt = f"ساعات الدوام{suffix} من {a} إلى {b}."
+            srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
+            return rtl_wrap(txt) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
+def _compose_procurement_threshold(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    for _, i in hits:
+        for s in sent_split(chunks[i].text):
+            sn = ar_normalize(s)
+            if any(w in sn for w in ["عروض","ثلاث","3","سقف","حد","شيكل","دينار","دولار","شراء","مشتريات"]):
+                srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k, (_, j) in enumerate(hits, 1)]
+                return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
+def _compose_overtime(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    found = {"approval": None, "calc": None, "form": None}
+    for _, i in hits:
+        for s in sent_split(chunks[i].text):
+            sn = ar_normalize(s)
+            if any(w in sn for w in ["موافق", "اعتماد"]) and found["approval"] is None:
+                found["approval"] = s.strip()
+            if any(w in sn for w in ["احتساب", "نسبة", "أجر","اجر","125"]) and found["calc"] is None:
+                found["calc"] = s.strip()
+            if any(w in sn for w in ["نموذج", "كشف الساعات"]) and found["form"] is None:
+                found["form"] = s.strip()
+    if any(found.values()):
+        lines = [v for v in [found["approval"], found["calc"], found["form"]] if v]
+        srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k, (_, j) in enumerate(hits, 1)]
+        return rtl_wrap(" ".join(lines)) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
+def _compose_leave(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    for _, i in hits:
+        for s in sent_split(chunks[i].text):
+            sn = ar_normalize(s)
+            if re.search(r'(اجاز|إجاز|اجازه)', sn) and re.search(r'\d', sn):
+                srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k, (_, j) in enumerate(hits, 1)]
+                return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
+def _compose_break_answer(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    for _, i in hits:
+        for s in sent_split(chunks[i].text):
+            sn = ar_normalize(s)
+            if any(w in sn for w in ["استراح","راحة","بريك","رضاع","رضاعه"]):
+                if DUR_TOKEN.search(sn) or any(p in sn for p in ["نصف ساعه","نصف ساعة","ربع ساعه","ربع ساعة"]):
+                    srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
+                    return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
+def _compose_hourly_leave(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    for _, i in hits:
+        for s in sent_split(chunks[i].text):
+            sn = ar_normalize(s)
+            if any(w in sn for w in ["مغادر","اذن","إذن"]) and (re.search(r'\d', sn) or "حد" in sn or "اقصى" in sn or "شهري" in sn):
+                srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
+                return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
+# ---------------- Main answer function ----------------
+
+def answer(q: str, index: HybridIndex, intent: str, use_rerank_flag: bool) -> str:
+    hits = retrieve(index, q, use_rerank_flag)
+    if not hits:
+        return rtl_wrap("لم أعثر على إجابة واضحة في الدليل.")
+
+    chunks = index.chunks
+
+    if intent in ("work_hours", "ramadan_hours"):
+        composed = _compose_hours_answer(chunks, hits, intent)
+        if composed: return composed
+
+    if intent == "break":
+        composed = _compose_break_answer(chunks, hits)
+        if composed: return composed
+
+    if intent == "hourly_leave":
+        composed = _compose_hourly_leave(chunks, hits)
+        if composed: return composed
+
+    if intent == "procurement":
+        composed = _compose_procurement_threshold(chunks, hits)
+        if composed: return composed
+
+    if intent == "overtime":
+        composed = _compose_overtime(chunks, hits)
+        if composed: return composed
+
+    if intent == "leave":
+        composed = _compose_leave(chunks, hits)
+        if composed: return composed
+
+    # Fallback: pick best snippet with intent-aware scoring
+    _, idx0 = hits[0]
+    sn = best_snippet(chunks[idx0], ar_normalize(q), intent)
+    if not sn:
+        return rtl_wrap("لم أعثر على إجابة مناسبة.")
+    srcs = [f"{k}. Data_pdf.pdf - page {chunks[i].page}" for k, (_, i) in enumerate(hits, 1)]
+    return rtl_wrap(sn) + "\n" + "Sources:\n" + "\n".join(srcs)
+
+# ---------------- CLI & sanity ----------------
 
 SANITY_PROMPTS = [
     "ما هي ساعات الدوام الرسمية من وإلى؟",
@@ -486,3 +760,71 @@ SANITY_PROMPTS = [
     "ما سياسة السلوك المهني ومكافحة التحرش؟",
     "هل توجد مياومات/بدل سفر؟ وكيف تُصرف",
 ]
+
+def run_sanity(index: HybridIndex, use_rerank_flag: bool):
+    LOG.info("Running sanity suite...\n")
+    passed = 0
+    for q in SANITY_PROMPTS:
+        intent = classify_intent(q)
+        out = answer(q, index, intent, use_rerank_flag)
+        ok = "Sources:" in out and "لم أعثر" not in out
+        if ok: passed += 1
+        print(("✅ " if ok else "❌ ") + f"Q: {q}")
+        print(out)
+        print("-"*80)
+    print(f"Concept-check PASS: {passed}/{len(SANITY_PROMPTS)}")
+
+def interactive_loop(index: HybridIndex, use_rerank_flag: bool):
+    print("Ready.")
+    print("اسأل عن سياسات الدليل (عربي). اكتب 'exit' للخروج.\n")
+    while True:
+        try:
+            q = input("سؤالك: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting."); break
+        if not q: continue
+        if q.lower() in ("exit","quit","q"): print("Exiting."); break
+        LOG.info("Searching...")
+        intent = classify_intent(q)
+        print(answer(q, index, intent, use_rerank_flag))
+        print("-"*66)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--chunks", type=str, default=CHUNKS_PATH, help="Path to chunks (JSONL or JSON)")
+    ap.add_argument("--hier-index", type=str, default="heading_inverted_index.json", help="(Optional) hierarchical inverted index path")
+    ap.add_argument("--aliases", type=str, default="section_aliases.json", help="(Optional) section aliases")
+    ap.add_argument("--sanity", action="store_true", help="Run sanity prompts and exit")
+    ap.add_argument("--rerank", action="store_true", help="Enable cross-encoder reranking")
+    ap.add_argument("--save-index", type=str, default=None, help="Directory to save index artifacts")
+    ap.add_argument("--load-index", type=str, default=None, help="Directory to load index artifacts from")
+    ap.add_argument("--model", type=str, default=None, help="SentenceTransformer model ID override")
+    args = ap.parse_args()
+
+    hier = load_hierarchy(args.hier_index, args.aliases)
+    chunks, chunks_hash = load_chunks(path=args.chunks)
+    try:
+        index = HybridIndex(chunks, chunks_hash, hier=hier, model_name=args.model) if args.model else HybridIndex(chunks, chunks_hash, hier=hier)
+    except TypeError:
+        index = HybridIndex(chunks, chunks_hash, hier=hier)
+
+    loaded = False
+    if args.load_index:
+        loaded = index.load(args.load_index)
+
+    if not loaded:
+        index.build()
+        if args.save_index:
+            index.save(args.save_index)
+
+    LOG.info("Cross-encoder reranker %s.", "ENABLED.." if args.rerank else "disabled...")
+    LOG.info("Ready.")
+
+    if args.sanity:
+        run_sanity(index, use_rerank_flag=args.rerank)
+        return
+
+    interactive_loop(index, use_rerank_flag=args.rerank)
+
+if __name__ == "__main__":
+    main()
