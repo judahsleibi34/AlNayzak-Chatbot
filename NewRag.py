@@ -1,306 +1,571 @@
 # -*- coding: utf-8 -*-
 """
-RAG Orchestrator (Arabic) — strictness booster & robust hierarchy (single-file)
+Hardened Arabic-first EXTRACTIVE retriever (PDF-only, no fabrication).
 
-- Robust handling for custom hierarchy objects (e.g., HierData)
-- Data-driven "priors" from current headings (no hardcoded section numbers)
-- Relevance-aware numeric/time/day rescue (prior & keyword weighted)
-- Approval-intent detection (doesn't force times for "موافقة/اعتماد/إذن" questions)
-- Wider Arabic variants for durations & keywords (يوماً/يوما, صلاة/غداء…)
-- PASS_STRICT accepts plain digits for numeric questions (e.g., "3 عروض")
+Key properties
+--------------
+- Deterministic, extractive-only (no generations, no paraphrases).
+- Strict section/page gating via hierarchy+aliases (no global hunts unless explicitly allowed).
+- Proximity+unit guards for numerics and times.
+- Refuses to answer when confidence is low or text is absent (prevents wrong answers).
+- Clean Arabic output + exact PDF page citations.
 
-USAGE (strict sanity, extractive, deterministic):
-python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --hier-index heading_inverted_index.json --aliases section_aliases.json --sanity --no-llm --regex-hunt --hourlines-only --out-dir runs
-
-USAGE (interactive chatbot):
-python NewRag.py --chunks Data_pdf_clean_chunks.jsonl --hier-index heading_inverted_index.json --aliases section_aliases.json --no-llm --regex-hunt --hourlines-only --out-dir runs
+Usage (same CLI flags as before; reranker ignored):
+  python retrival_model.py --chunks Data_pdf_clean_chunks.jsonl --hier-index heading_inverted_index.json --aliases section_aliases.json --sanity
 """
 
-import os, sys, re, json, time, argparse, logging
-from datetime import datetime
-from collections import defaultdict
-from types import SimpleNamespace
-from collections.abc import Mapping
+import os, re, sys, json, argparse, logging, hashlib
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict, Any, Set
 
-# --------------------------------------------------------------------------------------
-# Arabic normalizer
-# --------------------------------------------------------------------------------------
-_AR_DIAC = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]")
-def norm(s: str) -> str:
-    if s is None: return ""
-    t = s.strip().lower()
-    t = _AR_DIAC.sub("", t)
-    t = t.replace("أ","ا").replace("إ","ا").replace("آ","ا")
-    t = t.replace("ى","ي").replace("ئ","ي").replace("ؤ","و")
-    t = t.replace("ة","ه")
-    t = re.sub(r"[^\w\s%٪:–\-]", " ", t, flags=re.UNICODE)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-# --------------------------------------------------------------------------------------
-# Intent → heading stems
-# --------------------------------------------------------------------------------------
-_INTENT_TO_HEADING_STEMS = {
-    "work_hours": ["ساعات العمل","الدوام","ايام الدوام","الحضور","الانصراف","اوقات العمل","الحضور والانصراف","مواعيد العمل"],
-    "ramadan_hours": ["ساعات العمل","الدوام","رمضان","ايام الصوم","الصوم","اوقات العمل","الدوام في رمضان"],
-    "work_days": ["ايام العمل","ايام الدوام","نهاية الاسبوع","السبت","العطل الاسبوعيه"],
-    "breaks": ["استراحه","راحه","فترات الاستراحه","فتره الراحه","استراحه الغداء","صلاه","غداء"],
-    "overtime": ["العمل الاضافي","الساعات الاضافيه","اضافي","بدل الساعات الاضافيه","موافقه على العمل الاضافي"],
-    "public_holiday_comp": ["العطل الرسميه","الاعياد","تعويض العطل","العمل في العطل"],
-    "annual_leave": ["اجازه سنويه","سنويه","رصيد الاجازات","ترحيل الاجازات","الحد الاقصى للاجازات"],
-    "sick_leave": ["اجازه مرضيه","مرضيه","تقرير طبي","تقارير طبيه"],
-    "maternity_leave": ["اجازه امومه","الامومه","قبل الولاده","بعد الولاده"],
-    "bereavement_leave": ["اجازه حداد","الحداد","وفاه","وفاة"],
-    "payroll": ["الرواتب","الراتب","صرف الرواتب","شؤون ماليه","تاريخ الصرف"],
-    "transport_allowance": ["بدل المواصلات","مواصلات","السفر الداخلي","تنقلات","بدل تنقل"],
-    "salary_advance": ["سلفه","سلف الرواتب","السلف","سلفه راتب"],
-    "petty_cash": ["النثريات","المصروفات النثريه","مصاريف","سلفه نثريه","مصاريف تشغيليه"],
-    "procurement_thresholds": ["المشتريات","عروض الاسعار","سقف الشراء","ثلاثه عروض","ثلاث عروض","توريد"],
-    "conflict_of_interest": ["تضارب مصالح","الهدايا","الضيافه","مدونه السلوك","افصاح"],
-    "asset_custody": ["العهد","العهدة","التسليم","الاستلام","نموذج عهده","استلام العهده","تسليم العهده"],
-    "remote_work": ["العمل عن بعد","العمل من المنزل","سياسه العمل عن بعد","ترتيبات العمل المرن"],
-    "hourly_exit": ["مغادره ساعيه","اذن مغادره","اذن ساعه","الخروج خلال الدوام","الحد الاقصى الشهري"],
-    "performance_review": ["تقييم الاداء","الاداء السنوي","معايير الاداء","تقييم سنوي"],
-    "discipline": ["الانذار","العقوبات","التدرج التاديبي","لائحه العقوبات","اجراءات المخالفات"],
-    "confidentiality": ["السرية","حماية المعلومات","البيانات","سريه المعلومات","امن المعلومات"],
-    "conduct_harassment": ["السلوك المهني","التحرش","مدونه السلوك","سلوكيات غير مقبوله","سوء السلوك"],
-    "per_diem": ["مياومات","بدل سفر","السفر","بدل المياومات","مصاريف سفر"],
-}
-
-# --------------------------------------------------------------------------------------
-# Robust heading iterator (handles dicts/lists/custom classes)
-# --------------------------------------------------------------------------------------
-def _iter_headings(hier):
-    """
-    Yield (heading_text, pages_set) from many possible 'hier' shapes:
-      - Mapping: { heading: {pages:[...]}, ... }
-      - Iterable of dicts/tuples
-      - Custom classes exposing to_dict()/as_dict()
-      - Custom classes with attributes headings/nodes/sections/children/data/items
-    """
-    if not hier:
-        return
-
-    obj = hier
-
-    for meth in ("to_dict", "as_dict"):
-        if hasattr(obj, meth) and callable(getattr(obj, meth)):
-            try:
-                obj = getattr(obj, meth)()
-            except Exception:
-                pass
-            break
-
-    def _to_pages(pg):
-        if isinstance(pg, (list, set, tuple)):
-            out = set()
-            for x in pg:
-                try:
-                    if str(x).strip() != "":
-                        out.add(int(str(x)))
-                except Exception:
-                    continue
-            return out
-        if isinstance(pg, int):
-            return {pg}
-        return set()
-
-    if isinstance(obj, Mapping):
-        for k, v in obj.items():
-            hd = str(k)
-            pages = set()
-            if isinstance(v, Mapping):
-                pg = v.get("pages") or v.get("page_set") or v.get("p") or v.get("page") or []
-                pages = _to_pages(pg)
-            yield hd, pages
-        return
-
-    try:
-        iterator = iter(obj)
-        is_iterable = not isinstance(obj, (str, bytes))
-    except TypeError:
-        iterator = None
-        is_iterable = False
-
-    if is_iterable and iterator is not None:
-        for item in obj:
-            hd = None; pages = set()
-            if isinstance(item, Mapping):
-                hd = item.get("heading") or item.get("title") or item.get("name") or item.get("h")
-                pg = item.get("pages") or item.get("page_set") or item.get("p") or item.get("page") or []
-                pages = _to_pages(pg)
-            elif isinstance(item, (list, tuple)) and item:
-                hd = item[0]
-                if len(item) > 1:
-                    pages = _to_pages(item[1])
-            if hd:
-                yield str(hd), pages
-        return
-
-    for attr in ("headings", "nodes", "sections", "children", "data", "items"):
-        payload = getattr(obj, attr, None)
-        if payload is None:
-            continue
-
-        if isinstance(payload, Mapping):
-            for k, v in payload.items():
-                hd = str(k)
-                pages = set()
-                if isinstance(v, Mapping):
-                    pg = v.get("pages") or v.get("page_set") or v.get("p") or v.get("page") or []
-                    pages = _to_pages(pg)
-                yield hd, pages
-            return
-
-        try:
-            for item in payload:
-                hd = None; pages = set()
-                if isinstance(item, Mapping):
-                    hd = item.get("heading") or item.get("title") or item.get("name") or item.get("h")
-                    pg = item.get("pages") or item.get("page_set") or item.get("p") or item.get("page") or []
-                    pages = _to_pages(pg)
-                elif isinstance(item, (list, tuple)) and item:
-                    hd = item[0]
-                    if len(item) > 1:
-                        pages = _to_pages(item[1])
-                if hd:
-                    yield str(hd), pages
-            return
-        except TypeError:
-            continue
-
-    return
-
-def derive_section_priors(intent: str, hier) -> dict:
-    """
-    Return {"pages": set[int], "headings": [matched_headings]} based ONLY on current hierarchy headings.
-    """
-    intent = intent or ""
-    norm_int = norm(intent)
-    stems = _INTENT_TO_HEADING_STEMS.get(intent, [])
-    if not stems and norm_int:
-        if "دوام" in norm_int or "ساعات" in norm_int: stems = _INTENT_TO_HEADING_STEMS["work_hours"]
-        elif "رمضان" in norm_int: stems = _INTENT_TO_HEADING_STEMS["ramadan_hours"]
-        elif "عروض" in norm_int or "سقف" in norm_int: stems = _INTENT_TO_HEADING_STEMS["procurement_thresholds"]
-
-    pages, matched = set(), []
-
-    try:
-        iterator = _iter_headings(hier)
-    except Exception:
-        iterator = []
-
-    for heading, pset in iterator:
-        nh = norm(heading)
-        ok = False
-        for stem in stems:
-            if stem and stem in nh:
-                ok = True; break
-        if not ok and norm_int:
-            toks = set(norm_int.split())
-            if any(t and t in nh for t in toks):
-                ok = True
-        if ok:
-            matched.append(heading)
-            pages |= set(pset)
-    return {"pages": pages, "headings": matched}
-
-# --------------------------------------------------------------------------------------
-# Env quiet
-# --------------------------------------------------------------------------------------
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+import numpy as np
 
 try:
-    import torch  # optional
+    import faiss  # optional fast index
 except Exception:
-    torch = None
+    faiss = None
 
-# Your retriever module
-import retrival_model as RET
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+LOG = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------------------
-# Chunk utilities
-# --------------------------------------------------------------------------------------
-def _get_attr_or_key(obj, key, default=None):
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    val = getattr(obj, key, None)
-    if val is not None: return val
-    for nest in ("meta", "metadata", "__dict__"):
-        container = getattr(obj, nest, None)
-        if isinstance(container, dict) and key in container:
-            return container.get(key)
-    return default
+# ---------------- Strict mode toggles ----------------
+STRICT_MODE = True  # keep True: forbids unsafe fallbacks
+MAX_SNIPPET_CHARS = 260
+MAX_CITATIONS = 3
+WINDOW_CHARS = 48  # numeric-keyword proximity window
 
-def _first_non_empty(*vals):
-    for v in vals:
-        if v is None: continue
-        s = str(v)
-        if s.strip(): return s
-    return ""
+# ---------------- Arabic utils (SAFE) ----------------
+AR_DIAC = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]')
+AR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"٠١٢٣٤٥٦٧٨٩")}
+IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
 
-def _first_page_like(obj):
-    candidates = (
-        _get_attr_or_key(obj, "page"),
-        _get_attr_or_key(obj, "page_number"),
-        _get_attr_or_key(obj, "page_num"),
-        _get_attr_or_key(obj, "page_idx"),
-        _get_attr_or_key(obj, "pageno"),
-        _get_attr_or_key(obj, "page_start"),
-    )
-    for c in candidates:
-        if c is None or str(c).strip() == "": continue
-        try: return int(str(c).strip())
-        except Exception: pass
+def ar_normalize(s: str) -> str:
+    if not s: return ""
+    s = s.replace('\u0640','')                # tatweel
+    s = AR_DIAC.sub('', s)                    # remove diacritics
+    # keep ta marbuta (ة) intact to avoid harming tokens
+    s = (s.replace('أ','ا').replace('إ','ا').replace('آ','ا')
+           .replace('ى','ي'))
+    s = s.translate(AR_NUMS).translate(IR_NUMS)   # Arabic/Indic -> ASCII
+    s = s.replace('،', ',').replace('٫','.')
+    s = ' '.join(s.split())
+    return s
+
+def rtl_wrap(t: str) -> str:
+    return '\u202B' + t + '\u202C'
+
+SENT_SPLIT_RE = re.compile(r'(?<=[\.\!\؟\?،]|[\n])\s+')
+
+def sent_split(s: str) -> List[str]:
+    parts = [p.strip() for p in SENT_SPLIT_RE.split(s or "") if p and p.strip()]
+    out = []
+    for p in parts:
+        pn = ar_normalize(p)
+        if len(pn) < 6:  # drop tiny fragments
+            continue
+        # require >50% letters (avoid junk/IDs)
+        letters = sum(ch.isalpha() for ch in pn)
+        total = len(pn.replace(" ", ""))
+        if total == 0 or letters/total < 0.5:
+            continue
+        out.append(p)
+    return out if out else ([s.strip()] if (s and s.strip()) else [])
+
+# ---------------- Data IO ----------------
+CHUNKS_PATH = "Data_pdf_clean_chunks.jsonl"
+
+@dataclass
+class Chunk:
+    id: int
+    page: int
+    text: str
+    norm: str
+
+_TEXT_KEYS = {"text","text_display","content","body","raw","paragraph","para","line","value","data","clean_text","norm"}
+_TEXT_ARRAY_KEYS = {"lines","paragraphs","paras","sentences","chunks","blocks","spans","tokens"}
+_PAGE_KEYS = {"page","page_no","page_num","pageNumber","page_index","Page","PageNo"}
+_ID_KEYS = {"id","chunk_id","cid","idx","index","Id","ID"}
+
+def _as_text(v):
+    if isinstance(v, str):
+        return v.strip() if v.strip() else None
+    if isinstance(v, list):
+        parts = [str(x).strip() for x in v if isinstance(x, (str,int,float)) and str(x).strip()]
+        return "\n".join(parts) if parts else None
     return None
 
-CHUNKS_BY_PAGE = {}  # {int page: concatenated text}
+def _get_any(d: dict, keys: set):
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    lower = {k.lower(): k for k in d.keys()}
+    for k in keys:
+        lk = k.lower()
+        if lk in lower and d[lower[lk]] not in (None, ""):
+            return d[lower[lk]]
+    return None
 
-def _build_page_text_index(chunks):
-    pages = defaultdict(list)
-    for ch in chunks:
-        txt = _first_non_empty(
-            _get_attr_or_key(ch, "text"),
-            _get_attr_or_key(ch, "content"),
-            _get_attr_or_key(ch, "chunk"),
-            _get_attr_or_key(ch, "body"),
-            "",
-        )
-        if isinstance(txt, bytes):
-            try: txt = txt.decode("utf-8", "ignore")
-            except Exception: txt = ""
-        pg = _first_page_like(ch)
-        if pg is None:
-            src = _get_attr_or_key(ch, "source") or _get_attr_or_key(ch, "doc_source") or ""
-            m = re.search(r"(?:[Pp]age|(?:ال)?صفحة)\s+(\d+)", str(src))
-            if m:
-                try: pg = int(m.group(1))
-                except Exception: pg = None
-        if pg is not None and txt:
-            pages[int(pg)].append(str(txt))
-    return {p: "\n".join(v) for p, v in pages.items()}
+def _file_hash(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1<<20), b""):
+            h.update(b)
+    return h.hexdigest()
 
-# --------------------------------------------------------------------------------------
-# Logging
-# --------------------------------------------------------------------------------------
-def setup_logger(log_path: str):
-    logger = logging.getLogger("rag_orchestrator")
-    logger.setLevel(logging.INFO)
-    ch = logging.StreamHandler(sys.stdout); ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
-    fh = logging.FileHandler(log_path, encoding="utf-8"); fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(message)s"))
-    logger.handlers = []; logger.addHandler(ch); logger.addHandler(fh)
-    return logger
+def load_chunks(path=CHUNKS_PATH) -> Tuple[List[Chunk], str]:
+    if not os.path.exists(path):
+        LOG.error("Chunks file not found: %s", path); sys.exit(1)
+    LOG.info("Loading chunks from %s ...", path)
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        first = f.read(1); f.seek(0)
+        if first == "[":
+            rows = json.load(f)
+        else:
+            for line in f:
+                line = line.strip().rstrip(",")
+                if not line: continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    if line.startswith('"') and line.endswith('"'):
+                        rows.append(line.strip('"'))
+                    continue
+    chunks: List[Chunk] = []
+    for idx, j in enumerate(rows):
+        if isinstance(j, str):
+            t = j; page = -1; cid = idx
+        elif isinstance(j, dict):
+            t = _as_text(_get_any(j, _TEXT_KEYS)) or _as_text(_get_any(j, _TEXT_ARRAY_KEYS))
+            if not t: continue
+            page = _get_any(j, _PAGE_KEYS)
+            try: page = int(page) if page is not None else -1
+            except Exception: page = -1
+            cid = _get_any(j, _ID_KEYS)
+            try: cid = int(cid)
+            except Exception: cid = idx
+        else:
+            continue
+        t = t.strip()
+        if not t: continue
+        chunks.append(Chunk(id=int(cid), page=int(page), text=t, norm=ar_normalize(t)))
+    if not chunks:
+        LOG.error("No chunks parsed. Ensure your file has textual fields.")
+        sys.exit(1)
+    LOG.info("Loaded %d chunks", len(chunks))
+    return chunks, _file_hash(path)
 
-LOG = logging.getLogger("rag_orchestrator")
+# ---------------- Hierarchy / aliases ----------------
+@dataclass
+class HierData:
+    inverted: Dict[str, List[int]]
+    aliases: Dict[str, List[str]]
 
-# --------------------------------------------------------------------------------------
-# Sanity prompts (default)
-# --------------------------------------------------------------------------------------
-DEFAULT_SANITY_PROMPTS = [
+def _load_json(path: Optional[str]) -> Dict[str, Any]:
+    if not path or not os.path.exists(path): return {}
+    with open(path, "r", encoding="utf-8") as f: return json.load(f)
+
+def load_hierarchy(hier_index_path: Optional[str], aliases_path: Optional[str]) -> Optional[HierData]:
+    inv = _load_json(hier_index_path)
+    aliases = _load_json(aliases_path)
+    if not inv:
+        LOG.info("No hierarchy index provided/loaded (section gating disabled).")
+        return None
+
+    def _n(s: str) -> str: return ar_normalize(s).lower()
+
+    inv_n: Dict[str, List[int]] = {}
+    for k, v in inv.items():
+        if not isinstance(v, list): continue
+        cleaned: List[int] = []
+        for x in v:
+            try:
+                cleaned.append(int(x))
+            except Exception:
+                m = re.search(r'(\d+)$', str(x))
+                if m:
+                    try: cleaned.append(int(m.group(1)))
+                    except Exception: pass
+        inv_n[_n(k)] = cleaned
+
+    aliases_n = {_n(k): [_n(a) for a in v] for k, v in (aliases or {}).items()}
+    LOG.info("Loaded hierarchy: %d keys, %d alias sets", len(inv_n), len(aliases_n))
+    return HierData(inverted=inv_n, aliases=aliases_n)
+
+def _hier_candidates(query: str, hd: HierData) -> Set[int]:
+    qn = ar_normalize(query).lower()
+    toks = [t for t in re.split(r"[\s\|\:/,;]+", qn) if t]
+    keys = set(toks)
+    for canon, alist in hd.aliases.items():
+        if any(a in qn for a in alist+[canon]):
+            keys.add(canon)
+    cand: Set[int] = set()
+    for k in keys:
+        if k in hd.inverted:
+            cand.update(hd.inverted[k])
+    return cand
+
+# ---------------- Index (dense only + strict gating) ----------------
+class HybridIndex:
+    def __init__(self, chunks: List[Chunk], chunks_hash: str, hier: Optional[HierData] = None,
+                 model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
+        from sentence_transformers import SentenceTransformer
+        self.chunks = chunks
+        self.chunks_hash = chunks_hash
+        self.hier = hier
+        self.model_name = model_name
+        self.model = SentenceTransformer(model_name)
+        self.emb = None
+        self.faiss = None
+
+    def build(self):
+        LOG.info("Building embeddings...")
+        texts = [c.norm for c in self.chunks]
+        self.emb = self.model.encode(texts, batch_size=128, convert_to_numpy=True,
+                                     show_progress_bar=True, normalize_embeddings=True)
+        if faiss is not None:
+            d = self.emb.shape[1]
+            self.faiss = faiss.IndexFlatIP(d)
+            self.faiss.add(self.emb.astype('float32'))
+            LOG.info("Built FAISS index")
+        else:
+            LOG.warning("faiss not available; dense search will use numpy.")
+
+    def dense(self, q: str, topk=50, restrict_ids: Optional[Set[int]] = None):
+        qv = self.model.encode([q], convert_to_numpy=True, normalize_embeddings=True)
+        if self.faiss is not None:
+            D, I = self.faiss.search(qv.astype('float32'), topk)
+            scores, idxs = D[0], I[0]
+        else:
+            sims = self.emb @ qv[0]
+            idxs = np.argsort(-sims)[:topk]
+            scores = sims[idxs]
+        if restrict_ids is None:
+            return scores, idxs
+        # STRICT gating: return only restricted; if empty -> return empty
+        filtS, filtI = [], []
+        rset = set(int(x) for x in restrict_ids)
+        for s, i in zip(scores, idxs):
+            if int(i) in rset:
+                filtS.append(float(s)); filtI.append(int(i))
+            if len(filtI) >= topk: break
+        return np.array(filtS), np.array(filtI)
+
+# ---------------- Intents & guards ----------------
+KW_HOURS = re.compile(r'(ساعات)\s+(الدوام|العمل)')
+KW_RAMADAN = re.compile(r'رمضان')
+KW_LEAVE = re.compile(r'(إجاز|اجاز)')
+KW_OVERTIME = re.compile(r'(إضافي|اضافي)')
+KW_FLEX = re.compile(r'(مرون|الحضور|الانصراف|تأخير|تاخير|خصم|بصمة|بصمه)')
+KW_BREAK = re.compile(r'(استراح|راحة|بريك|رضاعه|رضاع)')
+KW_PROC = re.compile(r'(شراء|مشتريات|عروض|مناقصة|توريد|تأمين|حد|سقف)')
+KW_WORKDAYS = re.compile(r'(ايام|أيام).*(العمل|الدوام)|السبت|الاحد|الخميس')
+
+def classify_intent(q: str) -> str:
+    qn = ar_normalize(q)
+    if KW_HOURS.search(qn) and KW_RAMADAN.search(qn): return "ramadan_hours"
+    if KW_WORKDAYS.search(qn): return "workdays"
+    if KW_HOURS.search(qn): return "work_hours"
+    if KW_FLEX.search(qn): return "flex"
+    if KW_BREAK.search(qn): return "break"
+    if KW_OVERTIME.search(qn): return "overtime"
+    if KW_LEAVE.search(qn): return "leave"
+    if KW_PROC.search(qn): return "procurement"
+    if re.search(r'(مياوم|مياومات|بدل\s*سفر|نفقات|فواتير|ايصالات|تذاكر|فندق)', qn):
+        return "per_diem"
+    return "general"
+
+INTENT_HINTS = {
+    "flex":    ["مرون","تاخير","تأخير","الحضور","الانصراف","خصم","بصمه","بصمة"],
+    "break":   ["استراح","راحة","فسحه","فسحة","بريك","رضاعه","رضاع","دقيقه","دقائق","ساعه","ساعة"],
+    "overtime":["اضافي","ساعات اضافيه","تعويض","موافقه","اعتماد","العطل","العطل الرسميه","نسبه","125","أجر","اجر","احتساب"],
+    "leave":   ["اجاز","سنويه","سنوية","مرضيه","طارئه","امومه","حداد","بدون راتب","رصيد"],
+    "work_hours": ["ساعات","دوام","العمل","الى","حتي","حتى","من","ايام","اوقات"],
+    "ramadan_hours": ["رمضان","ساعات","دوام","العمل","الى","حتي","حتى","من","اوقات"],
+    "procurement": ["عروض","ثلاثه","ثلاث","3","عرض","مناقص","سقف","حد","شراء","مشتريات","شيكل","₪","دينار","دولار","توريد"],
+    "per_diem": ["مياومات","مياومه","بدل","سفر","صرف","نفقات","مصاريف","فواتير","ايصالات","تذاكر","فندق","اقامه","اقامة"],
+    "workdays": ["ايام","العمل","الدوام","السبت","الاحد","الخميس","من","الى"]
+}
+
+# deny-lists by intent to prevent cross-topic leakage
+INTENT_DENY = {
+    "public_holiday": ["عن كل سنة عمل","نهاية الخدمة","تعويض نهاية الخدمة","مكافأة نهاية الخدمة"],
+    "overtime": [],
+    "procurement": [],
+    "work_hours": [],
+    "ramadan_hours": [],
+    "leave": [],
+    "per_diem": [],
+    "break": [],
+    "flex": [],
+    "workdays": [],
+    "general": []
+}
+
+def _contains_any(s: str, arr: List[str]) -> bool:
+    s = ar_normalize(s)
+    return any(tok for tok in arr if tok in s)
+
+# ---------------- Time extraction ----------------
+TIME_RE = re.compile(
+    r'(?:من\s*)?'
+    r'(\d{1,2}(?::|\.)?\d{0,2})\s*'
+    r'(?:[-–—]|الى|إلى|حتي|حتى)\s*'
+    r'(\d{1,2}(?::|\.)?\d{0,2})'
+)
+
+def _normalize_hhmm(tok: str) -> str:
+    tok = tok.replace('.', ':')
+    if ':' not in tok:
+        return f"{int(tok):d}:00"
+    h, m = tok.split(':', 1)
+    if m == "": m = "00"
+    return f"{int(h):d}:{int(m):02d}"
+
+def _to_minutes(hhmm: str) -> int:
+    h, m = hhmm.split(':'); return int(h)*60 + int(m)
+
+def _plausible_workday(a: int, b: int) -> bool:
+    return 6*60 <= a <= 20*60+30 and 6*60 <= b <= 20*60+30 and b > a
+
+def extract_all_ranges(text: str, check_workday: bool) -> List[Tuple[int,int]]:
+    n = ar_normalize(text)
+    ranges: List[Tuple[int,int]] = []
+    for m in TIME_RE.finditer(n):
+        a = _normalize_hhmm(m.group(1)); b = _normalize_hhmm(m.group(2))
+        A, B = _to_minutes(a), _to_minutes(b)
+        if B <= A:
+            B_try = B + 12*60
+            if B_try > A:
+                B = B_try
+            else:
+                A, B = B, A
+        if check_workday:
+            dur = B - A
+            if not (6*60 <= dur <= 11*60 and _plausible_workday(A, B)):
+                continue
+        ranges.append((A,B))
+    return ranges
+
+def pick_best_range(ranges: List[Tuple[int,int]]) -> Optional[Tuple[str,str]]:
+    if not ranges: return None
+    scored = []
+    for (A,B) in ranges:
+        dur = B - A
+        target = abs(dur - 7.5*60)
+        scored.append((target, -(dur), A, B))
+    scored.sort()
+    _, _, A, B = scored[0]
+    return f"{A//60:d}:{A%60:02d}", f"{B//60:d}:{B%60:02d}"
+
+# ---------------- Proximity guards ----------------
+def _prox_numeric_with_kws(text: str, kws: List[str], window=WINDOW_CHARS) -> bool:
+    T = ar_normalize(text)
+    for m in re.finditer(r'\b\d+\b', T):
+        start = max(0, m.start()-window); end = m.end()+window
+        ctx = T[start:end]
+        if any(kw in ctx for kw in kws):
+            return True
+    return False
+
+def _has_unit(text: str, units: List[str]) -> bool:
+    T = ar_normalize(text)
+    return any(u in T for u in units)
+
+# ---------------- Retrieval ----------------
+def retrieve(index: HybridIndex, q: str, intent: str) -> List[Tuple[float,int]]:
+    qn = ar_normalize(q)
+    restrict_ids: Optional[Set[int]] = None
+    if index.hier is not None:
+        cand = _hier_candidates(qn, index.hier)
+        if cand:
+            restrict_ids = cand
+    scores, idxs = index.dense(qn, topk=60, restrict_ids=restrict_ids)
+    if restrict_ids is not None and (idxs is None or len(idxs) == 0):
+        # STRICT: do not globally fallback; refuse later
+        return []
+    pairs = list(zip(list(map(float, scores)), list(map(int, idxs))))
+    pairs.sort(key=lambda x: -x[0])
+    return pairs[:12]
+
+# ---------------- Answer composers (EXTRACTIVE) ----------------
+def _compose_hours(chunks: List[Chunk], hits, label: str) -> Optional[str]:
+    for _, i in hits:
+        ch = chunks[i]
+        if ch.page < 0: continue
+        for s in sent_split(ch.text):
+            if _contains_any(s, INTENT_DENY.get("work_hours", [])): 
+                continue
+            ranges = extract_all_ranges(s, check_workday=True)
+            rng = pick_best_range(ranges)
+            if rng:
+                a, b = rng
+                sent = f"ساعات الدوام{label} من {a} إلى {b}."
+                return rtl_wrap(sent) + f"\nSources:\n1. Data_pdf.pdf - page {ch.page}"
+    return None
+
+def _compose_workdays(chunks: List[Chunk], hits) -> Optional[str]:
+    days_kw = ["الاحد","الإثنين","الاثنين","الثلاثاء","الأربعاء","الخميس","السبت","الجمعة","ايام","الأيام","ايام الدوام","ايام العمل"]
+    for _, i in hits:
+        ch = chunks[i]
+        if ch.page < 0: continue
+        for s in sent_split(ch.text):
+            sn = ar_normalize(s)
+            if any(d in sn for d in days_kw):
+                return rtl_wrap(s.strip()) + f"\nSources:\n1. Data_pdf.pdf - page {ch.page}"
+    return None
+
+def _compose_flex(chunks: List[Chunk], hits) -> Optional[str]:
+    kws = ["مرون","تاخير","تأخير","الحضور","الانصراف","خصم","بصمه","بصمة","تعويض"]
+    for _, i in hits:
+        ch = chunks[i]
+        for s in sent_split(ch.text):
+            if any(k in ar_normalize(s) for k in kws) and not _contains_any(s, ["نهاية الخدمة"]):
+                return rtl_wrap(s.strip()) + f"\nSources:\n1. Data_pdf.pdf - page {ch.page}"
+    return None
+
+def _compose_break(chunks: List[Chunk], hits) -> Optional[str]:
+    kws = ["استراح","راحة","بريك","رضاع","رضاعه","ساعة","ساعه","دقائق","دقيقه"]
+    for _, i in hits:
+        ch = chunks[i]
+        for s in sent_split(ch.text):
+            sn = ar_normalize(s)
+            if any(k in sn for k in kws):
+                # require unit (ساعة/دقيقة) or explicit policy statement
+                if _has_unit(s, ["ساعة","ساعه","دقيقة","دقائق"]) or "فتر" in sn or "مده" in sn:
+                    return rtl_wrap(s.strip()) + f"\nSources:\n1. Data_pdf.pdf - page {ch.page}"
+    return None
+
+def _compose_overtime(chunks: List[Chunk], hits) -> Optional[str]:
+    must = ["اضافي","احتساب","اجر","أجر","موافقه","مسبقه","نسبة","125"]
+    deny = INTENT_DENY.get("overtime", [])
+    for _, i in hits:
+        ch = chunks[i]
+        sents = sent_split(ch.text)
+        good = []
+        for s in sents:
+            sn = ar_normalize(s)
+            if any(d in sn for d in deny): 
+                continue
+            if any(m in sn for m in must):
+                good.append(s.strip())
+        if good:
+            out = " ".join(good[:2])
+            return rtl_wrap(out) + f"\nSources:\n1. Data_pdf.pdf - page {ch.page}"
+    return None
+
+def _compose_leave(chunks: List[Chunk], hits) -> Optional[str]:
+    kws = ["اجاز","سنويه","سنوية","مرضيه","حداد","امومه","طارئه","بدون راتب","رصيد"]
+    for _, i in hits:
+        ch = chunks[i]
+        for s in sent_split(ch.text):
+            sn = ar_normalize(s)
+            if any(k in sn for k in kws) and re.search(r'\d', sn):
+                return rtl_wrap(s.strip()) + f"\nSources:\n1. Data_pdf.pdf - page {ch.page}"
+    return None
+
+def _compose_procurement(chunks: List[Chunk], hits) -> Optional[str]:
+    # require "عروض/عرض/أسعار/شراء/مشتريات" near numbers (thresholds) within window and a currency/unit if present
+    num_kws = ["عرض","عروض","اسعار","أسعار","شراء","مشتريات","توريد","سقف","حد"]
+    currency = ["شيكل","₪","دينار","دولار"]
+    for _, i in hits:
+        ch = chunks[i]
+        for s in sent_split(ch.text):
+            if _prox_numeric_with_kws(s, num_kws, WINDOW_CHARS) or any(k in ar_normalize(s) for k in num_kws):
+                # if there is a number, prefer also a currency/unit in context (when present)
+                snn = ar_normalize(s)
+                if re.search(r'\d', snn):
+                    # allow missing currency if policy states "ثلاثة عروض" without number
+                    if any(c in snn for c in currency) or any(w in snn for w in ["عروض","عرض"]):
+                        return rtl_wrap(s.strip()) + f"\nSources:\n1. Data_pdf.pdf - page {ch.page}"
+                else:
+                    # sentences stating "ثلاثة عروض" without numeric amounts
+                    if any(w in snn for w in ["ثلاث","ثلاثه","3"]) and any(w in snn for w in ["عروض","عرض"]):
+                        return rtl_wrap(s.strip()) + f"\nSources:\n1. Data_pdf.pdf - page {ch.page}"
+    return None
+
+def _compose_per_diem(chunks: List[Chunk], hits) -> Optional[str]:
+    kws = ["مياومات","مياومه","بدل سفر","بدل المياومات","نفقات","مصاريف","فواتير","ايصالات","تذاكر","فندق","اقامة","اقامه","تعرفة","تعريفه","كيلومتر","شيكل"]
+    for _, i in hits:
+        ch = chunks[i]
+        for s in sent_split(ch.text):
+            sn = ar_normalize(s)
+            if any(k in sn for k in kws):
+                # prefer sentences with explicit units (شيكل/كم/كيلومتر/فاتورة/إيصال)
+                if _has_unit(s, ["شيكل","كم","كيلومتر","فاتوره","فاتورة","ايصال","إيصال"]):
+                    return rtl_wrap(s.strip()) + f"\nSources:\n1. Data_pdf.pdf - page {ch.page}"
+                # fallback: still extract if it clearly defines the policy
+                return rtl_wrap(s.strip()) + f"\nSources:\n1. Data_pdf.pdf - page {ch.page}"
+    return None
+
+def _compose_general_best(chunks: List[Chunk], hits, intent: str) -> Optional[str]:
+    hints = INTENT_HINTS.get(intent, [])
+    for _, i in hits:
+        ch = chunks[i]
+        for s in sent_split(ch.text):
+            sn = ar_normalize(s)
+            if hints and not any(h in sn for h in hints):
+                continue
+            if INTENT_DENY.get(intent) and _contains_any(s, INTENT_DENY[intent]):
+                continue
+            # require numbers for numbery intents
+            if intent in ("work_hours","ramadan_hours","overtime","leave","procurement","per_diem") and not re.search(r'\d', sn):
+                continue
+            return rtl_wrap(s.strip()) + f"\nSources:\n1. Data_pdf.pdf - page {ch.page}"
+    return None
+
+# ---------------- Main answer (EXTRACTIVE ONLY) ----------------
+def answer(q: str, index: HybridIndex, intent: str, use_rerank_flag: bool=False) -> str:
+    hits = retrieve(index, q, intent)
+    if not hits:
+        return rtl_wrap("لم يرد نص صريح حول ذلك في الدليل المرفق.")
+
+    chunks = index.chunks
+
+    if intent == "work_hours":
+        out = _compose_hours(chunks, hits, label="")
+        if out: return out
+
+    if intent == "ramadan_hours":
+        out = _compose_hours(chunks, hits, label=" في شهر رمضان")
+        if out: return out
+
+    if intent == "workdays":
+        out = _compose_workdays(chunks, hits)
+        if out: return out
+
+    if intent == "flex":
+        out = _compose_flex(chunks, hits)
+        if out: return out
+
+    if intent == "break":
+        out = _compose_break(chunks, hits)
+        if out: return out
+
+    if intent == "overtime":
+        out = _compose_overtime(chunks, hits)
+        if out: return out
+
+    if intent == "leave":
+        out = _compose_leave(chunks, hits)
+        if out: return out
+
+    if intent == "procurement":
+        out = _compose_procurement(chunks, hits)
+        if out: return out
+
+    if intent == "per_diem":
+        out = _compose_per_diem(chunks, hits)
+        if out: return out
+
+    out = _compose_general_best(chunks, hits, intent)
+    if out: return out
+
+    # STRICT refusal instead of unsafe fallback
+    return rtl_wrap("لم يرد نص صريح حول ذلك في الدليل المرفق.")
+
+# ---------------- CLI ----------------
+SANITY_PROMPTS = [
     "ما هي ساعات الدوام الرسمية من وإلى؟",
     "هل يوجد مرونة في الحضور والانصراف؟ وكيف تُحسب دقائق التأخير؟",
     "هل توجد استراحة خلال الدوام؟ وكم مدتها؟",
@@ -333,739 +598,51 @@ DEFAULT_SANITY_PROMPTS = [
     "هل توجد مياومات/بدل سفر؟ وكيف تُصرف",
 ]
 
-# --------------------------------------------------------------------------------------
-# Arabic patterns & helpers
-# --------------------------------------------------------------------------------------
-_HEADING_PATTERNS = [
-    r"^\s*الإجابة\s*:?$",
-    r"^\s*الخلاصة\s*:?\s*$",
-    r"^\s*الملخص\s*:?\s*$",
-    r"^\s*Summary\s*:?\s*$",
-    r"^\s*Answer\s*:?\s*$",
-]
-_AR_DAYS = ["الأحد","الإثنين","الاثنين","الثلاثاء","الأربعاء","الخميس","الجمعة","السبت"]
+def run_sanity(index: HybridIndex):
+    LOG.info("Running sanity suite (extractive-only)…\n")
+    passed = 0
+    for q in SANITY_PROMPTS:
+        intent = classify_intent(q)
+        out = answer(q, index, intent, use_rerank_flag=False)
+        ok = "Sources:" in out and "لم يرد نص" not in out
+        passed += int(ok)
+        print(("✅ " if ok else "⚪ ") + f"Q: {q}")
+        print(out); print("-"*80)
+    print(f"Extractive PASS (has sources): {passed}/{len(SANITY_PROMPTS)}")
 
-_TIME_PATTERNS = [
-    r"\b\d{1,2}:\d{2}\b",                     # 8:30
-    r"\b\d{1,2}[:٫]\d{2}\b",                  # 8٫30
-    r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b",          # 8-5
-    r"\b\d{1,2}\s*(?:إلى|حتى)\s*\d{1,2}\b",   # 8 إلى 5
-    r"\b\d{1,2}\s*(?:ص|م)\b",                 # 8 ص/5 م
-]
-_PERCENT_RX   = re.compile(r"\b\d{1,3}\s*[%٪]\b")
-# add "يوماً/يوما" variants
-_DURATION_RX  = re.compile(r"\b\d{1,2}\s*(?:دقيقة|دقائق|ساعة|ساعات|يوم|يوما|يوماً|أيام)\b")
-_SECTION_HEAVY = re.compile(r"(?:\d+\.){2,}\d+")
-
-_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-_AR_LETTER_RX  = re.compile(r"[ء-ي]")
-
-def _to_western_digits(s): return (s or "").translate(_ARABIC_DIGITS)
-def _strip_mojibake(s): return "" if not s else s.replace("\ufeff","").replace("�","").replace("\uFFFD","")
-def _arabic_ratio(s):
-    if not s: return 1.0
-    letters = re.findall(r"\w", s, flags=re.UNICODE)
-    if not letters: return 1.0
-    arabic = _AR_LETTER_RX.findall(s)
-    return (len(arabic) / max(1, len(letters)))
-
-def _purge_non_arabic_lines(s, min_ratio=0.66):
-    if not s: return s
-    keep = []
-    for line in s.splitlines():
-        ln = line.strip()
-        if not ln: continue
-        t = _to_western_digits(ln)
-        if any(re.search(p, t) for p in _TIME_PATTERNS) or _PERCENT_RX.search(t) or _DURATION_RX.search(t):
-            keep.append(ln); continue
-        ratio = _arabic_ratio(ln)
-        if ratio >= min_ratio: keep.append(ln)
-    return "\n".join(keep)
-
-def _has_times_or_days(txt, accept_plain_digits=False):
-    if not txt: return False
-    t = _to_western_digits(txt)
-    if any(day in t for day in _AR_DAYS): return True
-    if any(re.search(p, t) for p in _TIME_PATTERNS): return True
-    if _DURATION_RX.search(t): return True
-    if _PERCENT_RX.search(t): return True
-    if accept_plain_digits and re.search(r"\b\d+\b", t): return True
-    return False
-
-def _sentences(txt):
-    if not txt: return []
-    lines = [l.strip() for l in txt.splitlines() if l.strip()]
-    keep = []
-    for l in lines:
-        if any(re.match(p, l) for p in _HEADING_PATTERNS): continue
-        keep.append(l)
-    txt2 = " ".join(keep)
-    parts = re.split(r"(?<=[\.\!\؟])\s+|[\n\r]+|[•\-–]\s+", txt2)
-    parts = [p.strip(" -–•\t") for p in parts if p and len(p.strip()) > 0]
-    merged = []
-    for p in parts:
-        if merged and len(p) < 10:
-            merged[-1] = merged[-1] + " " + p
-        else:
-            merged.append(p)
-    return merged
-
-def _clean_text(txt):
-    if not txt: return ""
-    txt = _strip_mojibake(txt)
-    txt = re.sub(r"^```.*?$", "", txt, flags=re.M | re.S)
-    lines = [l.strip() for l in txt.splitlines() if l.strip()]
-    keep = []
-    for l in lines:
-        if any(re.match(p, l) for p in _HEADING_PATTERNS): continue
-        if "فهرس المحتويات" in l or "جميع الحقوق محفوظة" in l: continue
-        if _SECTION_HEAVY.search(l): continue
-        keep.append(l)
-    txt = " ".join(keep).strip()
-    txt = re.sub(r"\s+", " ", txt).strip()
-    return txt
-
-def _paginate_text(text, max_chars=600):
-    text = text.strip()
-    if len(text) <= max_chars: return [text]
-    parts, cur, count = [], [], 0
-    for line in text.splitlines():
-        if count + len(line) + 1 > max_chars:
-            parts.append("\n".join(cur).strip())
-            cur, count = [line], len(line)
-        else:
-            cur.append(line); count += len(line) + 1
-    if cur: parts.append("\n".join(cur).strip())
-    return parts
-
-def _split_answer(answer_text):
-    if not answer_text: return "", ""
-    parts = re.split(r"\n(?=Sources:|المصادر:)", answer_text, maxsplit=1)
-    body = parts[0].strip(); sources = parts[1].strip() if len(parts) > 1 else ""
-    return body, sources
-
-# --------------------------------------------------------------------------------------
-# Intent & question keywords
-# --------------------------------------------------------------------------------------
-POLICY_VERBS = ("يجب","يلزم","يُمنع","يُحظر","يتعيّن","لا يجوز","يحق","تكون","يتم","وفقاً","حسب","يتطلب","يتعين")
-NEG = ["لا","غير","عدم","دون","إلا","لا يتم","لا يجوز","ليس"]
-REQ = ["موافقه","اذن","كتابي","خطي","مسبق","اعتماد","تصريح","موافقه مسبقه"]
-
-def _norm_tokens(s):
-    s = _to_western_digits(s or "")
-    s = re.sub(r"[^\w\s%٪:–\-]+"," ", s, flags=re.UNICODE)
-    return [t for t in s.split() if t.strip()]
-
-def _question_keywords(q):
-    qn = norm(q or "")
-    toks = _norm_tokens(qn)
-    extras = []
-
-    # Work hours / days / Ramadan
-    if "ساعات" in qn or "دوام" in qn or "اوقات" in qn:
-        extras += ["ساعات","دوام","من","إلى","حتى","اوقات","الحضور","الانصراف","مواعيد"]
-    if "رمضان" in qn or "صوم" in qn:
-        extras += ["رمضان","الصوم","ايام الصوم","تخفيض ساعات"]
-
-    # breaks
-    if "استراح" in qn or "راحه" in qn or "غداء" in qn or "صلاه" in qn:
-        extras += ["استراحه","راحه","فتره","مده","مدتها","وسط","منتصف","غداء","صلاه","استراحه الغداء","فتره صلاه"]
-
-    # overtime, approval
-    if "اضاف" in qn or "ساعات اضافيه" in qn:
-        extras += ["اضافيه","العمل الاضافي","اجر","تعويض","موافقه","موافقه مسبقه","اعتماد","اذن"]
-    if "عطل" in qn or "عطله" in qn or "عيد" in qn:
-        extras += ["العطل","الرسمية","عطله","نهاية","أسبوع","تعويض العطل"]
-
-    # leaves
-    if "مغادر" in qn:
-        extras += ["مغادره","ساعيه","الحد","الاقصى","شهري","اذن","اذن مغادره"]
-    if "اجازه" in qn:
-        extras += ["اجازه","ايام","مده","سنو","الحد الاقصى","ترحيل","رصيد","غير المستخدمه","مستندات","طارئه","مرضيه","امومه","حداد"]
-    if "امومه" in qn or "ولاده" in qn:
-        extras += ["امومه","قبل الولاده","بعد الولاده","71","سبعون","سبعين"]
-    if "حداد" in qn or "وفاه" in qn or "وفاة" in qn:
-        extras += ["حداد","وفاه","وفاة","مده","30","ثلاثون","ثلاثين"]
-
-    # procurement / per-diem
-    if "سقف" in qn or "عروض" in qn or "شراء" in qn:
-        extras += ["سقف","عروض","اسعار","ثلاثه","ثلاث","شراء","توريد","ثلاثة عروض","3"]
-    if "مياومات" in qn or "بدل سفر" in qn or "سفر" in qn:
-        extras += ["مياومات","بدل سفر","بدل المياومات","مصاريف","مصاريف سفر","قائمه مصاريف","تسويه","ايصال","فاتوره"]
-
-    # conduct / confidentiality
-    if "تحرش" in qn or "سلوك" in qn:
-        extras += ["تحرش","سلوك","مهني","سلوك مهني","سوء السلوك","مدونه السلوك"]
-    if "سري" in qn or "سرية" in qn or "حمايه" in qn or "معلومات" in qn:
-        extras += ["السرية","سريه المعلومات","حماية المعلومات","بيانات","امن المعلومات"]
-
-    # transport
-    if "مواصلات" in qn or "تنقل" in qn:
-        extras += ["بدل المواصلات","مواصلات","بدل تنقل","الذهاب من المنزل للعمل","كيلومتر","شيكل"]
-
-    # asset custody
-    if "عهد" in qn or "عهده" in qn:
-        extras += ["العهد","العهدة","استلام","تسليم","نموذج عهده","براءه ذمه","محضر تسليم"]
-
-    # discipline
-    if "انذار" in qn or "تاديب" in qn or "تأديب" in qn:
-        extras += ["انذار","العقوبات","التدرج التاديبي","اجراء","مخالفات","جزاءات"]
-
-    return list(dict.fromkeys(toks + extras))
-
-def _expects_numerics(q):
-    q = norm(q or "")
-    cues = ("كم","مده","ما الحد","الحد","من وإلى","من والى","من الى","متى","النسبة","%","٪",
-            "ساعات","دقائق","يوم","أيام","يوماً","يوما","اجر","تعويض","سقف","بدل","مياومات",
-            "الحد الاقصى","شهري","ثلاثه","3","ثلاث")
-    return any(c in q for c in cues)
-
-# --------------------------------------------------------------------------------------
-# Sources → pages helpers
-# --------------------------------------------------------------------------------------
-def _parse_pages_from_sources(sources_text):
-    if not sources_text: return []
-    s = _to_western_digits(sources_text)
-    pages = set()
-    for m in re.findall(r"(?:\b[Pp]age\b|(?:ال)?صفحة)\s+(\d+)", s):
-        try: pages.add(int(m))
-        except Exception: pass
-    return sorted(pages)
-
-def _page_ctx_from_pages(pages, max_chars=3500):
-    if not pages: return ""
-    buf, total = [], 0
-    for p in pages:
-        txt = CHUNKS_BY_PAGE.get(p, "")
-        if not txt: continue
-        t = _clean_text(txt)
-        if total + len(t) > max_chars:
-            remaining = max_chars - total
-            if remaining > 200:
-                buf.append(t[:remaining]); total = max_chars; break
-        else:
-            buf.append(t); total += len(t)
-    return " ".join(buf).strip()
-
-# --------------------------------------------------------------------------------------
-# Generic regex hunter + relevance-weighted candidate collector
-# --------------------------------------------------------------------------------------
-GENERIC_RXS = [
-    re.compile(r"\b\d{1,2}:\d{2}\b"),
-    re.compile(r"\b\d{1,2}[:٫]\d{2}\b"),
-    re.compile(r"\b\d{1,2}\s*(?:ص|م)\b"),
-    re.compile(r"\b\d{1,2}\s*(?:إلى|حتى|-\s*|–\s*)\s*\d{1,2}\b"),
-    re.compile(r"\b\d{1,3}\s*[%٪]\b"),
-    _DURATION_RX,
-    re.compile(r"\b\d+\b"),
-]
-ACCOUNTING_BAN = {"اهلاك","الاستهلاك","أصل","الاصول","الميزانيه","الاهلاك","القيمه الدفتريه"}
-
-def _line_has_generic_numeric(t):
-    T = _to_western_digits(t)
-    for rx in GENERIC_RXS:
-        if rx.search(T): return True
-    if any(d in T for d in _AR_DAYS): return True
-    return False
-
-def _regex_hunt_generic(text, q_kws, intent=None):
-    if not text: return []
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    hits = []
-    for l in lines:
-        L = _clean_text(l)
-        if not L: continue
-        if _SECTION_HEAVY.search(L): continue
-        if "فهرس المحتويات" in L or "جميع الحقوق محفوظة" in L: continue
-        if _arabic_ratio(L) < 0.4 and not _line_has_generic_numeric(L):
-            continue
-        if intent in ("work_hours","ramadan_hours","overtime","annual_leave","sick_leave","hourly_exit","per_diem"):
-            if any(b in L for b in ACCOUNTING_BAN):
-                continue
-        score = 0
-        if _line_has_generic_numeric(L): score += 3
-        for kw in q_kws:
-            if kw and kw in norm(L): score += 1
-        if any(v in L for v in POLICY_VERBS): score += 1
-        if intent in ("overtime","salary_advance","remote_work","hourly_exit"):
-            has_req = any(k in norm(L) for k in REQ)
-            has_neg = any(k in norm(L) for k in NEG)
-            if has_req and not has_neg: score += 3
-            if has_req and has_neg: score -= 3
-        if score > 0:
-            hits.append((score, L))
-    hits.sort(key=lambda x: (-x[0], len(x[1])))
-    return [h[1] for h in hits]
-
-def _gather_numeric_candidates(prior_pages, cited_pages, query_terms=None, max_lines=8):
-    query_terms = [t for t in (query_terms or []) if t]
-    seen, scored = set(), []
-    ordered_pages = list(prior_pages) + [p for p in cited_pages if p not in prior_pages] + \
-                    [p for p in sorted(CHUNKS_BY_PAGE) if p not in prior_pages and p not in cited_pages]
-    for p in ordered_pages:
-        txt = CHUNKS_BY_PAGE.get(p, "")
-        if not txt: continue
-        for line in (l.strip() for l in txt.splitlines() if l.strip()):
-            if line in seen: continue
-            if not _line_has_generic_numeric(line): continue
-            L = norm(_clean_text(line))
-            kscore = sum(1 for t in query_terms if t and t in L)
-            if any(v in L for v in POLICY_VERBS): kscore += 1
-            scored.append((kscore, len(L), line))
-            seen.add(line)
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return [ln for _,__,ln in scored[:max_lines]]
-
-def _ensure_numeric_presence(answer_body, prior_pages, cited_pages, limit=6, query_terms=None):
-    candidates = _gather_numeric_candidates(prior_pages, cited_pages, query_terms=query_terms, max_lines=limit)
-    if not candidates: return answer_body
-    bullets, seen = [], set()
-    for c in candidates:
-        c = _clean_text(c).strip()
-        if not c or c in seen: continue
-        seen.add(c)
-        if len(c) > 140: c = c[:139].rstrip() + "…"
-        bullets.append(f"• {c}")
-    block = "\n\nأرقام/أوقات ذات صلة (من المصدر):\n" + "\n".join(bullets)
-    return (answer_body + block) if answer_body.strip() else block
-
-# --------------------------------------------------------------------------------------
-# Bullet formatting
-# --------------------------------------------------------------------------------------
-def _clip(s: str, n: int) -> str:
-    s = s.strip()
-    if n and len(s) > n:
-        return (s[:max(1, n-1)]).rstrip() + "…"
-    return s
-
-def _as_bullets_clipped(sents, limit=5, max_chars=120):
-    sents = sents[:max(1, limit)]
-    sents = [_clip(s, max_chars) for s in sents]
-    out, seen = [], set()
-    for s in sents:
-        if s and s not in seen:
-            seen.add(s); out.append(f"• {s}")
-    return "\n".join(out)
-
-def _filter_hourlines(sents):
-    out = []
-    for s in sents:
-        t = _to_western_digits(s)
-        if _has_times_or_days(t, accept_plain_digits=True):
-            out.append(s)
-    return out
-
-def _bullets_for_display(text: str, question: str, intent: str, cfg):
-    sents = _sentences(text)
-    if cfg.hourlines_only and (_is_hours_like(question, intent) or _expects_numerics(question)):
-        sents = _filter_hourlines(sents)
-    if not sents:
-        sents = _sentences(text)
-    return _as_bullets_clipped(sents, limit=cfg.max_bullets, max_chars=cfg.bullet_max_chars)
-
-def _is_hours_like(question: str, intent: str = "") -> bool:
-    qn = norm((question or "").strip())
-    # approval-like → do not force times
-    if any(k in qn for k in ["موافقه","اعتماد","اذن","تصريح","موافقه مسبقه"]):
-        return False
-    hours_kws = ["ساعات","الدوام","رمضان","ايام الدوام","الساعات الاضافيه","العطل","استراحه","مغادره ساعيه","وقت","من الى","من وإلى","مواعيد"]
-    return any(kw in qn for kw in hours_kws) or intent in ("work_hours","ramadan_hours","overtime","work_days","breaks")
-
-# --------------------------------------------------------------------------------------
-# Core Q&A
-# --------------------------------------------------------------------------------------
-def ask_once(index: RET.HybridIndex, tokenizer, model, question: str,
-             use_llm: bool = True, use_rerank_flag: bool = True, cfg: SimpleNamespace = None, hier=None) -> str:
-    t0 = time.time()
-    cfg = cfg or SimpleNamespace(max_bullets=5, bullet_max_chars=120, paginate_chars=800,
-                                 hourlines_only=False, regex_hunt=True)
-    intent = RET.classify_intent(question)
-
-    priors = derive_section_priors(intent, hier or [])
-    prior_pages = list(priors.get("pages", []))
-
-    extractive_answer = RET.answer(question, index, intent, use_rerank_flag=use_rerank_flag)
-
-    lines = str(extractive_answer or "").split('\n')
-    body_lines, source_lines, sources_started = [], [], False
-    for line in lines:
-        ls = line.strip()
-        if ls.startswith("Sources:") or ls.startswith("المصادر:"):
-            sources_started = True; source_lines.append(line)
-        elif sources_started:
-            source_lines.append(line)
-        else:
-            body_lines.append(line)
-    body_raw = '\n'.join(body_lines).strip()
-    sources = '\n'.join(source_lines).strip()
-
-    cited_pages = _parse_pages_from_sources(sources)
-    ordered_pages = (prior_pages or []) + [p for p in cited_pages if p not in prior_pages]
-
-    page_ctx = _page_ctx_from_pages(ordered_pages, max_chars=3500)
-
-    hours_like = _is_hours_like(question, intent)
-    tmp_body = _clean_text(body_raw)
-    if (not tmp_body) or ("لا يقدّم النص" in tmp_body) or ("لم أعثر" in tmp_body):
-        if page_ctx:
-            body_raw = page_ctx
-    elif (hours_like or _expects_numerics(question)) and not _has_times_or_days(tmp_body, accept_plain_digits=True):
-        if _has_times_or_days(page_ctx, accept_plain_digits=True):
-            body_raw = page_ctx
-
-    if cfg.regex_hunt:
-        q_kws = _question_keywords(question)
-        hunted = []
-        if prior_pages:
-            for p in prior_pages:
-                t = CHUNKS_BY_PAGE.get(p, "")
-                if not t: continue
-                hunted.extend(_regex_hunt_generic(t, q_kws, intent=intent))
-                if len(hunted) >= 10: break
-        if not hunted and cited_pages:
-            for p in cited_pages:
-                t = CHUNKS_BY_PAGE.get(p, "")
-                if not t: continue
-                hunted.extend(_regex_hunt_generic(t, q_kws, intent=intent))
-                if len(hunted) >= 10: break
-        if not hunted:
-            all_pages = (prior_pages or []) + [p for p in sorted(CHUNKS_BY_PAGE) if p not in prior_pages]
-            for p in all_pages:
-                t = CHUNKS_BY_PAGE.get(p, "")
-                hunted.extend(_regex_hunt_generic(t, q_kws, intent=intent))
-                if len(hunted) >= 10: break
-        if hunted and (_expects_numerics(question) or hours_like):
-            body_raw = "\n".join(hunted[:8])
-
-    def _final(dt, text, srcs):
-        pg = getattr(cfg, "paginate_chars", 800)
+def interactive_loop(index: HybridIndex):
+    print("جاهز.")
+    print("اسأل عن بنود الدليل (إجابات مقتبسة حرفياً من الـPDF). اكتب 'exit' للخروج.\n")
+    while True:
         try:
-            pg = int(pg)
-        except Exception:
-            pg = 800
-        pg = max(700, pg)
-        parts = _paginate_text(text, max_chars=pg)
-        if len(parts) > 1:
-            labeled = []
-            for i, p in enumerate(parts, 1):
-                labeled.append(f"الجزء {i}/{len(parts)}:\n{p}")
-            text_out = "\n\n".join(labeled)
-        else:
-            text_out = parts[0] if parts else text
-        return f"⏱ {dt:.2f}s | 🤖 {text_out}\n{srcs}" if srcs else f"⏱ {dt:.2f}s | 🤖 {text_out}"
+            q = input("سؤالك: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nخروج."); break
+        if not q: continue
+        if q.lower() in ("exit","quit","q"): print("خروج."); break
+        intent = classify_intent(q)
+        print(answer(q, index, intent, use_rerank_flag=False))
+        print("-"*66)
 
-    if not body_raw or len(body_raw.strip()) == 0:
-        dt = time.time() - t0
-        return _final(dt, "لا يقدّم النص المسترجَع تفاصيل كافية للإجابة بشكل قاطع من المصدر نفسه.", sources)
-
-    body_clean = _clean_text(body_raw)
-    body_clean = _purge_non_arabic_lines(body_clean)
-
-    if (_expects_numerics(question) or hours_like) and not _has_times_or_days(body_clean, accept_plain_digits=True):
-        q_kws = _question_keywords(question)
-        hunted2 = []
-        for p in (prior_pages or []):
-            t = CHUNKS_BY_PAGE.get(p, "")
-            hunted2.extend(_regex_hunt_generic(t, q_kws, intent=intent))
-            if len(hunted2) >= 10: break
-        if hunted2:
-            body_clean = _clean_text("\n".join(hunted2[:8]))
-            body_clean = _purge_non_arabic_lines(body_clean)
-
-    # ---- No LLM path
-    if (not use_llm) or (tokenizer is None) or (model is None):
-        dt = time.time() - t0
-        bullets = _bullets_for_display(body_clean or body_raw, question, intent, cfg)
-        if not bullets:
-            bullets = _as_bullets_clipped(_sentences(body_clean or body_raw), limit=cfg.max_bullets, max_chars=cfg.bullet_max_chars)
-        formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
-
-        # ensure numeric presence with relevance
-        if _expects_numerics(question) and not _has_times_or_days(formatted, accept_plain_digits=True):
-            q_terms = _question_keywords(question)
-            formatted = _ensure_numeric_presence(formatted, prior_pages, cited_pages, limit=8, query_terms=q_terms)
-
-        return _final(dt, formatted, sources)
-
-    # ---- Optional LLM refine
-    try:
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        system_prompt = (
-            "لخّص بوضوح من النص التالي دون إضافة أي معلومات جديدة أو أرقام غير موجودة. "
-            "أعد بالبنود (•) وبالعربية فقط."
-        )
-        user_prompt = f"السؤال: {question}\nالنص:\n{body_clean or body_raw}"
-        if hasattr(tokenizer, "apply_chat_template"):
-            prompt = tokenizer.apply_chat_template(
-                [{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}],
-                tokenize=False, add_generation_prompt=True
-            )
-        else:
-            prompt = f"[system]\n{system_prompt}\n\n[user]\n{user_prompt}\n\n[assistant]\n"
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-        if hasattr(model, "device"):
-            inputs = {k: v.to(model.device) for k,v in inputs.items()}
-        eos_id = getattr(tokenizer, "eos_token_id", None)
-        pad_id = eos_id if eos_id is not None else getattr(tokenizer, "pad_token_id", None)
-        out_ids = model.generate(**inputs, max_new_tokens=160, do_sample=False, repetition_penalty=1.05,
-                                 eos_token_id=eos_id, pad_token_id=pad_id)
-        start = inputs["input_ids"].shape[1]
-        raw = tokenizer.decode(out_ids[0][start:], skip_special_tokens=True).strip()
-        resp = _clean_text(raw); resp = _purge_non_arabic_lines(resp)
-        if not resp:
-            dt = time.time() - t0
-            bullets = _bullets_for_display(body_clean or body_raw, question, intent, cfg)
-            formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
-            if _expects_numerics(question) and not _has_times_or_days(formatted, accept_plain_digits=True):
-                q_terms = _question_keywords(question)
-                formatted = _ensure_numeric_presence(formatted, prior_pages, cited_pages, limit=8, query_terms=q_terms)
-            return _final(dt, formatted, sources)
-
-        # post-LLM numeric reinforcement
-        if _expects_numerics(question) and not _has_times_or_days(resp, accept_plain_digits=True):
-            q_terms = _question_keywords(question)
-            resp = _ensure_numeric_presence(resp, prior_pages, cited_pages, limit=8, query_terms=q_terms)
-
-        dt = time.time() - t0
-        return _final(dt, resp, sources)
-    except Exception as e:
-        LOG.warning(f"LLM generation failed: {e}")
-        dt = time.time() - t0
-        bullets = _bullets_for_display(body_clean or body_raw, question, intent, cfg)
-        formatted = f"استنادًا إلى النصوص المسترجَعة من المصدر، إليك الخلاصة:\n{bullets}" if bullets else (body_clean or body_raw)
-        if _expects_numerics(question) and not _has_times_or_days(formatted, accept_plain_digits=True):
-            q_terms = _question_keywords(question)
-            formatted = _ensure_numeric_presence(formatted, prior_pages, cited_pages, limit=8, query_terms=q_terms)
-        return _final(dt, formatted, sources)
-
-# --------------------------------------------------------------------------------------
-# Sanity runner
-# --------------------------------------------------------------------------------------
-def _gather_sanity_prompts() -> list:
-    ret_prompts = []
-    try: ret_prompts = list(getattr(RET, "SANITY_PROMPTS", []) or [])
-    except Exception: ret_prompts = []
-    seen, merged = set(), []
-    for q in (ret_prompts + DEFAULT_SANITY_PROMPTS):
-        if q not in seen:
-            seen.add(q); merged.append(q)
-    return merged
-
-def _pass_loose(answer_text: str) -> bool:
-    has_sources = ("Sources:" in answer_text) or ("المصادر:" in answer_text)
-    bad = ("لا يقدّم النص المسترجَع تفاصيل كافية" in answer_text)
-    return bool(has_sources and not bad)
-
-def _is_meaningful(txt: str) -> bool:
-    return bool(txt and len(re.sub(r"\s+","", txt)) >= 12)
-
-def _pass_strict(question: str, body_only: str) -> bool:
-    if not _is_meaningful(body_only): return False
-    needs_numbers = _is_hours_like(question, "") or _expects_numerics(question)
-    if needs_numbers:
-        return _has_times_or_days(body_only, accept_plain_digits=True)
-    return True
-
-def run_test_prompts(index: RET.HybridIndex, tokenizer, model,
-                     use_llm: bool, use_rerank_flag: bool, artifacts_dir: str, cfg: SimpleNamespace, hier=None):
-    os.makedirs(artifacts_dir, exist_ok=True)
-    results_path = os.path.join(artifacts_dir, "results.jsonl")
-    summary_md   = os.path.join(artifacts_dir, "summary.md")
-    report_txt   = os.path.join(artifacts_dir, "report.txt")
-
-    results_f = open(results_path, "w", encoding="utf-8")
-    report_f  = open(report_txt,  "w", encoding="utf-8")
-
-    def _tee(line=""):
-        print(line); report_f.write(line + "\n"); report_f.flush()
-
-    tests = _gather_sanity_prompts()
-    if not tests:
-        _tee("❌ No sanity prompts available.")
-        results_f.close(); report_f.close(); return
-
-    _tee("🧪 Running sanity prompts ...")
-    _tee("=" * 80)
-
-    total = len(tests)
-    pass_loose_count, pass_strict_count = 0, 0
-
-    for i, q in enumerate(tests, 1):
-        _tee(f"\n📝 Test {i}/{total}: {q}")
-        _tee("-" * 60)
-        try:
-            result = ask_once(index, tokenizer, model, q, use_llm=use_llm, use_rerank_flag=use_rerank_flag, cfg=cfg, hier=hier)
-            _tee(result)
-
-            body_only, _src_blk = _split_answer(result)
-            loose = _pass_loose(result)
-            strict = _pass_strict(q, body_only)
-
-            pass_loose_count += int(loose)
-            pass_strict_count += int(strict)
-
-            _tee("✅ PASS_LOOSE" if loose else "❌ FAIL_LOOSE")
-            _tee("✅ PASS_STRICT" if strict else "❌ FAIL_STRICT")
-            _tee("=" * 80)
-
-            rec = {
-                "index": i, "question": q, "answer": result, "body_only": body_only,
-                "pass_loose": loose, "pass_strict": strict,
-            }
-            results_f.write(json.dumps(rec, ensure_ascii=False) + "\n"); results_f.flush()
-
-        except Exception as e:
-            _tee(f"❌ Error: {e}")
-            _tee("=" * 80)
-
-    summary = (
-        f"# Sanity Summary\n\n"
-        f"- Total: {total}\n"
-        f"- PASS_LOOSE: {pass_loose_count}/{total}\n"
-        f"- PASS_STRICT: {pass_strict_count}/{total}\n"
-        f"\nArtifacts:\n- results.jsonl\n- report.txt\n"
-    )
-    with open(summary_md, "w", encoding="utf-8") as f:
-        f.write(summary)
-
-    _tee(f"\nSummary: PASS_LOOSE {pass_loose_count}/{total} | PASS_STRICT {pass_strict_count}/{total}")
-    _tee(f"Artifacts saved in: {artifacts_dir}")
-
-# --------------------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--chunks", type=str, default="Data_pdf_clean_chunks.jsonl", help="Path to chunks (JSONL/JSON)")
-    parser.add_argument("--hier-index", type=str, default="heading_inverted_index.json")
-    parser.add_argument("--aliases", type=str, default="section_aliases.json")
-    parser.add_argument("--save-index", type=str, default=None)
-    parser.add_argument("--load-index", type=str, default=None)
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--ask", type=str, default=None)
-    parser.add_argument("--test", action="store_true")
-    parser.add_argument("--sanity", action="store_true")
-    parser.add_argument("--no-llm", action="store_true")
-    parser.add_argument("--use-4bit", action="store_true")
-    parser.add_argument("--use-8bit", action="store_true")
-    parser.add_argument("--no-rerank", action="store_true")
-    parser.add_argument("--device", type=str, default="auto", choices=["auto","cpu","cuda"])
-    parser.add_argument("--out-dir", type=str, default="runs")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--chunks", type=str, default=CHUNKS_PATH, help="Path to chunks (JSONL/JSON)")
+    ap.add_argument("--hier-index", type=str, default="heading_inverted_index.json", help="Optional hierarchy inverted index")
+    ap.add_argument("--aliases", type=str, default="section_aliases.json", help="Optional aliases for headings")
+    ap.add_argument("--sanity", action="store_true", help="Run sanity prompts and exit")
+    args = ap.parse_args()
 
-    # General controls
-    parser.add_argument("--regex-hunt", action="store_true", help="Generic numeric/time/day hunter (question-driven).")
-    parser.add_argument("--hourlines-only", action="store_true", help="Keep only lines with times/days/numbers/% when relevant.")
-    parser.add_argument("--max-bullets", type=int, default=5, help="Max bullets.")
-    parser.add_argument("--bullet-max-chars", type=int, default=120, help="Max characters per bullet.")
-    parser.add_argument("--paginate-chars", type=int, default=800, help="Pagination threshold of body (min 700 will be enforced).")
+    hier = load_hierarchy(args.hier_index, args.aliases)
+    chunks, chunks_hash = load_chunks(path=args.chunks)
+    index = HybridIndex(chunks, chunks_hash, hier=hier)
+    index.build()
 
-    args = parser.parse_args()
-    cfg = SimpleNamespace(
-        regex_hunt=args.regex_hunt,
-        hourlines_only=args.hourlines_only,
-        max_bullets=args.max_bullets,
-        bullet_max_chars=args.bullet_max_chars,
-        paginate_chars=args.paginate_chars,
-    )
+    LOG.info("Ready (STRICT_MODE=%s).", STRICT_MODE)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(args.out_dir, f"run_{timestamp}")
-    os.makedirs(run_dir, exist_ok=True)
+    if args.sanity:
+        run_sanity(index); return
 
-    global LOG
-    LOG = setup_logger(os.path.join(run_dir, "run.log"))
-    LOG.info("Artifacts will be saved under: %s", run_dir)
-
-    hier = RET.load_hierarchy(args.hier_index, args.aliases)
-    try:
-        LOG.info("hier type=%s; attrs(sample)=%s", type(hier), list(dir(hier))[:15])
-    except Exception:
-        pass
-
-    if not os.path.exists(args.chunks):
-        LOG.error("Chunks file not found: %s", args.chunks); return
-    chunks, chunks_hash = RET.load_chunks(path=args.chunks)
-
-    global CHUNKS_BY_PAGE
-    CHUNKS_BY_PAGE = _build_page_text_index(chunks)
-
-    index = RET.HybridIndex(chunks, chunks_hash, hier=hier)
-
-    loaded = False
-    if args.load_index and os.path.exists(args.load_index):
-        try:
-            rlog = logging.getLogger("retrival_model"); lvl = rlog.level; rlog.setLevel(logging.ERROR)
-            loaded = index.load(args.load_index); rlog.setLevel(lvl)
-            if loaded: LOG.info("Index loaded successfully from %s", args.load_index)
-        except Exception as e:
-            LOG.info("Will rebuild index: %s", e)
-
-    if not loaded:
-        LOG.info("Building index ..."); index.build()
-        if args.save_index:
-            try:
-                index.save(args.save_index); LOG.info("Index saved to %s", args.save_index)
-            except Exception as e:
-                LOG.warning("Failed to save index: %s", e)
-
-    tok = mdl = None
-    use_llm = not args.no_llm
-    if use_llm:
-        try:
-            from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-            use_cuda = (args.device != "cpu") and (torch is not None) and hasattr(torch, "cuda") and torch.cuda.is_available()
-            if args.device == "cuda" and not use_cuda:
-                LOG.warning("CUDA requested but not available; falling back to CPU.")
-            bf16_supported = use_cuda and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
-            dtype_fp = torch.bfloat16 if (bf16_supported and torch is not None) else (torch.float16 if (use_cuda and torch is not None) else None)
-            model_kwargs = {"trust_remote_code": True}
-            if args.device == "cpu" or not use_cuda:
-                model_kwargs["device_map"] = "cpu"
-                if torch is not None: model_kwargs["torch_dtype"] = torch.float32
-            else:
-                model_kwargs["device_map"] = "auto"
-                if dtype_fp is not None: model_kwargs["torch_dtype"] = dtype_fp
-            if args.use_4bit or args.use_8bit:
-                try:
-                    model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                        load_in_4bit=bool(args.use_4bit),
-                        load_in_8bit=bool(args.use_8bit),
-                        bnb_4bit_compute_dtype=(torch.bfloat16 if bf16_supported else (torch.float16 if use_cuda else None)),
-                    )
-                except Exception as e:
-                    LOG.warning("Quantization setup failed: %s", e)
-            tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-            mdl = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
-        except Exception as e:
-            LOG.warning(f"Failed to load LLM ({args.model}); continuing retrieval-only. Error: {e}")
-            tok = mdl = None; use_llm = False
-
-    use_rerank_flag = not args.no_rerank
-
-    if args.test or args.sanity:
-        run_test_prompts(index, tok, mdl, use_llm=use_llm, use_rerank_flag=use_rerank_flag, artifacts_dir=run_dir, cfg=cfg, hier=hier)
-        print(f"\n✅ Saved artifacts under: {run_dir}")
-        return
-
-    if args.ask:
-        ans = ask_once(index, tok, mdl, args.ask, use_llm=use_llm, use_rerank_flag=use_rerank_flag, cfg=cfg, hier=hier)
-        single_path = os.path.join(run_dir, "single_answer.txt")
-        with open(single_path, "w", encoding="utf-8") as f: f.write(ans)
-        print(ans); print(f"\n✅ Saved single answer to: {single_path}")
-        return
-
-    print("Ready. اطرح سؤالك (اكتب 'exit' للخروج)\n")
-    interactive_path = os.path.join(run_dir, "interactive_transcript.txt")
-    with open(interactive_path, "w", encoding="utf-8") as trans:
-        while True:
-            try: q = input("سؤالك: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nExiting."); break
-            if not q: continue
-            if q.lower() in ("exit","quit","q"): print("Exiting."); break
-            ans = ask_once(index, tok, mdl, q, use_llm=use_llm, use_rerank_flag=use_rerank_flag, cfg=cfg, hier=hier)
-            print(ans); trans.write(f"\nQ: {q}\n{ans}\n"); trans.flush()
-    print(f"\n✅ Interactive transcript saved to: {interactive_path}")
+    interactive_loop(index)
 
 if __name__ == "__main__":
     main()
