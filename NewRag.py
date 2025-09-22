@@ -65,6 +65,9 @@ TIME_TOKEN = re.compile(r'\b\d{1,2}[:\.]\d{0,2}\b')
 ANY_DIGIT  = re.compile(r'\d')
 DUR_TOKEN  = re.compile(r'\b(\d{1,3})\s*(?:دقيقه|دقيقه|دقيقة|دقائق|ساعة|ساعه|ساعات)\b', re.I)
 
+HALF_HOUR_PAT    = re.compile(r'\bنصف\s+ساع[هة]\b')
+QUARTER_HOUR_PAT = re.compile(r'\bربع\s+ساع[هة]\b')
+
 WEEKDAYS = ["السبت","الاحد","الأحد","الاثنين","الإثنين","الثلاثاء","الاربعاء","الأربعاء","الخميس","الجمعة"]
 
 def normalize_hhmm(tok: str) -> str:
@@ -74,15 +77,17 @@ def normalize_hhmm(tok: str) -> str:
     if m == "": m = "00"
     return f"{int(h):d}:{int(m):02d}"
 
+def _to_minutes(hhmm: str) -> int:
+    h, m = map(int, hhmm.split(":"))
+    return h*60 + m
+
+def _plausible_workday(A: int, B: int) -> bool:
+    return 6*60 <= A <= 20*60+30 and 6*60 <= B <= 20*60+30 and B > A
+
 # ---------------- Strict needs rules (intent-aware) ----------------
 def needs_numeric_or_time(question: str, intent: str) -> bool:
     """
     Only require numbers/time when it truly makes sense.
-    - Always for work_hours / ramadan_hours
-    - For break only if the question contains 'كم' or 'مدة'
-    - For procurement/per-diem/overtime/leave when the question explicitly asks about 'كم/مدة/نسبة/سقف/حد/3/ثلاث' or contains digits
-    - Never trigger merely on 'من'/'الى' (they can mean 'who/from' linguistically)
-    - Do NOT key on 'يوم/أيام' (false positive for workdays)
     """
     qn = ar_normalize(question)
     has_num = bool(ANY_DIGIT.search(qn))
@@ -102,13 +107,12 @@ def body_has_required_signals(body: str, intent: str) -> bool:
     if intent in ("work_hours","ramadan_hours"):
         return bool(TIME_RANGE.search(bn) or TIME_TOKEN.search(bn))
     if intent == "break":
-        return bool(DUR_TOKEN.search(bn) or TIME_TOKEN.search(bn))
+        return bool(DUR_TOKEN.search(bn) or TIME_TOKEN.search(bn) or
+                    HALF_HOUR_PAT.search(bn) or QUARTER_HOUR_PAT.search(bn))
     if intent == "workdays":
         return any(d in body for d in WEEKDAYS) or ("ايام" in bn and ("العمل" in bn or "الدوام" in bn))
-    # numeric-ish intents
     if intent in ("procurement","per_diem","overtime","leave"):
         return bool(ANY_DIGIT.search(bn))
-    # general
     return len(bn) >= 6
 
 # ---------------- Pass criteria & parsing ----------------
@@ -151,31 +155,38 @@ def pick_best_time_range(texts):
         for m in TIME_RANGE.finditer(tn):
             a = normalize_hhmm(m.group(1))
             b = normalize_hhmm(m.group(2))
-            # prefer work-like durations (6h..11h)
-            h1, m1 = map(int, a.split(':')); A = h1*60+m1
-            h2, m2 = map(int, b.split(':')); B = h2*60+m2
-            if B <= A: B += 12*60
+            A, B = _to_minutes(a), _to_minutes(b)
+            if B <= A:
+                B += 12*60  # handle "8:30–3:00" typos
+
             dur = B - A
-            score = 0
-            if 360 <= dur <= 660: score += 2
-            if "دوام" in tn or "العمل" in tn: score += 1
-            best = max(best, (score, a, b), key=lambda x: x[0]) if best else (score, a, b)
-    if best and best[0] > 0:
-        return best[1], best[2]
-    return None
+            if not (360 <= dur <= 660):   # require 6–11 hours
+                continue
+            if not _plausible_workday(A, B):
+                continue
+
+            # score: closeness to 7h30 + presence of دوام/العمل + bonus if start 7:00–9:30
+            score = -abs(dur - 450)
+            if ("دوام" in tn or "العمل" in tn): score += 30
+            if 7*60 <= A <= 9*60+30: score += 10
+
+            cand = (score, a, b)
+            if (best is None) or (cand[0] > best[0]):
+                best = cand
+
+    return (best[1], best[2]) if best else None
 
 def find_duration_line(texts):
-    # try to find "استراحة ... 30 دقيقة" etc.
     candidates = []
     for t in texts:
         tn = ar_normalize(t)
-        if ("استراح" in tn or "راحة" in tn or "بريك" in tn) and DUR_TOKEN.search(tn):
+        if (("استراح" in tn or "راحة" in tn or "بريك" in tn or "رضاع" in tn) and
+            (DUR_TOKEN.search(tn) or HALF_HOUR_PAT.search(tn) or QUARTER_HOUR_PAT.search(tn))):
             candidates.append(t.strip())
-    # fallback: any line with دقيقة/ساعة + number
     if not candidates:
         for t in texts:
             tn = ar_normalize(t)
-            if DUR_TOKEN.search(tn):
+            if DUR_TOKEN.search(tn) or HALF_HOUR_PAT.search(tn) or QUARTER_HOUR_PAT.search(tn):
                 candidates.append(t.strip())
     return candidates[0] if candidates else None
 
@@ -187,7 +198,6 @@ def find_workdays_line(texts):
 
 def repair_body_if_needed(question, intent, body, pages, all_chunks):
     """If strict fails, search cited pages and synthesize a minimal, correct line."""
-    # collect texts from cited pages
     page_set = set(pages)
     texts = [c.text for c in all_chunks if c.page in page_set]
 
@@ -209,7 +219,6 @@ def repair_body_if_needed(question, intent, body, pages, all_chunks):
         if line: return line
         return body
 
-    # for numeric-ish intents, if no digits in body, try to pull any numeric line from cited pages
     if intent in ("procurement","per_diem","overtime","leave"):
         if not ANY_DIGIT.search(ar_normalize(body or "")):
             for t in texts:
@@ -248,11 +257,9 @@ def run_sanity(index, all_chunks, out_dir: Path, rtl: str, digits: str):
             body_raw = parts[0].strip()
             pages = extract_pages(ans)
 
-            # first strict check
             okL = pass_loose(ans)
             okS = pass_strict(q, strip_rtl_wrap(body_raw), intent)
 
-            # try repair if strict failed and we have pages
             repaired = None
             if not okS and pages:
                 repaired = repair_body_if_needed(q, intent, strip_rtl_wrap(body_raw), pages, all_chunks)
@@ -284,7 +291,6 @@ def run_sanity(index, all_chunks, out_dir: Path, rtl: str, digits: str):
             jf.write(json.dumps(row, ensure_ascii=False) + "\n")
             rows.append(row)
 
-    # summary.md
     with summary_path.open("w", encoding="utf-8") as sf:
         sf.write("# Sanity Run\n\n")
         sf.write(f"- Total questions: **{total}**\n")
