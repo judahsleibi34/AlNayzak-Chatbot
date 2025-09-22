@@ -1,16 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Arabic-first hybrid retriever with persistence (for RAG).
+Arabic-first hybrid retriever with intent-aware composing for RAG.
 
-What’s new in this revision
+What's new in this revision
 ---------------------------
-- STRICT fix: better intent gates; real "must tokens" enforcement.
-- Hours composer: scans sentence- AND chunk-level for a plausible daily range.
+- Hours chooser now favors start 07:00–10:00 and end 13:00–18:00; never prints
+  the inverted "3:00 → 8:30" case for work hours.
 - New composers:
-    * _compose_break_answer(): finds استراحة/راحة/بريك/رضاعة + duration.
-    * _compose_hourly_leave(): handles إذن مغادرة ساعية + limits.
-- Leave/procurement selection stays numeric-first.
-- OCR hygiene: skip boilerplate lines; ignore section numbers only for time intents.
+    * _compose_break_answer()         -> استراحة/راحة/بريك/رضاعة + مدة
+    * _compose_hourly_leave()         -> إذن/مغادرة ساعية + حدود/أرقام
+    * _compose_leave_carryover()      -> الإجازة السنوية غير المستخدمة/الترحيل
+    * _compose_emergency_leave()      -> الإجازة الطارئة (آلية الطلب/المدة)
+    * _compose_performance_review()   -> تقييم الأداء السنوي + معايير
+- STRICT-friendly selection: fallbacks refuse unrelated snippets (e.g., الاستقالة) for
+  hourly leave / break / carryover / performance.
+- Display sanitizer strips OCR tokens like "uni06BE" before returning answers.
 """
 
 import os, re, sys, json, argparse, logging, hashlib
@@ -46,7 +50,7 @@ LOG = logging.getLogger(__name__)
 AR_DIAC = re.compile(r'[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]')
 AR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"٠١٢٣٤٥٦٧٨٩")}
 IR_NUMS = {ord(c): ord('0')+i for i,c in enumerate(u"۰۱۲۳۴۵۶۷۸۹")}
-NOISY_UNI = re.compile(r'\buni[0-9A-Fa-f]{3,6}\b')
+NOISY_UNI = re.compile(r'/?\buni[0-9A-Fa-f]{3,6}\b')
 RIGHTS_LINE = re.compile(r'جميع الحقوق محفوظة|التعليم المساند والإبداع العلمي')
 SECTION_NUM = re.compile(r'\b\d+\.\d+\b')
 
@@ -62,6 +66,15 @@ def ar_normalize(s: str) -> str:
     s = ' '.join(s.split())
     return s
 
+def clean_display_text(s: str) -> str:
+    """Remove OCR garbage and tidy punctuation/whitespace for user-visible text."""
+    if not s: return s
+    s = NOISY_UNI.sub('', s)
+    s = re.sub(r'\s+([،,:;\.])', r'\1', s)
+    s = re.sub(r'\s{2,}', ' ', s)
+    s = s.replace('‐', '-').replace('-', '-').replace('–', '-').replace('—', '-')
+    return s.strip()
+
 def rtl_wrap(t: str) -> str:
     return '\u202B' + t + '\u202C'
 
@@ -76,7 +89,6 @@ def sent_split(s: str) -> List[str]:
             continue
         if RIGHTS_LINE.search(p):       # boilerplate
             continue
-        # NOTE: we DO NOT filter section numbers here; selection functions will do it per-intent.
         letters = sum(ch.isalpha() for ch in pn)
         total = len(pn.replace(" ", ""))
         if total > 0 and letters/total < 0.5:
@@ -382,6 +394,7 @@ KW_BREAK = re.compile(r'(استراح|راحة|بريك|رضاعه|رضاع)')
 KW_HOURLY = re.compile(r'(مغادره|مغادرة|اذن|إذن).*(ساعيه|ساعية)|مغادرة\s*ساعية')
 KW_PROC = re.compile(r'(شراء|مشتريات|عروض|مناقصة|توريد|تأمين|حد|سقف)')
 KW_WORKDAYS = re.compile(r'(ايام|أيام).*(العمل|الدوام)|السبت|الاحد|الخميس|الأحد')
+KW_PERFORMANCE = re.compile(r'تقييم\s+الأداء|الأداء\s+السنوي|المعايير|محاور')
 
 def classify_intent(q: str) -> str:
     qn = ar_normalize(q)
@@ -389,9 +402,12 @@ def classify_intent(q: str) -> str:
     if KW_WORKDAYS.search(qn): return "workdays"
     if KW_HOURLY.search(qn): return "hourly_leave"
     if KW_HOURS.search(qn): return "work_hours"
+    if "طارئ" in qn or "الطارئه" in qn or "الطارئة" in qn: return "emergency_leave"
     if KW_FLEX.search(qn): return "flex"
     if KW_BREAK.search(qn): return "break"
     if KW_OVERTIME.search(qn): return "overtime"
+    if KW_PERFORMANCE.search(qn) or "تقييم" in qn: return "performance"
+    if "ترح" in qn or "غير مستخدم" in qn or "غير المستخدم" in qn: return "carryover_leave"
     if KW_LEAVE.search(qn): return "leave"
     if KW_PROC.search(qn): return "procurement"
     if re.search(r'(مياوم|مياومات|بدل\s*سفر|نفقات|فواتير|تذاكر|فندق|اقام)', qn):
@@ -402,13 +418,16 @@ INTENT_HINTS = {
     "flex":    ["مرون", "تاخير", "تأخير", "الحضور", "الانصراف", "خصم", "بصمه","بصمة"],
     "break":   ["استراح", "راحة", "فسحه", "فسحة", "بريك","رضاعه","رضاع","دقيقه","دقائق","ساعه","ساعة","نصف","ربع"],
     "overtime":["اضافي", "ساعات اضافيه", "تعويض", "موافقه", "اعتماد", "العطل","العطل الرسميه","نسبه","125","أجر","اجر","احتساب"],
-    "leave":   ["اجاز", "اجازه","إجازة","سنويه","سنوية","مرضيه","طارئه","امومه","حداد","بدون","راتب"],
+    "leave":   ["اجاز", "اجازه","إجازة","سنويه","سنوية","مرضيه","امومه","حداد","بدون","راتب","طارئ"],
+    "carryover_leave": ["غير","مستخدم","غير مستخدم","ترح","سنويه","سقف","حد"],
     "hourly_leave": ["مغادر","اذن","ساعيه","ساعية","حد","اقصى","شهري"],
     "work_hours": ["ساعات", "دوام", "العمل","اوقات","من","الى","حتى","حتي"],
     "ramadan_hours": ["رمضان","ساعات", "دوام", "العمل","اوقات","من","الى","حتى","حتي"],
     "procurement": ["عروض","ثلاث","ثلاثه","3","شراء","سقف","حد","شيكل","₪","دينار","دولار","توريد","مشتريات"],
     "per_diem": ["مياومات","مياومه","بدل","سفر","صرف","نفقات","مصاريف","فواتير","ايصالات","تذاكر","فندق","اقامه","اقامة"],
-    "workdays": ["ايام","العمل","الدوام","السبت","الاحد","الأحد","الخميس","من","الى"]
+    "workdays": ["ايام","العمل","الدوام","السبت","الاحد","الأحد","الخميس","من","الى"],
+    "emergency_leave": ["اجاز","طارئ","طارئة","فوري","طلب","نموذج"],
+    "performance": ["تقييم","الأداء","سنوي","معايير","محاور","أهداف","مؤشرات"]
 }
 
 INTENT_MUST = {
@@ -419,7 +438,10 @@ INTENT_MUST = {
     "procurement":   ["عروض","عرض","ثلاث","ثلاثه","شراء","سقف","حد"],
     "per_diem":      ["بدل","سفر","مصاريف","نفقات","ايصالات","فواتير","تذاكر","فندق"],
     "break":         ["استراح","راحة","بريك","رضاع","رضاعه","دقائق","ساعة","ساعه","نصف","ربع"],
-    "hourly_leave":  ["مغادر","اذن","ساعيه","ساعية"],
+    "hourly_leave":  ["مغادر","اذن","إذن","ساعيه","ساعية"],
+    "carryover_leave": ["غير","مستخدم","ترح","سنويه","سنوية"],
+    "emergency_leave": ["اجاز","طارئ"],
+    "performance":   ["تقييم","الأداء"],
     "leave":         ["اجاز","اجازه","إجازة"],
     "general":       []
 }
@@ -451,36 +473,47 @@ def _normalize_hhmm(tok: str) -> str:
 def _to_minutes(hhmm: str) -> int:
     h, m = hhmm.split(':'); return int(h)*60 + int(m)
 
-def _plausible_workday(a: int, b: int) -> bool:
-    return 6*60 <= a <= 20*60+30 and 6*60 <= b <= 20*60+30 and b > a
-
 def extract_all_ranges(text: str, intent: str) -> List[Tuple[int,int]]:
     n = ar_normalize(text)
     ranges: List[Tuple[int,int]] = []
     for m in TIME_RE.finditer(n):
         a = _normalize_hhmm(m.group(1)); b = _normalize_hhmm(m.group(2))
         A, B = _to_minutes(a), _to_minutes(b)
-        if B <= A:  # handle 8:30 -> 3:00 style
-            B_try = B + 12*60
-            if B_try > A:
-                B = B_try
+        # fix wrap/inversions gracefully
+        if B <= A:
+            if A <= 10*60 and B+12*60 > A:
+                B = B + 12*60
             else:
                 A, B = B, A
         if intent in ("work_hours","ramadan_hours"):
             dur = B - A
-            if not (6*60 <= dur <= 11*60) or not _plausible_workday(A,B):
+            if dur < 6*60 or dur > 11*60:  # typical workday window
                 continue
         ranges.append((A, B))
     return ranges
 
-def pick_best_range(ranges: List[Tuple[int,int]]) -> Optional[Tuple[str,str]]:
+def _score_workday_range(A: int, B: int) -> float:
+    dur = B - A
+    score = 0.0
+    # target 7.5h ~ 9h
+    if 6*60 <= dur <= 11*60: score += 3.0
+    if 7*60 <= dur <= 9*60: score += 1.0
+    # plausible start/end
+    if 7*60 <= A <= 10*60: score += 2.5
+    if 13*60 <= B <= 18*60: score += 2.5
+    # earlier start (8:30 better than 9:30)
+    score += max(0.0, (10*60 - min(A, 10*60)) / 60.0) * 0.2
+    return score
+
+def pick_best_range(ranges: List[Tuple[int,int]], prefer_workday=True) -> Optional[Tuple[str,str]]:
     if not ranges: return None
-    scored = []
-    for (A,B) in ranges:
-        dur = B - A
-        scored.append((abs(dur - 7.5*60), -(dur), A, B))
-    scored.sort()
-    _, _, A, B = scored[0]
+    if prefer_workday:
+        scored = [(_score_workday_range(A,B), A, B) for (A,B) in ranges]
+        scored.sort(key=lambda x: (-x[0], x[1], x[2]))
+        _, A, B = scored[0]
+    else:
+        ranges.sort()
+        A, B = ranges[0]
     return f"{A//60:d}:{A%60:02d}", f"{B//60:d}:{B%60:02d}"
 
 # ---------------- Retrieval & Answering ----------------
@@ -535,13 +568,6 @@ def retrieve(index: HybridIndex, q: str, rerank: bool) -> List[Tuple[float,int]]
 
     return prelim[:8]
 
-def _has_numbers(sn: str) -> bool:
-    return bool(re.search(r'\d', sn))
-
-def _has_time_hint(sn: str) -> bool:
-    sn = ar_normalize(sn)
-    return any(w in sn for w in ["من","الى","حتي","حتى",":","."])
-
 def _looks_junky(sn: str) -> bool:
     snn = ar_normalize(sn)
     if len(snn) < 6: return True
@@ -567,19 +593,28 @@ def best_snippet(chunk: Chunk, qnorm: str, intent: str, max_len=260) -> Optional
         if not _must_tokens_present(sn, intent):
             continue
         # time intents: demand numbers + hint + context
-        if intent in ("work_hours","ramadan_hours") and not (_has_numbers(sn) and _has_time_hint(sn) and ("دوام" in sn or "عمل" in sn or "ساعات" in sn)):
+        if intent in ("work_hours","ramadan_hours"):
+            has_time = bool(re.search(r'\d', sn) and (":" in s or "الى" in sn or "إلى" in sn or "حتى" in sn or "حتي" in sn))
+            ctx = ("دوام" in sn) or ("عمل" in sn) or ("ساعات" in sn)
+            if not (has_time and ctx): 
+                continue
+        # strengthen hourly_leave/break/carryover/performance contexts
+        if intent == "hourly_leave" and not any(k in sn for k in ["مغادر","اذن","إذن","ساعيه","ساعية"]):
             continue
+        if intent == "break" and not any(k in sn for k in ["استراح","راحة","بريك","رضاع"]):
+            continue
+        if intent == "carryover_leave" and not any(k in sn for k in ["غير","مستخدم","ترح"]):
+            continue
+        if intent == "performance" and not ("تقييم" in sn or "الأداء" in sn):
+            continue
+
         overlap = len(q_terms & set(sn.split()))
-        has_time = _has_numbers(sn) and _has_time_hint(sn)
+        has_num = bool(re.search(r'\d', sn))
         has_hint = any(h in sn for h in hints)
         score = 0.0
         score += 1.2 * overlap
-        if has_time: score += 1.0
+        if has_num: score += 0.6
         if has_hint: score += 0.8
-        if _has_numbers(sn) and intent in ("work_hours","ramadan_hours","overtime","leave","procurement","per_diem","hourly_leave"):
-            score += 0.4
-        if overlap == 0 and not (has_time or has_hint):
-            score -= 0.6
         if score > best_score:
             best, best_score = s, score
 
@@ -593,7 +628,7 @@ def best_snippet(chunk: Chunk, qnorm: str, intent: str, max_len=260) -> Optional
         return None
 
     txt = best.strip()
-    return (txt[:max_len] + ("…" if len(txt) > max_len else ""))
+    return clean_display_text(txt[:max_len] + ("…" if len(txt) > max_len else ""))
 
 # ---------------- Answer synthesis helpers ----------------
 
@@ -608,11 +643,11 @@ def _compose_hours_answer(chunks: List[Chunk], hits: List[Tuple[float,int]], int
             if not _must_tokens_present(sn, intent):
                 continue
             ranges = extract_all_ranges(s, intent)
-            rng = pick_best_range(ranges)
+            rng = pick_best_range(ranges, prefer_workday=True)
             if rng:
                 a, b = rng
                 suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
-                txt = f"ساعات الدوام{suffix} من {a} إلى {b}."
+                txt = clean_display_text(f"ساعات الدوام{suffix} من {a} إلى {b}.")
                 src = f"Data_pdf.pdf - page {chunks[i].page}"
                 return rtl_wrap(txt) + "\n" + f"Sources:\n1. {src}"
     # pass 2: chunk-level (handles split lines)
@@ -622,11 +657,11 @@ def _compose_hours_answer(chunks: List[Chunk], hits: List[Tuple[float,int]], int
         if not (("دوام" in tn) or ("عمل" in tn) or ("ساعات" in tn)):
             continue
         ranges = extract_all_ranges(t, intent)
-        rng = pick_best_range(ranges)
+        rng = pick_best_range(ranges, prefer_workday=True)
         if rng:
             a, b = rng
             suffix = " في شهر رمضان" if intent == "ramadan_hours" else ""
-            txt = f"ساعات الدوام{suffix} من {a} إلى {b}."
+            txt = clean_display_text(f"ساعات الدوام{suffix} من {a} إلى {b}.")
             srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
             return rtl_wrap(txt) + "\n" + "Sources:\n" + "\n".join(srcs)
     return None
@@ -637,7 +672,7 @@ def _compose_procurement_threshold(chunks: List[Chunk], hits: List[Tuple[float,i
             sn = ar_normalize(s)
             if any(w in sn for w in ["عروض","ثلاث","3","سقف","حد","شيكل","دينار","دولار","شراء","مشتريات"]):
                 srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k, (_, j) in enumerate(hits, 1)]
-                return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
+                return rtl_wrap(clean_display_text(s.strip())) + "\n" + "Sources:\n" + "\n".join(srcs)
     return None
 
 def _compose_overtime(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
@@ -646,11 +681,11 @@ def _compose_overtime(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Opti
         for s in sent_split(chunks[i].text):
             sn = ar_normalize(s)
             if any(w in sn for w in ["موافق", "اعتماد"]) and found["approval"] is None:
-                found["approval"] = s.strip()
+                found["approval"] = clean_display_text(s.strip())
             if any(w in sn for w in ["احتساب", "نسبة", "أجر","اجر","125"]) and found["calc"] is None:
-                found["calc"] = s.strip()
+                found["calc"] = clean_display_text(s.strip())
             if any(w in sn for w in ["نموذج", "كشف الساعات"]) and found["form"] is None:
-                found["form"] = s.strip()
+                found["form"] = clean_display_text(s.strip())
     if any(found.values()):
         lines = [v for v in [found["approval"], found["calc"], found["form"]] if v]
         srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k, (_, j) in enumerate(hits, 1)]
@@ -663,26 +698,63 @@ def _compose_leave(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optiona
             sn = ar_normalize(s)
             if re.search(r'(اجاز|إجاز|اجازه)', sn) and re.search(r'\d', sn):
                 srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k, (_, j) in enumerate(hits, 1)]
-                return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
+                return rtl_wrap(clean_display_text(s.strip())) + "\n" + "Sources:\n" + "\n".join(srcs)
     return None
 
 def _compose_break_answer(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    # sentence-level first
     for _, i in hits:
         for s in sent_split(chunks[i].text):
             sn = ar_normalize(s)
             if any(w in sn for w in ["استراح","راحة","بريك","رضاع","رضاعه"]):
                 if DUR_TOKEN.search(sn) or any(p in sn for p in ["نصف ساعه","نصف ساعة","ربع ساعه","ربع ساعة"]):
                     srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
-                    return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
+                    return rtl_wrap(clean_display_text(s.strip())) + "\n" + "Sources:\n" + "\n".join(srcs)
+    # chunk-level fallback
+    for _, i in hits:
+        tn = ar_normalize(chunks[i].text)
+        if any(w in tn for w in ["استراح","راحة","بريك","رضاع"]):
+            m = re.search(DUR_TOKEN, tn)
+            if m:
+                srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
+                return rtl_wrap(clean_display_text(chunks[i].text.strip())) + "\n" + "Sources:\n" + "\n".join(srcs)
     return None
 
 def _compose_hourly_leave(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
     for _, i in hits:
         for s in sent_split(chunks[i].text):
             sn = ar_normalize(s)
-            if any(w in sn for w in ["مغادر","اذن","إذن"]) and (re.search(r'\d', sn) or "حد" in sn or "اقصى" in sn or "شهري" in sn):
+            if any(w in sn for w in ["مغادر","اذن","إذن"]) and (re.search(r'\d', sn) or "حد" in sn or "اقصى" in sn or "شهري" in sn or "ساعيه" in sn or "ساعية" in sn):
                 srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
-                return rtl_wrap(s.strip()) + "\n" + "Sources:\n" + "\n".join(srcs)
+                return rtl_wrap(clean_display_text(s.strip())) + "\n" + "Sources:\n" + "\n".join(srcs)
+    # refuse unrelated snippets
+    return None
+
+def _compose_leave_carryover(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    for _, i in hits:
+        for s in sent_split(chunks[i].text):
+            sn = ar_normalize(s)
+            if any(k in sn for k in ["غير مستخدم","غير المستخدم","ترح","ترحيل"]) and ("اجاز" in sn or "إجاز" in sn):
+                srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
+                return rtl_wrap(clean_display_text(s.strip())) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
+def _compose_emergency_leave(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    for _, i in hits:
+        for s in sent_split(chunks[i].text):
+            sn = ar_normalize(s)
+            if ("طارئ" in sn or "طارئه" in sn or "الطارئه" in sn or "الطارئة" in sn) and ("نموذج" in sn or "طلب" in sn or re.search(r'\d', sn)):
+                srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
+                return rtl_wrap(clean_display_text(s.strip())) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return None
+
+def _compose_performance_review(chunks: List[Chunk], hits: List[Tuple[float,int]]) -> Optional[str]:
+    for _, i in hits:
+        for s in sent_split(chunks[i].text):
+            sn = ar_normalize(s)
+            if ("تقييم" in sn or "الأداء" in sn) and any(k in sn for k in ["سنوي","معايير","محاور","مرة","سنويه","سنويا","اهداف","مؤشرات"]):
+                srcs = [f"{k}. Data_pdf.pdf - page {chunks[j].page}" for k,(_,j) in enumerate(hits,1)]
+                return rtl_wrap(clean_display_text(s.strip())) + "\n" + "Sources:\n" + "\n".join(srcs)
     return None
 
 # ---------------- Main answer function ----------------
@@ -706,6 +778,18 @@ def answer(q: str, index: HybridIndex, intent: str, use_rerank_flag: bool) -> st
         composed = _compose_hourly_leave(chunks, hits)
         if composed: return composed
 
+    if intent == "carryover_leave":
+        composed = _compose_leave_carryover(chunks, hits)
+        if composed: return composed
+
+    if intent == "emergency_leave":
+        composed = _compose_emergency_leave(chunks, hits)
+        if composed: return composed
+
+    if intent == "performance":
+        composed = _compose_performance_review(chunks, hits)
+        if composed: return composed
+
     if intent == "procurement":
         composed = _compose_procurement_threshold(chunks, hits)
         if composed: return composed
@@ -724,7 +808,7 @@ def answer(q: str, index: HybridIndex, intent: str, use_rerank_flag: bool) -> st
     if not sn:
         return rtl_wrap("لم أعثر على إجابة مناسبة.")
     srcs = [f"{k}. Data_pdf.pdf - page {chunks[i].page}" for k, (_, i) in enumerate(hits, 1)]
-    return rtl_wrap(sn) + "\n" + "Sources:\n" + "\n".join(srcs)
+    return rtl_wrap(clean_display_text(sn)) + "\n" + "Sources:\n" + "\n".join(srcs)
 
 # ---------------- CLI & sanity ----------------
 
