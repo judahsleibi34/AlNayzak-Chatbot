@@ -1,0 +1,33 @@
+{
+  "source_filename": "solar_notes.txt",
+  "doc_title": "Solar Pumps",
+  "sections": [
+    {
+      "id": "introduction",
+      "level": 1,
+      "title": "Introduction",
+      "path": [
+        "Introduction"
+      ],
+      "content": "This document describes solar pumps."
+    },
+    {
+      "id": "design",
+      "level": 1,
+      "title": "Design",
+      "path": [
+        "Design"
+      ],
+      "content": "Prototype specs and energy estimates."
+    },
+    {
+      "id": "conclusion",
+      "level": 1,
+      "title": "Conclusion",
+      "path": [
+        "Conclusion"
+      ],
+      "content": "Next steps for deployment."
+    }
+  ]
+}
