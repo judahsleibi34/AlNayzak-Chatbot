@@ -1,0 +1,37 @@
+{
+  "data": {
+    "train_conversations": 143,
+    "val_conversations": 15,
+    "source_csv": "full_dataset_expanded_normalized.csv",
+    "text_column": "content_normalized"
+  },
+  "model": {
+    "base_model": "Qwen/Qwen2.5-7B-Instruct",
+    "use_4bit": true,
+    "max_seq_len": 2048
+  },
+  "lora": {
+    "r": 8,
+    "alpha": 16,
+    "dropout": 0.05,
+    "target_modules": "all-linear"
+  },
+  "training": {
+    "epochs": 30,
+    "batch_size": 1,
+    "grad_accum": 64,
+    "effective_batch_size": 64,
+    "learning_rate": 0.0002,
+    "packing": true
+  },
+  "early_stopping": {
+    "enabled": true,
+    "patience": 3,
+    "divergence_threshold": 0.15
+  },
+  "training_history": {
+    "train_losses": [],
+    "val_losses": [],
+    "stopped_early": false
+  }
+}
